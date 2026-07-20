@@ -8,13 +8,23 @@ import torch.nn as nn
 
 
 def pca_components(X: np.ndarray, n_components: int = 2) -> np.ndarray:
-    """Top-`n_components` PCA directions of X, shape (n_components, d)."""
-    covariance = (X.astype(np.float64).T @ X.astype(np.float64)) / max(
-        1, X.shape[0] - 1
-    )
-    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    order = np.argsort(eigenvalues)[::-1][:n_components]
-    return eigenvectors[:, order].T.astype(np.float32)
+    """Top-`n_components` PCA directions of X, shape (n_components, d).
+
+    Uses an economy SVD of a single float64 view. Avoids the macOS Accelerate
+    ``X.astype(f64).T @ X.astype(f64)`` path, which emits spurious
+    divide-by-zero / overflow matmul warnings on large ``n``.
+    """
+    X64 = np.asarray(X, dtype=np.float64, order="C")
+    if X64.ndim != 2:
+        raise ValueError(f"Expected a 2D array, got shape {X64.shape}")
+    n_components = int(n_components)
+    if n_components < 1 or n_components > X64.shape[1]:
+        raise ValueError(
+            f"n_components must be in [1, {X64.shape[1]}], got {n_components}"
+        )
+    # X = U S Vt  →  principal axes are the leading rows of Vt
+    _, _, vt = np.linalg.svd(X64, full_matrices=False)
+    return np.ascontiguousarray(vt[:n_components], dtype=np.float32)
 
 
 class ParametricMapper(nn.Module):
@@ -282,11 +292,23 @@ class AttentionMapper(nn.Module):
                 return (d2 + 1e-8).sqrt()                          # Laplacian falloff
             return torch.zeros_like(d2)                            # "constant" (ablation)
 
+        def _sqdist(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            """Pairwise squared distances (|a|,|b|) via the matmul identity
+            ||a-b||^2 = |a|^2 + |b|^2 - 2 a.b^T, without materializing the
+            (|a|, |b|, d) broadcast tensor. This keeps peak memory at O(|a|*|b|)
+            instead of O(|a|*|b|*d) -- the difference between fitting and OOM at
+            large batch x landmark counts. Clamped at 0 to absorb the tiny
+            negative values floating-point cancellation can produce."""
+            a2 = a.square().sum(-1, keepdim=True)                  # (|a|, 1)
+            b2 = b.square().sum(-1)                                # (|b|,)
+            d2 = a2 + b2[None, :] - 2.0 * (a @ b.t())              # (|a|, |b|)
+            return d2.clamp_min_(0.0)
+
         if top_p is not None and top_p < M:
             # --- gathered sparse: attend only to the P nearest landmarks ---
             # O(M) distance to find the P nearest, then key/value projections and
             # the attention einsum run over P instead of M.
-            d2 = (x[:, None, :] - self.landmark_hd[None, :, :]).square().sum(-1)  # (B,M)
+            d2 = _sqdist(x, self.landmark_hd)                                    # (B,M)
             topd, topi = torch.topk(d2, top_p, dim=1, largest=False)             # (B,P)
             lhd = self.landmark_hd[topi]                                          # (B,P,d)
             lemb = self.landmark_emb[topi]                                        # (B,P,e)
@@ -308,7 +330,7 @@ class AttentionMapper(nn.Module):
         vals = self.v_proj(
             torch.cat([self.landmark_hd, self.landmark_emb], dim=1)
         ).view(M, H, Dh)                                           # (M, H, Dh)
-        d2 = (x[:, None, :] - self.landmark_hd[None, :, :]).square().sum(-1)
+        d2 = _sqdist(x, self.landmark_hd)                                # (B, M)
         bias = -torch.nn.functional.softplus(self.log_beta) * _dist(d2)   # (B, M)
         q = self.q_proj(x)
         for layer, norm in zip(self.q_update, self.norms):
