@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "leanmap"
+version = "0.1.0"
+description = "Small, self-contained, deployable parametric UMAP (FAISS k-NN + PCA-anchored net)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "leanmap contributors" }]
+keywords = ["umap", "parametric", "dimensionality-reduction", "faiss", "embedding"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering",
+    "Intended Audience :: Science/Research",
+]
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.8",
+    "torch>=1.13",
+]
+
+[project.optional-dependencies]
+# FAISS is required to fit a new model; installed separately because the
+# right wheel (faiss-cpu vs a GPU build) depends on the platform.
+cpu = ["faiss-cpu>=1.7"]
+examples = ["scikit-learn>=1.0", "matplotlib>=3.5", "umap-learn>=0.5"]
+
+[project.scripts]
+leanmap = "leanmap._cli:main"
+
+[project.urls]
+Homepage = "https://github.com/phzwart/leanmap"
+Repository = "https://github.com/phzwart/leanmap"
+
+[tool.setuptools.packages.find]
+where = ["src"]
