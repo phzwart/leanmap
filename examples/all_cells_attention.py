@@ -87,20 +87,36 @@ def main() -> None:
                     help="sparse: attend to the P nearest landmarks (0/dense = all)")
     ap.add_argument("--dense", action="store_true", help="disable sparse attention")
     ap.add_argument("--gram", type=float, default=0.1, help="Gram-anchor weight")
+    ap.add_argument("--lr", type=float, default=2e-3, help="learning rate")
+    ap.add_argument("--batch-size", type=int, default=10000,
+                    help="training batch size")
     ap.add_argument("--device", default=None, help="cuda / mps / cpu (default: auto)")
     ap.add_argument("--plot-every", type=int, default=0,
-                    help="also plot every N epochs (0 = only at the end)")
+                    help="plot + save embedding/encoder every N epochs (0 = only at end)")
+    ap.add_argument("--subsample", type=int, default=0,
+                    help="fit on a random N-point subsample (0 = use all 206k)")
+    ap.add_argument("--seed", type=int, default=0, help="subsample RNG seed")
     args = ap.parse_args()
 
     X, syslab = load(CSV)
     print(f"loaded {len(X):,} cells, {X.shape[1]}-D volume-normalized roots")
+
+    # Optional random subsample (reproducible). Subsample BEFORE building the
+    # reference coords so `ref` matches the fitted rows (attention mode requires
+    # reference_coords.shape == (len(X), n_components)).
+    if args.subsample and args.subsample < len(X):
+        rng = np.random.default_rng(args.seed)
+        idx = rng.choice(len(X), args.subsample, replace=False)
+        X, syslab = X[idx], syslab[idx]
+        print(f"subsampled to {len(X):,} cells (seed {args.seed})")
 
     # Landmark 2D initialization = PCA-2 of the standardized roots (a geometric
     # init, NOT a UMAP prior). The API needs reference_coords for all points in
     # attention mode; it selects landmarks by FPS in data space and takes their
     # reference coords from here.
     xs, _, _ = standardize(X, mode="center")
-    ref = (xs @ pca_components(xs, 2).T).astype(np.float32)
+    # np.dot avoids macOS Accelerate spurious overflow warnings from ``@``
+    ref = np.dot(xs, pca_components(xs, 2).T).astype(np.float32)
 
     model = LeanMap(
         device=args.device,
@@ -112,23 +128,65 @@ def main() -> None:
         attend_top_p=None if args.dense else args.attend_top_p,
         n_neighbors=15,
         scale_mode="center",
+        index_kind="flat",
+        use_gpu_for_flat=True,
         hidden_dims=(128, 128),
         negative_sample_rate=5,
-        learning_rate=2e-3,
+        learning_rate=args.lr,
+        batch_size=args.batch_size,
         epochs=args.epochs,
         verbose=True,
     )
 
-    cb = None
-    if args.plot_every > 0:
-        def cb(ep, emb, loss, enc):
-            if ep % args.plot_every == 0:
-                plot(emb, syslab, HERE / f"all_cells_ep{ep:02d}.png",
-                     f"leanmap all cells — epoch {ep} (loss {loss:.3f})")
+    ckpt_dir = HERE / "all_cells_checkpoints"
+    ckpt_dir.mkdir(exist_ok=True)
+
+    def on_epoch(ep, emb, loss, enc):
+        if emb is None:
+            return
+        if args.plot_every > 0 and ep % args.plot_every != 0 and ep != args.epochs:
+            return
+        import torch
+
+        np.save(ckpt_dir / f"emb_epoch{ep:03d}.npy", emb.astype(np.float32))
+        torch.save(
+            {
+                "epoch": ep,
+                "loss": float(loss),
+                "encoder_state_dict": {
+                    k: v.detach().cpu() for k, v in enc.state_dict().items()
+                },
+            },
+            ckpt_dir / f"encoder_epoch{ep:03d}.pt",
+        )
+        plot(
+            emb,
+            syslab,
+            ckpt_dir / f"plot_epoch{ep:03d}.png",
+            f"leanmap all cells — epoch {ep}/{args.epochs} "
+            f"(loss {loss:.3f}, {args.inducing} landmarks)",
+        )
+        # also keep a flat name for the latest epoch plot
+        plot(
+            emb,
+            syslab,
+            HERE / f"all_cells_ep{ep:03d}.png",
+            f"leanmap all cells — epoch {ep} (loss {loss:.3f})",
+        )
 
     t = time.time()
-    model.fit(X, reference_coords=ref, on_epoch=cb)
-    emb = model.transform(X)
+    model.fit(
+        X,
+        reference_coords=ref,
+        on_epoch=on_epoch if args.plot_every > 0 else None,
+        checkpoint_every=max(1, args.plot_every) if args.plot_every > 0 else 1,
+    )
+    import torch
+
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    # MPS: keep transform batches small — sparse attention still builds (B, M) d2.
+    emb = model.transform(X, batch_size=min(10000, args.batch_size))
     print(f"fit {time.time() - t:.0f}s | embedding {emb.shape} "
           f"spread {emb.std(0).round(2)}")
 
