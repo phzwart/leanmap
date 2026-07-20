@@ -28,6 +28,20 @@ Fits a plain graph-loss leanmap (no inducing points, no UMAP prior) and writes
 Subset of the full PDB cell set: orthorhombic space groups 16–74, primitive
 centering only — the clean "primitive" orthorhombic island.
 
+## `data/all_pdb_cells.csv`
+
+The full set — **206,184 PDB unit cells** across all seven crystal systems.
+Same columns as above, plus two extra label columns:
+
+| columns | meaning |
+|---|---|
+| `crystal_system` | triclinic / monoclinic / orthorhombic / tetragonal / trigonal / hexagonal / cubic (from `sg_number`) |
+| `centering` | lattice centering from the HM symbol (`A`/`B` collapsed to `C`) |
+
+System counts: orthorhombic 74,017 · monoclinic 57,836 · tetragonal 24,642 ·
+trigonal 21,555 · hexagonal 15,454 · triclinic 8,492 · cubic 4,188.
+Centering: P 155,726 · C 32,192 · I 11,754 · H 5,457 · F 1,039 · R 16.
+
 ### Note on faiss + torch on macOS
 
 Fitting needs FAISS to build the k-NN graph. On macOS a venv that mixes a
