@@ -4,13 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "leanmap"
-version = "0.1.0"
-description = "Small, self-contained, deployable parametric UMAP (FAISS k-NN + PCA-anchored net)."
+version = "0.2.0"
+description = "leanmap (LEarn ANother MAPping): parametric landmark-conditioned neighbor embedding with a cohesive multi-scale graph pyramid."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "leanmap contributors" }]
-keywords = ["umap", "parametric", "dimensionality-reduction", "faiss", "embedding"]
+keywords = [
+    "leanmap",
+    "parametric",
+    "dimensionality-reduction",
+    "neighbor-embedding",
+    "landmark",
+    "film",
+    "faiss",
+    "umap",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -21,13 +30,24 @@ dependencies = [
     "numpy>=1.22",
     "scipy>=1.8",
     "torch>=1.13",
+    "tqdm>=4.64",
+    "pot>=0.9",
 ]
 
 [project.optional-dependencies]
-# FAISS is required to fit a new model; installed separately because the
-# right wheel (faiss-cpu vs a GPU build) depends on the platform.
+# FAISS accelerates kNN for fit (ANN). Brute-force knn_mode works without it.
+# Install faiss-cpu from PyPI, or a CUDA FAISS build from conda for GPU indices.
 cpu = ["faiss-cpu>=1.7"]
-examples = ["scikit-learn>=1.0", "matplotlib>=3.5", "umap-learn>=0.5"]
+examples = [
+    "scikit-learn>=1.0",
+    "matplotlib>=3.5",
+    "pandas>=1.5",
+]
+# Evaluation metrics (trustworthiness etc.).
+eval = ["scikit-learn>=1.0"]
+# Back-compat alias for the old optional extra name.
+plane = ["scikit-learn>=1.0"]
+dev = ["pytest>=7.0", "scikit-learn>=1.0"]
 
 [project.scripts]
 leanmap = "leanmap._cli:main"
@@ -38,3 +58,7 @@ Repository = "https://github.com/phzwart/leanmap"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

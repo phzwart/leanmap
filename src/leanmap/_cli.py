@@ -1,4 +1,4 @@
-"""Command-line interface: ``leanmap fit | transform | info``."""
+"""Command-line interface: ``leanmap fit | transform | info`` (PLANE)."""
 
 from __future__ import annotations
 
@@ -7,158 +7,123 @@ import sys
 from pathlib import Path
 
 import numpy as np
-
-from . import __version__
-from ._api import LeanMap
+import torch
 
 
-# --------------------------------------------------------------------------- IO
-def _load_matrix(path: str, *, delimiter: str = ",", skip_header: int = 0) -> np.ndarray:
-    """Load a 2D float matrix from .npy, .npz (key 'X' or first array), or text."""
+def _load_array(path: str) -> np.ndarray:
     p = Path(path)
-    suffix = p.suffix.lower()
-    if suffix == ".npy":
-        arr = np.load(p)
-    elif suffix == ".npz":
-        npz = np.load(p)
-        key = "X" if "X" in npz else npz.files[0]
-        arr = npz[key]
-    else:  # csv / tsv / txt
-        arr = np.loadtxt(p, delimiter=delimiter, skiprows=skip_header)
-    arr = np.asarray(arr, dtype=np.float32)
-    if arr.ndim == 1:
-        arr = arr[:, None]
-    if arr.ndim != 2:
-        raise ValueError(f"Expected a 2D matrix, got shape {arr.shape}")
-    return np.ascontiguousarray(arr)
+    if p.suffix == ".npy":
+        return np.load(p).astype(np.float32, copy=False)
+    if p.suffix == ".npz":
+        return np.load(p)["X"].astype(np.float32, copy=False)
+    raise SystemExit(f"unsupported input format: {p.suffix} (use .npy or .npz)")
 
 
-def _save_embedding(path: str, emb: np.ndarray, *, delimiter: str = ",") -> None:
-    p = Path(path)
-    suffix = p.suffix.lower()
-    if suffix == ".npy":
-        np.save(p, emb)
-    else:
-        np.savetxt(p, emb, delimiter=delimiter, header="x,y", comments="")
+def cmd_fit(args: argparse.Namespace) -> int:
+    from leanmap import PLANEConfig, fit
+
+    X = _load_array(args.input)
+    cfg = PLANEConfig.for_scale(len(X))
+    if args.epochs is not None:
+        cfg.epochs = int(args.epochs)
+    if args.n_components is not None:
+        cfg.d_out = int(args.n_components)
+    if args.device is not None:
+        cfg.device = args.device
+    if args.seed is not None:
+        cfg.seed = int(args.seed)
+    if args.no_pyramid:
+        cfg.pyramid_scales = 0
+        cfg.pyramid_level_weights = None
+        cfg.pyramid_coarse_backbone = 0.0
+
+    result = fit(X, dist_fn=args.metric, config=cfg)
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    result.save(str(out))
+    if args.embedding is not None:
+        with torch.no_grad():
+            Z, _ = result.embed(X)
+        np.save(args.embedding, Z.detach().cpu().numpy())
+    print(f"saved {out}")
+    return 0
 
 
-# ------------------------------------------------------------------- subcommands
-def _cmd_fit(args: argparse.Namespace) -> int:
-    X = _load_matrix(args.input, delimiter=args.delimiter, skip_header=args.skip_header)
-    print(f"[fit] loaded {X.shape[0]} x {X.shape[1]} from {args.input}", file=sys.stderr)
+def cmd_transform(args: argparse.Namespace) -> int:
+    from leanmap import load_plane
 
-    mapper = LeanMap(
-        device=args.device,
-        verbose=not args.quiet,
-        n_neighbors=args.n_neighbors,
-        min_dist=args.min_dist,
-        spread=args.spread,
-        index_kind=args.index_kind,
-        local_connectivity=args.local_connectivity,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        negative_sample_rate=args.negative_sample_rate,
-        repulsion_strength=args.repulsion_strength,
-        learning_rate=args.learning_rate,
-        hidden_dims=tuple(args.hidden_dims),
-        seed=args.seed,
+    model = load_plane(args.model)
+    X = _load_array(args.input)
+    with torch.no_grad():
+        Z, _ = model.embed(torch.as_tensor(X, dtype=torch.float32))
+    Z = Z.detach().cpu().numpy()
+    np.save(args.output, Z)
+    print(f"wrote {args.output}  shape={tuple(Z.shape)}")
+    return 0
+
+
+def cmd_info(args: argparse.Namespace) -> int:
+    payload = torch.load(args.model, map_location="cpu", weights_only=False)
+    cfg = payload.get("config") or {}
+    print(f"model: {args.model}")
+    print(
+        f"d_out={cfg.get('d_out')} width={cfg.get('width')} depth={cfg.get('depth')}"
     )
-    emb = mapper.fit_transform(X)
-    mapper.save(args.model_out)
-    print(f"[fit] saved model -> {args.model_out}", file=sys.stderr)
-
-    if args.embedding_out:
-        _save_embedding(args.embedding_out, emb, delimiter=args.delimiter)
-        print(f"[fit] saved embedding -> {args.embedding_out}", file=sys.stderr)
+    print(
+        f"n_landmarks={cfg.get('n_landmarks')} n_neighbors={cfg.get('n_neighbors')}"
+    )
+    print(
+        f"pyramid_scales={cfg.get('pyramid_scales')} "
+        f"pyramid_level_weights={cfg.get('pyramid_level_weights')} "
+        f"pyramid_coarse_backbone={cfg.get('pyramid_coarse_backbone')}"
+    )
+    gs = payload.get("graph_stats") or {}
+    if gs:
+        print(f"graph_stats keys: {sorted(gs.keys())[:12]}...")
     return 0
 
 
-def _cmd_transform(args: argparse.Namespace) -> int:
-    mapper = LeanMap.load(args.model, device=args.device)
-    X = _load_matrix(args.input, delimiter=args.delimiter, skip_header=args.skip_header)
-    if mapper.n_features_in_ is not None and X.shape[1] != mapper.n_features_in_:
-        raise ValueError(
-            f"Model expects {mapper.n_features_in_} features, got {X.shape[1]}"
-        )
-    print(f"[transform] embedding {X.shape[0]} rows", file=sys.stderr)
-    emb = mapper.transform(X, batch_size=args.batch_size)
-    _save_embedding(args.output, emb, delimiter=args.delimiter)
-    print(f"[transform] saved embedding -> {args.output}", file=sys.stderr)
-    return 0
-
-
-def _cmd_info(args: argparse.Namespace) -> int:
-    mapper = LeanMap.load(args.model, device="cpu")
-    enc = mapper.torch_module.encoder
-    n_params = sum(p.numel() for p in mapper.torch_module.parameters())
-    print(f"leanmap model: {args.model}")
-    print(f"  input features : {mapper.n_features_in_}")
-    print(f"  encoder input  : {enc.input_dim}")
-    print(f"  hidden dims    : {enc.hidden_dims}")
-    print(f"  parameters     : {n_params}")
-    print("  config:")
-    for k, v in vars(mapper.config).items():
-        print(f"    {k:22s}= {v}")
-    return 0
-
-
-# ------------------------------------------------------------------------ parser
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    ap = argparse.ArgumentParser(
         prog="leanmap",
-        description="Small, deployable parametric UMAP (FAISS k-NN + PCA-anchored net).",
+        description="PLANE: parametric landmark-conditioned neighbor embedding",
     )
-    parser.add_argument("--version", action="version", version=f"leanmap {__version__}")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = ap.add_subparsers(dest="command", required=True)
 
-    # shared data-IO args
-    def add_io(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--delimiter", default=",", help="text-file delimiter (default ',')")
-        p.add_argument("--skip-header", type=int, default=0, help="header rows to skip")
-        p.add_argument("--device", default=None, help="torch device (cpu, cuda, ...)")
-        p.add_argument("--batch-size", type=int, default=4096)
+    fit_p = sub.add_parser("fit", help="fit a PLANE model and save it")
+    fit_p.add_argument("input", help="training features (.npy or .npz with X)")
+    fit_p.add_argument("-o", "--output", required=True, help="output path (.pt)")
+    fit_p.add_argument("--embedding", default=None, help="optional .npy for train embedding")
+    fit_p.add_argument("--epochs", type=int, default=None)
+    fit_p.add_argument("--n-components", type=int, default=None, dest="n_components")
+    fit_p.add_argument("--metric", default="l2", help="distance (default: l2)")
+    fit_p.add_argument("--device", default=None)
+    fit_p.add_argument("--seed", type=int, default=None)
+    fit_p.add_argument(
+        "--no-pyramid",
+        action="store_true",
+        help="disable cohesive multi-scale pyramid (single-scale graph)",
+    )
+    fit_p.set_defaults(func=cmd_fit)
 
-    # fit
-    pf = sub.add_parser("fit", help="fit a mapper on a data matrix and save it")
-    pf.add_argument("input", help="training matrix (.npy/.npz/.csv/.tsv)")
-    pf.add_argument("-o", "--model-out", required=True, help="output model path (.mmap)")
-    pf.add_argument("-e", "--embedding-out", default=None, help="optional 2D embedding out")
-    pf.add_argument("--n-neighbors", type=int, default=50)
-    pf.add_argument("--min-dist", type=float, default=0.1)
-    pf.add_argument("--spread", type=float, default=1.0)
-    pf.add_argument("--index-kind", choices=["flat", "hnsw"], default="hnsw")
-    pf.add_argument("--local-connectivity", type=float, default=1.0)
-    pf.add_argument("--epochs", type=int, default=25)
-    pf.add_argument("--negative-sample-rate", type=int, default=5)
-    pf.add_argument("--repulsion-strength", type=float, default=1.0)
-    pf.add_argument("--learning-rate", type=float, default=1e-3)
-    pf.add_argument("--hidden-dims", type=int, nargs="+", default=[64, 64])
-    pf.add_argument("--seed", type=int, default=42)
-    pf.add_argument("--quiet", action="store_true", help="suppress per-epoch logs")
-    add_io(pf)
-    pf.set_defaults(func=_cmd_fit)
+    tr_p = sub.add_parser("transform", help="embed new points with a saved model")
+    tr_p.add_argument("model", help="saved .pt model")
+    tr_p.add_argument("input", help="features (.npy or .npz with X)")
+    tr_p.add_argument("-o", "--output", required=True, help="output embedding .npy")
+    tr_p.set_defaults(func=cmd_transform)
 
-    # transform
-    pt = sub.add_parser("transform", help="embed new data with a saved model")
-    pt.add_argument("input", help="matrix to embed (.npy/.npz/.csv/.tsv)")
-    pt.add_argument("-m", "--model", required=True, help="saved model path (.mmap)")
-    pt.add_argument("-o", "--output", required=True, help="embedding output (.npy/.csv)")
-    add_io(pt)
-    pt.set_defaults(func=_cmd_transform)
+    info_p = sub.add_parser("info", help="print summary of a saved model")
+    info_p.add_argument("model", help="saved .pt model")
+    info_p.set_defaults(func=cmd_info)
 
-    # info
-    pi = sub.add_parser("info", help="print a saved model's config and shape")
-    pi.add_argument("model", help="saved model path (.mmap)")
-    pi.set_defaults(func=_cmd_info)
-
-    return parser
+    return ap
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    return int(args.func(args))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

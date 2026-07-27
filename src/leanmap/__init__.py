@@ -1,62 +1,206 @@
-"""leanmap: a small, self-contained, deployable parametric UMAP.
+"""leanmap — LEarn ANother MAPping.
 
-Build a fuzzy topological graph from high-dimensional data with FAISS k-NN
-(no umap-learn dependency), train a PCA-anchored neural network to embed it,
-then ``transform`` any new data through the saved model.
+Parametric landmark-conditioned neighbour embedding with a cohesive
+multi-scale graph pyramid. After training, inference is a single network
+forward pass.
 """
 
 from __future__ import annotations
 
-from ._api import MapperConfig, LeanMap
-from ._graph import (
-    FuzzyGraphData,
-    build_fuzzy_graph,
-    faiss_knn,
-    fit_ab_params,
-    fuzzy_graph_from_knn,
-    smooth_knn_dist,
-    standardize,
-)
-from ._inducing import (
-    coverage_radius,
-    farthest_point_sampling,
-    induce_embed,
-    select_landmarks,
-)
-from ._decoder import CondFlow, GenerativeDecoder, MeanDecoder
-from ._discriminator import LeanmapDiscriminator
-from ._model import AttentionMapper, DeployableMapper, ParametricMapper, pca_components
-from ._pipeline import pca_reduce, run_pipeline
-from ._train import train_attention_mapper, train_parametric_mapper, transform
+# Must be set before torch initializes the MPS backend (spectral-norm vdot, etc.).
+import os
 
-__version__ = "0.1.0"
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+from .conditioning import (
+    RETENTION_CHANCE,
+    ConditioningFactor,
+    FactorStack,
+    FactorViewMetric,
+    Role,
+    build_factor_stack,
+    default_primary_factor,
+    identity_view,
+    metric_from_factors,
+    scale_quotient_factorization,
+    validate_factors,
+)
+from .config import AlignmentSpec, PLANEConfig
+from .conformal import ConformalCalibrator, bh_reject, geometry_consistency_score
+from .distance import (
+    CallableDistance,
+    CosineDistance,
+    DistanceFn,
+    EuclideanDistance,
+    ManhattanDistance,
+    SquaredEuclideanDistance,
+    chunked_cdist,
+    is_differentiable,
+)
+from .emd import (
+    geodesic_from_matrix,
+    geodesic_submatrix,
+    grid_cost_matrix,
+    image_emd,
+    image_masses,
+    pairwise_emd,
+    reference_knn_overlap,
+    reference_retrieval_overlap,
+    reference_shepard,
+    reference_trust_continuity,
+)
+from .evaluate import (
+    alignment_report,
+    benchmark_inference,
+    geodesic_fidelity,
+    knn_recall_out_of_sample,
+    density_correspondence,
+    knn_local_density,
+    shepard_pairs_ambient,
+    shepard_pairs_geodesic,
+    shepard_stats,
+    trustworthiness_continuity,
+    uniformity_of_pvalues,
+)
+from .graph import (
+    Graph,
+    GraphStats,
+    Representatives,
+    build_graph,
+    build_graph_pyramid,
+    smooth_knn,
+    union_assign_topc,
+)
+from .landmarks import (
+    AnchorAffinity,
+    LandmarkAffinity,
+    assign_buckets,
+    fps_init,
+    init_anchors,
+    landmark_geodesic_matrix,
+    poisson_disk_indices_geodesic,
+    quantile_init,
+)
+from .metrics import CompositeMetric, MetricSpec, get_metric, wrap_metric
+from .model import FiLMEncoder, PLANE, fit_pca_weight
+from .probes import (
+    CONTROL_PROBES,
+    PROBE_PATTERNS,
+    control_probes,
+    probe_pattern_names,
+    render_pattern,
+    structured_probes,
+)
+from .negative_space import (
+    ALL_FEATURES,
+    DM_ONLY_FEATURES,
+    DistanceQuantileHead,
+    NegativeSpaceModel,
+    PerturbationConfig,
+    build_labeled_set,
+    calibrate_head,
+    calibrate_novelty,
+    distance_to_support,
+    extract_features,
+    features_with_grad,
+    fit_negative_space,
+    NoveltyDetector,
+    sample_perturbations,
+)
+from .train import PLANEResult, fit, load_plane
+
+__version__ = "0.2.0"
 
 __all__ = [
-    "LeanMap",
-    "MapperConfig",
-    "FuzzyGraphData",
-    "build_fuzzy_graph",
-    "faiss_knn",
-    "fuzzy_graph_from_knn",
-    "smooth_knn_dist",
-    "standardize",
-    "fit_ab_params",
-    "ParametricMapper",
-    "DeployableMapper",
-    "pca_components",
-    "train_parametric_mapper",
-    "train_attention_mapper",
-    "AttentionMapper",
-    "transform",
-    "select_landmarks",
-    "farthest_point_sampling",
-    "induce_embed",
-    "coverage_radius",
-    "GenerativeDecoder",
-    "MeanDecoder",
-    "CondFlow",
-    "LeanmapDiscriminator",
-    "run_pipeline",
-    "pca_reduce",
+    "AlignmentSpec",
+    "PLANEConfig",
+    "PLANE",
+    "PLANEResult",
+    "fit",
+    "load_plane",
+    "Role",
+    "ConditioningFactor",
+    "FactorStack",
+    "FactorViewMetric",
+    "RETENTION_CHANCE",
+    "identity_view",
+    "default_primary_factor",
+    "build_factor_stack",
+    "scale_quotient_factorization",
+    "metric_from_factors",
+    "validate_factors",
+    "DistanceFn",
+    "EuclideanDistance",
+    "SquaredEuclideanDistance",
+    "CosineDistance",
+    "ManhattanDistance",
+    "CallableDistance",
+    "chunked_cdist",
+    "is_differentiable",
+    "MetricSpec",
+    "CompositeMetric",
+    "get_metric",
+    "wrap_metric",
+    "fps_init",
+    "poisson_disk_indices_geodesic",
+    "landmark_geodesic_matrix",
+    "quantile_init",
+    "init_anchors",
+    "assign_buckets",
+    "AnchorAffinity",
+    "LandmarkAffinity",
+    "Graph",
+    "GraphStats",
+    "Representatives",
+    "build_graph",
+    "build_graph_pyramid",
+    "smooth_knn",
+    "union_assign_topc",
+    "FiLMEncoder",
+    "fit_pca_weight",
+    "ConformalCalibrator",
+    "geometry_consistency_score",
+    "bh_reject",
+    "fit_negative_space",
+    "calibrate_head",
+    "calibrate_novelty",
+    "NoveltyDetector",
+    "NegativeSpaceModel",
+    "DistanceQuantileHead",
+    "PerturbationConfig",
+    "build_labeled_set",
+    "sample_perturbations",
+    "extract_features",
+    "features_with_grad",
+    "distance_to_support",
+    "ALL_FEATURES",
+    "DM_ONLY_FEATURES",
+    "trustworthiness_continuity",
+    "knn_recall_out_of_sample",
+    "alignment_report",
+    "benchmark_inference",
+    "uniformity_of_pvalues",
+    "geodesic_fidelity",
+    "shepard_stats",
+    "shepard_pairs_ambient",
+    "shepard_pairs_geodesic",
+    "knn_local_density",
+    "density_correspondence",
+    "grid_cost_matrix",
+    "image_masses",
+    "image_emd",
+    "pairwise_emd",
+    "geodesic_from_matrix",
+    "geodesic_submatrix",
+    "reference_shepard",
+    "reference_trust_continuity",
+    "reference_knn_overlap",
+    "reference_retrieval_overlap",
+    "PROBE_PATTERNS",
+    "CONTROL_PROBES",
+    "probe_pattern_names",
+    "render_pattern",
+    "structured_probes",
+    "control_probes",
     "__version__",
 ]

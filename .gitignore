@@ -34,8 +34,22 @@ htmlcov/
 *.swp
 .DS_Store
 
-# Local artifacts
+# Model / embedding artifacts
 *.mmap
+*.pt
+*.npy
 *.png
+*.svg
 *.npz
 !**/fixtures/**
+
+# Local research only (not part of the release package)
+legacy/
+train.log
+
+# Curated example plot output
+examples/out/
+examples/**/__pycache__/
+
+# PDB datasets (outside paper scope; large / regenerable)
+examples/data/pdb_*
