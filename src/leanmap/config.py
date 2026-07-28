@@ -226,15 +226,24 @@ class PLANEConfig:
     # (see ``leanmap.density`` for why targeting magnitude cannot work when the
     # intrinsic dimension greatly exceeds ``d_out``).
     #
-    # Because the term is scale free it has nothing to saturate against and needs
-    # no per-dataset decision: one weight, on by default. Set 0 to opt out.
-    # 1.0 puts it on the same footing as the other unit-scale terms, being the
-    # score of a layout whose density is unrelated to the data's.
+    # Being scale free removes a way to fail but does not make the term free:
+    # honouring density costs local structure on data whose density signal is
+    # mostly discrete cluster structure. Sweeping this on digits degrades
+    # ``trust_5`` monotonically while s_curve improves on every axis, so the
+    # tradeoff is a property of the data (see ``leanmap.density``). 1.0 puts the
+    # term on the same footing as the other unit-scale terms, being the score of
+    # a layout whose density is unrelated to the data's. Set 0 to opt out.
     lambda_density: float = 1.0
-    # Ramp (start, end) as fractions of training, like ``geo_ramp``. Density is
-    # a refinement of a layout that already has the right topology, so pinning
-    # it from step 0 fights the unrolling; the default mirrors ``geo_ramp``.
-    density_ramp: Tuple[float, float] = (0.2, 0.45)
+    # Ramp (start, end) as fractions of training, like ``geo_ramp``. Equal values
+    # give a hard gate. Density is a refinement of a layout that already has the
+    # right topology, and steering a forming one locks in wrong neighbourhoods,
+    # so the term is held off until the tail -- densMAP's ``dens_frac=0.3``, i.e.
+    # plain UMAP for the first 70% of epochs, expressed as a gate at 0.7.
+    density_ramp: Tuple[float, float] = (0.7, 0.7)
+    # Variance floor in the correlation denominator, ``density.DENSITY_VAR_SHIFT``
+    # (densMAP's ``dens_var_shift``). Repeated rather than imported: ``density``
+    # imports ``graph``, which imports this module.
+    density_var_shift: float = 0.1
     # Stars per step for the density term (reuses the frame-loss sampler).
     density_centers: int = 256
 
@@ -249,6 +258,37 @@ class PLANEConfig:
     # (disables the default warmup+cosine schedule).
     lr_after: Optional[float] = None
     lr_switch_epochs: int = 0
+
+    # Regression steps fitting the encoder to the landmark geodesic MDS, extended
+    # to every point by its affinity barycentre, before the main loop starts (see
+    # ``leanmap.warmstart``). A regression step costs about a ninth of a training
+    # step -- one forward, no negatives or triplets -- so this is cheap next to
+    # the epochs it aims to save. 0 disables it, which is the default until the
+    # timing and quality comparison says otherwise. Requires ``lambda_geo > 0``,
+    # since that is what builds the MDS.
+    warm_start_steps: int = 0
+    # Learning rate for those steps; None uses ``lr``. The regression is a much
+    # easier problem than the embedding objective and tolerates more.
+    warm_start_lr: Optional[float] = None
+    # Which coarse layout to start from: "isomap" (classical MDS of the landmark
+    # geodesics), "spectral" (leading eigenvectors of the fuzzy graph, UMAP's
+    # init), "pca", or "auto". Neither of the first two dominates -- Isomap wins on
+    # manifolds that are genuinely a sheet, spectral wins when the geodesics are
+    # not realisable in ``d_out`` dimensions and Isomap's MDS spectrum goes
+    # negative. "auto" does not guess from that diagnostic: it interpolates each
+    # candidate onto the graph's representatives and scores neighbour agreement
+    # against the kNN the build already computed, which is the same quantity the
+    # layouts are being chosen for. See ``leanmap.warmstart.rank_inits``.
+    warm_start_layout: str = "auto"
+
+    # Fraction of epochs spent climbing the pyramid from the coarsest level up,
+    # admitting one finer level at a time, before all levels run together. Steps
+    # per epoch follow the *active* levels' edge count, so a coarse epoch costs
+    # roughly ``PYRAMID_REP_RATIO`` times less per coarsening -- the early epochs
+    # decide global layout, which coarse edges already carry, so paying
+    # fine-graph prices for them is waste. 0 keeps every epoch at the full mix,
+    # which is the behaviour every recipe here was tuned against.
+    coarse_first_frac: float = 0.0
 
     # conformal
     calib_max: int = 2000

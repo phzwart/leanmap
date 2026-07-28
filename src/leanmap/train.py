@@ -49,6 +49,7 @@ from .density import density_budget, density_correlation_loss, star_log_radius
 from .distance import DistanceFn
 from .evaluate import geodesic_fidelity
 from .graph import Graph, build_graph, build_graph_pyramid
+from .warmstart import LAYOUTS as WARM_START_LAYOUTS, spectral_layout, warm_start
 from .landmarks import AnchorAffinity, LandmarkAffinity, classical_mds, landmark_geodesic_matrix
 from .losses import (
     alignment_ramp,
@@ -78,6 +79,66 @@ def _metric_name_from_dist_fn(dist_fn: Any) -> str:
         return dist_fn
     name = getattr(dist_fn, "name", None)
     return str(name) if name else "custom"
+
+
+def _split_budget(
+    batch_edges: int, lvl_w: Sequence[float], active: Sequence[int]
+) -> List[int]:
+    """Per-level edge counts for one step: ``batch_edges`` split over ``active``.
+
+    Inactive levels get zero, so the per-step cost stays at ``batch_edges``
+    however many levels are switched on.
+    """
+    counts = [0] * len(lvl_w)
+    if not active:
+        return counts
+    wsum = sum(lvl_w[i] for i in active) or 1.0
+    for i in active:
+        counts[i] = int(round(batch_edges * (lvl_w[i] / wsum)))
+    finest = min(active)
+    counts[finest] += batch_edges - sum(counts)  # absorb rounding
+    return [max(0, c) for c in counts]
+
+
+def coarse_to_fine_plan(
+    epochs: int,
+    edges_per_level: Sequence[int],
+    batch_edges: int,
+    lvl_w: Sequence[float],
+    coarse_frac: float,
+) -> List[Tuple[List[int], int]]:
+    """Per-epoch ``(edge counts per level, steps)``, coarsest levels admitted first.
+
+    Steps per epoch are set by the *active* levels' edge count, which is where the
+    saving comes from: the fine graph has ``PYRAMID_REP_RATIO`` times more nodes
+    per coarsening, so an epoch that only touches coarse levels needs
+    proportionally fewer steps to cover its edges. Global layout is what the early
+    epochs decide and coarse edges are what carry it, so paying fine-graph prices
+    for them is waste.
+
+    The first ``coarse_frac`` of epochs is divided evenly among the levels,
+    starting from the coarsest alone and admitting one finer level at a time;
+    after that every level is active with the configured weights, which is
+    exactly the old behaviour. ``coarse_frac=0`` reproduces it throughout.
+    """
+    n_levels = len(edges_per_level)
+    plan: List[Tuple[List[int], int]] = []
+    n_warm = int(round(max(0.0, min(1.0, coarse_frac)) * epochs))
+    for epoch in range(epochs):
+        if epoch < n_warm and n_levels > 1:
+            # phase 0 => coarsest only, last phase => everything
+            phase = int(n_levels * epoch / max(n_warm, 1))
+            finest = max(0, n_levels - 1 - phase)
+            active = list(range(finest, n_levels))
+        else:
+            active = list(range(n_levels))
+        counts = _split_budget(batch_edges, lvl_w, active)
+        # An epoch is one pass over the finest *active* level's edges. With every
+        # level active that is the finest graph, which is how epochs were counted
+        # before this schedule existed, so ``coarse_frac=0`` is unchanged.
+        edges = edges_per_level[min(active)]
+        plan.append((counts, max(1, math.ceil(edges / batch_edges))))
+    return plan
 
 
 def _param_groups(model: torch.nn.Module, config: "PLANEConfig") -> list:
@@ -619,10 +680,7 @@ def fit(
             lvl_w += [lvl_w[-1] if lvl_w else 1.0] * (n_levels - len(lvl_w))
     else:
         lvl_w = [1.0] * n_levels
-    _wsum = sum(lvl_w) or 1.0
-    lvl_counts = [int(round(config.batch_edges * (w / _wsum))) for w in lvl_w]
-    lvl_counts[0] += config.batch_edges - sum(lvl_counts)  # fix rounding on finest
-    lvl_counts = [max(0, c) for c in lvl_counts]
+    lvl_counts = _split_budget(config.batch_edges, lvl_w, list(range(n_levels)))
     if n_levels > 1:
         log.info(
             "pyramid training: %d levels, per-step edge split=%s (weights=%s)",
@@ -666,10 +724,13 @@ def fit(
         density_info["star_ambient_log_r_sd"] = star_budget.ambient_sd
         log.info(
             "density term active: correlating log radii against an ambient "
-            "spread of %.3f on %d-neighbour stars, weight %.3g",
+            "spread of %.3f on %d-neighbour stars, weight %.3g, gate %s, "
+            "var_shift %.3g",
             star_budget.ambient_sd,
             config.n_neighbors,
             config.lambda_density,
+            config.density_ramp,
+            config.density_var_shift,
         )
     # Coarse geodesic backbone: classical MDS of landmark geodesics +
     # Procrustes pull (absolute gauge) plus optional pairwise stress.
@@ -766,14 +827,106 @@ def fit(
         )
     retention_warn = retention_chance + (RETENTION_WARN - RETENTION_CHANCE)
 
+    # Warm start: fit the encoder to the coarse landmark layout before the main
+    # objective sees a step, so training refines a topologically sensible map
+    # instead of building one from PCA or from zero.
+    warm_info: Dict[str, Any] = {}
+    if config.warm_start_steps > 0:
+        layout = str(config.warm_start_layout)
+        if layout not in WARM_START_LAYOUTS:
+            raise ValueError(
+                f"warm_start_layout={layout!r} is not one of {WARM_START_LAYOUTS}"
+            )
+        if layout == "isomap" and geo_pack is None:
+            raise ValueError(
+                "warm_start_layout='isomap' needs the classical MDS of the landmark "
+                "geodesics, which is only built when lambda_geo > 0 (got "
+                f"{config.lambda_geo}). Use 'spectral', or raise lambda_geo."
+            )
+        if layout == "auto" and graph.knn_idx.numel() == 0:
+            # Ranking needs the representatives' ambient neighbours. Rather than
+            # silently skipping the warm start, fall back to naming a layout.
+            layout = "isomap" if geo_pack is not None else "spectral"
+            log.warning(
+                "warm_start_layout='auto' needs the representative kNN to rank "
+                "candidates and it is empty; using %r instead",
+                layout,
+            )
+        # Only build what will be used: an explicit choice should not pay for the
+        # eigensolve or the geodesics behind the candidates it did not ask for.
+        wanted = set(WARM_START_LAYOUTS[1:]) if layout == "auto" else {layout}
+        X_rep = X_train[graph.reps.rep_idx.to(X_train.device)]
+        candidates: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        if "isomap" in wanted and geo_pack is not None:
+            candidates["isomap"] = (geo_pack["X_lm"], geo_pack["Z_mds"])
+        if "spectral" in wanted:
+            candidates["spectral"] = (
+                X_rep,
+                spectral_layout(
+                    graph.edges,
+                    graph.weights,
+                    int(X_rep.shape[0]),
+                    config.d_out,
+                    seed=config.seed,
+                ),
+            )
+        if "pca" in wanted:
+            # PCA is the control: it is what the encoder starts from anyway, so it
+            # scoring best is the answer "these coarse layouts add nothing here".
+            W_pca = (
+                pca_weight
+                if pca_weight is not None
+                else fit_pca_weight(
+                    (X_enc_train - x_mean) / x_std, config.d_out, center=PCA_CENTER
+                )
+            )
+            rep_sel = graph.reps.rep_idx.to(X_enc_train.device)
+            X_enc_rep_n = (X_enc_train[rep_sel] - x_mean) / x_std
+            candidates["pca"] = (X_rep, (X_enc_rep_n @ W_pca.T).contiguous())
+        warm_info = warm_start(
+            model,
+            X_train,
+            candidates,
+            metric,
+            layout=layout,
+            X_ref=X_rep,
+            reference_knn=graph.knn_idx,
+            steps=int(config.warm_start_steps),
+            batch=config.batch_edges,
+            lr=float(
+                config.warm_start_lr
+                if config.warm_start_lr is not None
+                else config.lr
+            ),
+            min_dist=float(config.min_dist),
+            seed=config.seed,
+        )
+
     E = graph.edges.shape[0]
     steps_per_epoch = max(1, math.ceil(E / config.batch_edges))
-    total_steps = steps_per_epoch * config.epochs
+    plan = coarse_to_fine_plan(
+        config.epochs,
+        [int(g.edges.shape[0]) for g in graphs],
+        config.batch_edges,
+        lvl_w,
+        config.coarse_first_frac,
+    )
+    total_steps = sum(steps for _, steps in plan)
+    if config.coarse_first_frac > 0 and n_levels > 1:
+        log.info(
+            "coarse-to-fine: %d total steps vs %d flat (%.0f%% of the work), "
+            "first epoch %d step(s) on levels %s",
+            total_steps,
+            steps_per_epoch * config.epochs,
+            100.0 * total_steps / max(steps_per_epoch * config.epochs, 1),
+            plan[0][1],
+            [i for i, c in enumerate(plan[0][0]) if c > 0],
+        )
     opt = AdamW(
         _param_groups(model, config), lr=config.lr, weight_decay=WEIGHT_DECAY
     )
     if config.lr_after is not None and config.lr_switch_epochs > 0:
-        switch_steps = int(config.lr_switch_epochs) * steps_per_epoch
+        switch_steps = sum(steps for _, steps in plan[: config.lr_switch_epochs])
         lr0 = float(config.lr)
         lr1 = float(config.lr_after)
         ratio = lr1 / max(lr0, 1e-12)
@@ -823,9 +976,10 @@ def fit(
         frame_ramp = alignment_ramp(t_frac, *config.frame_ramp)
         geo_ramp = alignment_ramp(t_frac, *config.geo_ramp)
         dens_ramp = alignment_ramp(t_frac, *config.density_ramp) if density_on else 0.0
+        lvl_counts, epoch_steps = plan[epoch]
 
         pbar = tqdm(
-            range(steps_per_epoch),
+            range(epoch_steps),
             desc=f"epoch {epoch + 1}/{config.epochs}",
             leave=True,
             dynamic_ncols=True,
@@ -909,6 +1063,7 @@ def fit(
                     zdn.view(B_d, m_d, -1),
                     dmask.to(device),
                     dens_target[dcells.to(device)],
+                    var_shift=config.density_var_shift,
                 )
 
             L_geo = z_i.sum() * 0.0
@@ -997,7 +1152,7 @@ def fit(
                 refresh=False,
             )
 
-        nstep = steps_per_epoch
+        nstep = epoch_steps
         mean_a = torch.stack(usage).mean(dim=0).clamp_min(1e-12)
         usage_ent = float((-(mean_a * mean_a.log()).sum()).item())
         g_mean = float(np.mean(gammas[0::2])) if gammas else 0.0
@@ -1142,6 +1297,8 @@ def fit(
     )
     result.natural_scale = getattr(metric, "natural_scale", None)
     result.density = density_info
+    if warm_info:
+        result.graph_stats = {**result.graph_stats, **warm_info}
     if factor_metric is not None:
         result.factor_scales = dict(factor_metric.scales)
     if geo_stats:

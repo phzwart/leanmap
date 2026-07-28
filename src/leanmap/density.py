@@ -21,8 +21,22 @@ Correlating log radii instead is scale free. It asks that crowded ambient
 neighbourhoods come out crowded, in order, and says nothing about by how much --
 so there is no magnitude to fail to reach, no saturation, and no mode to choose.
 The ``dim / d_out`` factor drops out entirely, since correlation is invariant to
-it. This is the same shape of objective densMAP uses, which is why densMAP needs
-one weight rather than a per-dataset decision.
+it. This is the same shape of objective densMAP uses.
+
+Being scale free removes a way to fail; it does not make density preservation
+free. Sweeping ``lambda_density`` on digits costs local structure monotonically
+(``trust_5`` 0.947 -> 0.919, ``knn_overlap_5`` 0.395 -> 0.318 from 0 to 2.0) while
+density fidelity peaks at 1.0 and falls off after, and on s_curve the same sweep
+improves both at once. That tradeoff is a property of the data, not of the
+parameterisation: digits' density signal is largely discrete cluster structure,
+so honouring it fights the neighbour terms. UMAP is not exempt -- it keeps
+``densmap=False`` by default and so declines the task entirely, and densMAP
+exposes ``dens_lambda`` (default 2.0) for users to tune. What densMAP does have
+is damage control, mirrored here: the term is gated to the tail of training
+(``density_ramp``, cf. ``dens_frac``) so it refines a settled topology rather
+than steering a forming one, and its denominator carries a variance floor
+(``density_var_shift``, cf. ``dens_var_shift``) so a layout with little spread
+damps the gradient instead of amplifying it.
 
 :func:`density_budget`
     measures the ambient log radius per graph node, before training
@@ -43,10 +57,15 @@ from .distance import DistanceFn
 from .graph import Graph, _intrinsic_dim_levina_bickel
 from .utils import get_logger
 
-# Below this the batch carries no usable density signal -- every star has the
-# same radius -- and a correlation computed on it would be noise amplified by a
-# vanishing denominator. Such batches contribute nothing instead.
+# Below this the batch's *ambient* radii are all equal, so there is no ordering
+# to hold the layout to and a correlation would be noise over a vanishing
+# denominator. Such batches contribute nothing instead.
 MIN_TARGET_SD: float = 1e-3
+
+# Variance floor on the embedded side, densMAP's ``dens_var_shift``. Same default
+# and same units: variance of a log radius is invariant to the layout's overall
+# scale, so the number carries across datasets.
+DENSITY_VAR_SHIFT: float = 0.1
 
 
 @dataclass
@@ -182,27 +201,38 @@ def density_correlation_loss(
     z_nbr: torch.Tensor,
     mask: torch.Tensor,
     target: torch.Tensor,
+    var_shift: float = DENSITY_VAR_SHIFT,
 ) -> torch.Tensor:
     """``1 - corr(embedded log radius, ambient log radius)`` over the batch.
 
-    Scale free in both arguments: multiplying either side by any positive
-    constant leaves the value unchanged. That is the whole point -- the layout is
-    asked to put the crowded neighbourhoods in the crowded places, in order, and
-    never asked to hit a particular amount of contrast. A magnitude target can be
-    unreachable and then does damage while failing; an ordering target cannot be,
-    so one weight serves every dataset.
+    Asks that crowded ambient neighbourhoods come out crowded, in order, and
+    never that the layout reach a particular amount of contrast. A magnitude
+    target can be unreachable and then does damage while failing; an ordering
+    target cannot be.
+
+    ``var_shift`` is added to the embedded log-radius variance in the
+    denominator, as densMAP's ``dens_var_shift`` does. It buys stability at the
+    cost of exact scale invariance: a layout whose radii barely vary has its
+    gradient damped by the floor rather than amplified by a vanishing
+    denominator, which is the desirable direction to err, since such a layout has
+    no density signal to be confident about. Above that floor the term is
+    effectively the plain correlation, so the ``dim / d_out`` magnitude question
+    still does not arise. Set ``var_shift=0`` for the exact correlation.
 
     Ranges over ``[0, 2]`` with 1.0 the score of a layout whose density is
     unrelated to the data's, which puts it on the same footing as the other
-    unit-scale terms. Degenerate batches -- fewer than two stars, or no spread on
-    either side -- score 1.0 with no gradient rather than dividing by ~0.
+    unit-scale terms. Batches with fewer than two stars, or with no ambient
+    spread to correlate against, score 1.0 with no gradient.
     """
     if z_c.shape[0] < 2:
         return z_c.sum() * 0.0 + 1.0
     lr = embedded_log_radius(z_c, z_nbr, mask)
     a = lr - lr.mean()
     b = target - target.mean()
-    na, nb = a.norm(), b.norm()
-    if float(nb.detach()) < MIN_TARGET_SD or float(na.detach()) < MIN_TARGET_SD:
+    n = a.shape[0]
+    var_a = (a * a).sum() / n
+    var_b = (b * b).sum() / n
+    if float(var_b.detach()) < MIN_TARGET_SD**2:
         return z_c.sum() * 0.0 + 1.0
-    return 1.0 - (a * b).sum() / (na * nb)
+    denom = torch.sqrt(var_a + var_shift) * torch.sqrt(var_b)
+    return 1.0 - ((a * b).sum() / n) / denom

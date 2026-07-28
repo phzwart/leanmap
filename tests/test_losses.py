@@ -212,6 +212,39 @@ def test_procrustes_anchor_zero_for_similarity():
     assert float(procrustes_anchor_loss(z, target)) < 1e-5
 
 
+def test_best_rotation_2d_matches_svd_route():
+    """The 2-D closed form must be the SVD answer, reflections included."""
+    from leanmap.losses import _best_rotation
+
+    def svd_route(M):
+        U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+        R = U @ Vh
+        if torch.det(R) < 0:
+            U = U.clone()
+            U[:, -1] = -U[:, -1]
+            R = U @ Vh
+            S = S.clone()
+            S[-1] = -S[-1]
+        return R, S.sum()
+
+    torch.manual_seed(0)
+    for _ in range(200):
+        M = torch.randn(2, 2, dtype=torch.float64)
+        R, tr = _best_rotation(M)
+        R_ref, tr_ref = svd_route(M)
+        assert torch.allclose(R, R_ref, atol=1e-10)
+        assert abs(float(tr - tr_ref)) < 1e-10
+        assert abs(float(torch.det(R)) - 1.0) < 1e-10  # rotation, never a reflection
+
+
+def test_best_rotation_degenerate_input_is_finite():
+    from leanmap.losses import _best_rotation
+
+    R, tr = _best_rotation(torch.zeros(2, 2))
+    assert bool(torch.isfinite(R).all())
+    assert float(tr) == 0.0
+
+
 def test_procrustes_anchor_positive_for_twist():
     torch.manual_seed(0)
     # Rectangle of landmarks; twist the right half.

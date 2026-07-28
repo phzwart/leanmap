@@ -130,6 +130,22 @@ def build_arms(kind: str, epochs: int) -> List[RunSpec]:
         ]
     if kind == "min_dist":
         return [_arm("mdist", str(md), epochs, min_dist=md) for md in (0.1, 0.2, 0.5, 0.8)]
+    if kind == "speed":
+        # Two ways to stop paying full price for the early epochs, which only
+        # settle global layout: start from the landmark geodesic MDS instead of
+        # from PCA, and climb the pyramid from the coarsest level instead of
+        # mixing all scales from step 0. ``wall_s`` is the metric of interest
+        # here, but it only counts if the quality columns hold, so the half-epoch
+        # arm is the one that matters: same map, less time, or it did not work.
+        warm, coarse = dict(warm_start_steps=300), dict(coarse_first_frac=0.3)
+        return [
+            _arm("speed", "flat", epochs),
+            _arm("speed", "warm", epochs, **warm),
+            _arm("speed", "coarse", epochs, **coarse),
+            _arm("speed", "warm_coarse", epochs, **warm, **coarse),
+            _arm("speed", "warm_coarse_half", max(1, epochs // 2), **warm, **coarse),
+            _arm("speed", "flat_half", max(1, epochs // 2)),
+        ]
     if kind == "density":
         # Strength of the term tying which neighbourhoods come out crowded to the
         # ambient graph. The s-curve is the control that must NOT move: uniform
@@ -192,7 +208,7 @@ def build_arms(kind: str, epochs: int) -> List[RunSpec]:
 
 ARM_SETS = (
     "recommended", "ladder", "conditioning", "beta", "pyramid_geo",
-    "min_dist", "anchor", "squash", "pca_lr", "density",
+    "min_dist", "anchor", "squash", "pca_lr", "density", "speed",
 )
 
 

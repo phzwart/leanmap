@@ -374,6 +374,48 @@ def geodesic_stress_loss(
     return ((resid ** 2).mean() / denom).float()
 
 
+def _best_rotation(
+    M: torch.Tensor, eps: float = 1e-12
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Rotation maximising ``trace(R^T M)``, and that maximum.
+
+    Reflections are excluded, so this is the Procrustes solution over ``SO(d)``
+    rather than ``O(d)``.
+
+    In 2-D it is closed form. That is worth the special case because the general
+    route needs ``linalg.svd`` and a ``det(R) < 0`` branch, and this runs inside
+    the training step: MPS has no ``svd`` kernel, so the tiny 2x2 decomposition
+    falls back to the CPU and the Python-level comparison forces a device sync,
+    both on every step. With ``R(theta)`` substituted in,
+    ``trace(R^T M) = cos(theta) (M00 + M11) + sin(theta) (M10 - M01)``, which is
+    maximised at ``theta = atan2(M10 - M01, M00 + M11)`` with maximum
+    ``hypot(M00 + M11, M10 - M01)`` -- no factorisation and no branch.
+
+    A vanishing maximum means the two configurations are uncorrelated; ``scale``
+    then goes to zero at the call site, collapsing the target to a point, which is
+    the honest answer rather than an arbitrary rotation of noise.
+    """
+    if M.shape[-1] != 2:
+        U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+        R = U @ Vh
+        if torch.det(R) < 0:
+            U = U.clone()
+            U[:, -1] = -U[:, -1]
+            R = U @ Vh
+            S = S.clone()
+            S[-1] = -S[-1]
+        return R, S.sum()
+    cos_part = M[0, 0] + M[1, 1]
+    sin_part = M[1, 0] - M[0, 1]
+    trace = torch.hypot(cos_part, sin_part)
+    inv = 1.0 / trace.clamp_min(eps)
+    c, s = cos_part * inv, sin_part * inv
+    R = torch.stack(
+        [torch.stack([c, -s]), torch.stack([s, c])]
+    )
+    return R, trace
+
+
 def procrustes_anchor_loss(
     z: torch.Tensor,
     target: torch.Tensor,
@@ -403,18 +445,11 @@ def procrustes_anchor_loss(
         zc = z - z.mean(dim=0, keepdim=True)
         yc = target.to(device=z.device, dtype=z.dtype)
         yc = yc - yc.mean(dim=0, keepdim=True)
-        # Orthogonal Procrustes: R = U V^T from SVD(Y^T Z)
+        # Orthogonal Procrustes: the rotation maximising trace(R^T M).
         M = yc.transpose(0, 1) @ zc  # (d, d)
-        U, S, Vh = torch.linalg.svd(M, full_matrices=False)
-        R = U @ Vh
-        if torch.det(R) < 0:
-            U = U.clone()
-            U[:, -1] = -U[:, -1]
-            R = U @ Vh
-            S = S.clone()
-            S[-1] = -S[-1]
+        R, trace = _best_rotation(M)
         denom = (yc * yc).sum().clamp_min(eps)
-        scale = S.sum() / denom
+        scale = trace / denom
         t = z.mean(dim=0) - scale * (target.to(z.device, z.dtype).mean(dim=0) @ R)
     aligned = scale * (target.to(device=z.device, dtype=z.dtype) @ R) + t
     return ((z - aligned) ** 2).mean().float()
