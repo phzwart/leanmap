@@ -19,18 +19,39 @@ true distance factorises into an in-plane curve distance and a y-slab distance.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 
 import numpy as np
 import torch
 from sklearn.datasets import make_s_curve
 
 from _demo import OUT_DIR
-from negative_space_cotrain import PERTURB, base_config
 
-from leanmap import ALL_FEATURES, fit, fit_negative_space
-from leanmap.negative_space import _median_nn_scale
+from leanmap import ALL_FEATURES, PLANEConfig, fit, fit_negative_space
+from leanmap.negative_space import PerturbationConfig, _median_nn_scale
 from leanmap.distance import EuclideanDistance
-from dataclasses import replace
+
+PERTURB = PerturbationConfig(n_base=3000, radii_per_base=6, n_uniform_far=1500)
+
+
+def base_config(n, epochs, device, seed):
+    cfg = PLANEConfig.for_scale(n)
+    return replace(
+        cfg,
+        epochs=int(epochs),
+        seed=int(seed),
+        device=device,
+        batch_edges=512,
+        n_neighbors=10,
+        lr=1e-2,
+        lr_after=5e-3,
+        lr_switch_epochs=5,
+        min_dist=0.3,
+        n_negatives=15,
+        tau_scale=2.0,
+        learn_landmarks=False,
+        learn_tau=False,
+    )
 
 
 def true_distance_to_scurve(P: torch.Tensor, n_curve: int = 4000) -> torch.Tensor:
@@ -85,7 +106,6 @@ def main() -> None:
     ap.add_argument("--head-epochs", type=int, default=200)
     ap.add_argument("--alpha", type=float, default=0.1)
     ap.add_argument("--lam", type=float, default=None, help="exp(-score/lam) scale (auto if unset)")
-    ap.add_argument("--cotrain", action="store_true", help="co-train the encoder (lambda_dist>0)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
@@ -95,9 +115,7 @@ def main() -> None:
     X = X.astype("float32")
 
     cfg = base_config(args.n, args.epochs, args.device, args.seed)
-    if args.cotrain:
-        cfg = replace(cfg, lambda_dist=1.0, dist_ramp=(0.4, 0.7), dist_alpha=args.alpha)
-    print(f"training leanmap (cotrain={args.cotrain}) ...", flush=True)
+    print("training leanmap ...", flush=True)
     res = fit(X, dist_fn="l2", config=cfg)
 
     print("fitting negative-space head ...", flush=True)
@@ -170,10 +188,7 @@ def main() -> None:
     for a in (axes[1, 1], axes[1, 2]):
         a.set_xticks([]); a.set_yticks([]); a.set_aspect("equal", adjustable="datalim")
 
-    fig.suptitle(
-        f"Negative-space field probe on the S-curve "
-        f"({'co-trained' if args.cotrain else 'frozen'} encoder)"
-    )
+    fig.suptitle("Negative-space field probe on the S-curve (frozen encoder)")
     fig.tight_layout()
     out = OUT_DIR / "negative_space_field.png"
     fig.savefig(out, dpi=140)

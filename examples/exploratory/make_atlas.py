@@ -16,16 +16,30 @@ for p in (_EXAMPLES, _HERE):
         sys.path.insert(0, str(p))
 
 
-def build_atlas(name_dir: Path, *, cols: int = 4, thumb: float = 2.4) -> Path:
-    """Compose ``atlas.png`` from per-run ``scatter.png`` files."""
+def build_atlas(
+    name_dir: Path,
+    *,
+    cols: int = 4,
+    thumb: float = 2.4,
+    order: list[str] | None = None,
+) -> Path:
+    """Compose ``atlas.png`` from per-run ``scatter.png`` files.
+
+    ``order`` is an optional list of run directory names (pedagogical panel
+    order). When omitted, summary.csv order is used, else filesystem order.
+    """
     import matplotlib.pyplot as plt
     from matplotlib import image as mpimg
 
     name_dir = Path(name_dir)
-    # Prefer summary order if present; else filesystem order.
     run_dirs = []
+    if order:
+        for rid in order:
+            d = name_dir / rid
+            if (d / "scatter.png").is_file():
+                run_dirs.append(d)
     summary = name_dir / "summary.csv"
-    if summary.is_file() and summary.stat().st_size > 0:
+    if not run_dirs and summary.is_file() and summary.stat().st_size > 0:
         import csv
 
         with summary.open() as f:
@@ -82,6 +96,12 @@ def main(argv=None) -> int:
         help="directory containing per-run subfolders (e.g. examples/out/exploratory/s_curve)",
     )
     ap.add_argument("--cols", type=int, default=4)
+    ap.add_argument(
+        "--order",
+        nargs="+",
+        default=None,
+        help="optional run_id panel order (e.g. weights__off weights__flat …)",
+    )
     args = ap.parse_args(argv)
 
     name_dir = args.name_dir
@@ -98,7 +118,7 @@ def main(argv=None) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"summary refresh skipped: {exc}", file=sys.stderr)
 
-    atlas = build_atlas(name_dir, cols=args.cols)
+    atlas = build_atlas(name_dir, cols=args.cols, order=args.order)
     print(f"wrote {atlas}")
     return 0
 

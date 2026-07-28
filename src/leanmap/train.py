@@ -23,42 +23,96 @@ from .conditioning import (
     default_primary_factor,
     metric_from_factors,
 )
-from .config import AlignmentSpec, PLANEConfig
+from .config import (
+    C_BUCKETS,
+    C_SEARCH,
+    CALIB_FRAC,
+    ETA_BALANCE,
+    FRAME_CENTERS,
+    FRAME_NORMAL_THRESH,
+    FRAME_TANGENT_DIM,
+    GEO_PAIRS,
+    HYPER_WIDTH,
+    LAMBDA_BACKBONE,
+    LAMBDA_ORD,
+    LANDMARK_GEODESIC_K,
+    MDS_NEG_EIGEN_WARN,
+    PCA_CENTER,
+    PLANEConfig,
+    PYRAMID_REP_RATIO,
+    SPREAD,
+    WARMUP_FRAC,
+    WEIGHT_DECAY,
+)
 from .conformal import ConformalCalibrator, geometry_consistency_score, model_weight_hash
-from .distance import DistanceFn, EuclideanDistance
+from .density import density_budget, density_correlation_loss, star_log_radius
+from .distance import DistanceFn
 from .evaluate import geodesic_fidelity
 from .graph import Graph, build_graph, build_graph_pyramid
 from .landmarks import AnchorAffinity, LandmarkAffinity, classical_mds, landmark_geodesic_matrix
 from .losses import (
     alignment_ramp,
-    axial_alignment_loss,
     find_ab_params,
     fuzzy_cross_entropy,
     geodesic_stress_loss,
     landmark_regularisation,
-    lipschitz_penalty,
     local_rigidity_loss,
     ordinal_triplet_loss,
-    prepare_alignment_targets,
     procrustes_anchor_loss,
-    reconstruction_loss,
-    regional_alignment_loss,
-    sigreg_loss,
 )
 from .metrics import MetricSpec, wrap_metric
-from .model import Decoder, FiLMEncoder, PLANE, fit_pca_weight
-from .negative_space import (
-    ALL_FEATURES,
-    DistanceQuantileHead,
-    PerturbationConfig,
-    _median_nn_scale,
-    calibrate_head,
-    distance_to_support,
-    features_with_grad,
-    pinball_loss,
+from .model import ConcatEncoder, FiLMEncoder, PLANE, fit_pca_weight
+from .sampler import (
+    EdgeSampler,
+    NegativeSampler,
+    OrdinalTripletSampler,
+    StarSampler,
+    estimate_retention_null,
 )
-from .sampler import EdgeSampler, NegativeSampler, OrdinalTripletSampler, StarSampler
 from .utils import ensure_2d_float32, get_logger, resolve_device, seed_everything
+
+
+def _metric_name_from_dist_fn(dist_fn: Any) -> str:
+    """Derive a saveable metric label from the ``fit(..., dist_fn=...)`` argument."""
+    if isinstance(dist_fn, str):
+        return dist_fn
+    name = getattr(dist_fn, "name", None)
+    return str(name) if name else "custom"
+
+
+def _param_groups(model: torch.nn.Module, config: "PLANEConfig") -> list:
+    """Split parameters so the residual head can outrun the PCA skip.
+
+    With ``pca_skip=True`` the map starts at plain PCA and the head only has to
+    add a residual, so a single learning rate couples two decisions: raise it
+    and the skip drifts away from the PCA solution it was seeded with, leave it
+    low and the head never departs from PCA. ``pca_lr_mult`` decouples them by
+    putting the head and the FiLM hypernetworks on a higher rate than the skip
+    and backbone, which is the escape from that coupling.
+
+    A multiplier of 1 (the default) reproduces a single flat rate exactly.
+    """
+    mult = float(getattr(config, "pca_lr_mult", 1.0))
+    slow_prefixes = ("encoder.pca", "encoder.backbone", "encoder.norms")
+    if mult == 1.0 or not getattr(config, "pca_skip", False):
+        return [{"params": [p for p in model.parameters() if p.requires_grad]}]
+    fast, slow = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (slow if name.startswith(slow_prefixes) else fast).append(p)
+    if not fast or not slow:
+        return [{"params": [p for p in model.parameters() if p.requires_grad]}]
+    get_logger().info(
+        "param groups: %d slow tensors at lr, %d fast (head + FiLM hypers) at %.1fx",
+        len(slow),
+        len(fast),
+        mult,
+    )
+    return [
+        {"params": slow, "lr": float(config.lr)},
+        {"params": fast, "lr": float(config.lr) * mult},
+    ]
 
 
 @dataclass
@@ -71,7 +125,7 @@ class PLANEResult:
     a: float
     b: float
     graph_stats: dict
-    alignment_meta: list
+    metric_name: str = "l2"
 
     def save(self, path: Union[str, Path]) -> None:
         """Write a single ``.pt`` file containing only inference artefacts."""
@@ -119,11 +173,10 @@ class PLANEResult:
             if self.calibrator.s_calib is None
             else self.calibrator.s_calib.cpu(),
             "weight_hash": self.calibrator.weight_hash,
-            "alignment_metadata": self.alignment_meta,
             "graph_stats": self.graph_stats,
             "D": enc.D,
             "L": aff.M.shape[0],
-            "metric_name": self.config.metric,
+            "metric_name": self.metric_name,
             "natural_scale": getattr(self, "natural_scale", None),
             "factor_scales": getattr(self, "factor_scales", None),
         }
@@ -203,25 +256,33 @@ def load_plane(path: Union[str, Path], device: Optional[str] = None) -> PLANE:
             affs,
             width=cfg.width,
             depth=cfg.depth,
-            hyper_width=cfg.hyper_width,
+            hyper_width=HYPER_WIDTH,
             d_out=cfg.d_out,
         ).to(device_t)
         affinity_dim = sum(a.M.shape[0] for a in affs)
-        enc = FiLMEncoder(
-            D,
-            cfg.d_out,
-            width=cfg.width,
-            depth=cfg.depth,
-            L=L,
-            affinity_dim=affinity_dim,
-            hyper_width=cfg.hyper_width,
-            spectral_norm_flag=cfg.spectral_norm,
-            concat_affinity=cfg.concat_affinity,
-            pca_skip=cfg.pca_skip,
-        )
+        if getattr(cfg, "conditioning", "film") == "concat":
+            enc: Union[FiLMEncoder, ConcatEncoder] = ConcatEncoder(
+                D,
+                cfg.d_out,
+                width=cfg.width,
+                depth=cfg.depth,
+                L=L,
+                affinity_dim=affinity_dim,
+                pca_skip=cfg.pca_skip,
+            )
+        else:
+            enc = FiLMEncoder(
+                D,
+                cfg.d_out,
+                width=cfg.width,
+                depth=cfg.depth,
+                L=L,
+                affinity_dim=affinity_dim,
+                hyper_width=HYPER_WIDTH,
+                pca_skip=cfg.pca_skip,
+            )
         enc.set_normalization(payload["x_mean"], payload["x_std"])
-        dec = Decoder(cfg.d_out, D, cfg.width) if cfg.use_decoder else None
-        model = PLANE(stack, enc, dec).to(device_t)
+        model = PLANE(stack, enc).to(device_t)
     else:
         M = payload["landmark_coordinates"].to(device_t)
         aff = LandmarkAffinity(
@@ -239,14 +300,11 @@ def load_plane(path: Union[str, Path], device: Optional[str] = None) -> PLANE:
             width=cfg.width,
             depth=cfg.depth,
             L=L,
-            hyper_width=cfg.hyper_width,
-            spectral_norm_flag=cfg.spectral_norm,
-            concat_affinity=cfg.concat_affinity,
+            hyper_width=HYPER_WIDTH,
             pca_skip=cfg.pca_skip,
         )
         enc.set_normalization(payload["x_mean"], payload["x_std"])
-        dec = Decoder(cfg.d_out, D, cfg.width) if cfg.use_decoder else None
-        model = PLANE(aff, enc, dec).to(device_t)
+        model = PLANE(aff, enc).to(device_t)
     model.load_state_dict(payload["state_dict"], strict=False)
     model.eval()
     return model
@@ -256,7 +314,6 @@ def fit(
     X: np.ndarray | torch.Tensor,
     dist_fn: Union[str, MetricSpec, DistanceFn] = "l2",
     config: Optional[PLANEConfig] = None,
-    alignments: Optional[Sequence[AlignmentSpec]] = None,
     X_calib: Optional[np.ndarray | torch.Tensor] = None,
     callbacks: Optional[List[Callable]] = None,
     factors: Optional[Sequence[ConditioningFactor]] = None,
@@ -286,14 +343,6 @@ def fit(
         config = PLANEConfig.for_scale(X_tmp.shape[0])
     seed_everything(config.seed)
     device = resolve_device(config.device)
-    # Spectral-norm power iteration uses aten::vdot, which MPS does not implement
-    # even with PYTORCH_ENABLE_MPS_FALLBACK in some torch builds.
-    if device.type == "mps" and config.spectral_norm:
-        log = get_logger()
-        log.info("MPS: disabling spectral_norm (aten::vdot unsupported)")
-        from dataclasses import replace
-
-        config = replace(config, spectral_norm=False)
     X_all = torch.as_tensor(ensure_2d_float32(X), dtype=torch.float32)
     enc_view = encoder_view if encoder_view is not None else (lambda t: t)
 
@@ -304,7 +353,7 @@ def fit(
         X_train = X_all
         calib_idx = None
     else:
-        n_cal = min(int(config.calib_frac * N), config.calib_max)
+        n_cal = min(int(CALIB_FRAC * N), config.calib_max)
         n_cal = max(n_cal, 1)
         g = torch.Generator().manual_seed(config.seed)
         perm = torch.randperm(N, generator=g)
@@ -354,20 +403,6 @@ def fit(
                 learn_temperature=config.learn_tau,
             )
         ]
-        # Conditioning pyramid: add coarse MODULATOR levels (multi-resolution
-        # FiLM). Each gets its own auto-scaled tau via AnchorAffinity._default_tau.
-        for j, na in enumerate(config.conditioning_pyramid_levels or []):
-            factor_list.append(
-                ConditioningFactor(
-                    name=f"coarse{j}",
-                    view=identity_view,
-                    metric=metric,
-                    n_anchors=int(na),
-                    role=Role.MODULATOR,
-                    learn_anchors=config.learn_landmarks,
-                    learn_temperature=config.learn_tau,
-                )
-            )
     else:
         factor_list = list(factors)
 
@@ -403,29 +438,41 @@ def fit(
         X_train,
         metric,
         pyramid_scales=config.pyramid_scales,
-        pyramid_rep_ratio=config.pyramid_rep_ratio,
+        pyramid_rep_ratio=PYRAMID_REP_RATIO,
         pyramid_min_reps=config.pyramid_min_reps,
         pyramid_coarse_backbone=config.pyramid_coarse_backbone,
+        pyramid_squash=config.pyramid_squash,
         n_neighbors=config.n_neighbors,
         n_landmarks=n_graph_landmarks,
-        c_buckets=config.c_buckets,
+        c_buckets=C_BUCKETS,
         epsilon=config.epsilon,
         dedup=config.dedup,
         local_connectivity=config.local_connectivity,
         beta_multiplicity=config.beta_multiplicity,
-        hub_correction=config.hub_correction,
-        lambda_backbone=config.lambda_backbone,
+        lambda_backbone=LAMBDA_BACKBONE,
         knn_mode=config.knn_mode,
-        c_search=config.c_search,
+        c_search=C_SEARCH,
         seed=config.seed,
         extra_ivf_anchors=extra_ivf or None,
         fps_view=fps_view,
         fps_view_metric=fps_view_metric,
         fps_geodesic=config.landmark_geodesic,
-        fps_geodesic_k=config.landmark_geodesic_k,
+        fps_geodesic_k=LANDMARK_GEODESIC_K,
         fps_poisson=config.landmark_poisson,
     )
     graph = graphs[0]  # finest graph: reps/negatives/knn_idx/stats live here
+
+    if config.epsilon is None:
+        # Freeze the resolved merge radius into the artefact. Re-estimating on a
+        # refit would make the coarsening scale a function of how much data
+        # happened to be on hand, which defeats "explored once and saved".
+        from dataclasses import replace as _replace
+
+        config = _replace(config, epsilon=float(graph.stats.epsilon))
+        log.info(
+            "epsilon=%.6g frozen into the saved config (pass epsilon=None to re-estimate)",
+            config.epsilon,
+        )
 
     if calib_idx is not None:
         assert X_cal.shape[0] > 0
@@ -463,7 +510,7 @@ def fit(
         affs,
         width=config.width,
         depth=config.depth,
-        hyper_width=config.hyper_width,
+        hyper_width=HYPER_WIDTH,
         d_out=config.d_out,
     ).to(device)
     L = stack.primary_affinity.M.shape[0]
@@ -471,29 +518,47 @@ def fit(
     pca_weight = None
     if config.pca_skip:
         X_n = (X_enc_train - x_mean) / x_std
-        pca_weight = fit_pca_weight(X_n, config.d_out, center=config.pca_center)
+        pca_weight = fit_pca_weight(X_n, config.d_out, center=PCA_CENTER)
         log.info(
             "PCA skip: d_out=%d pca_center=%s (fit on encoder-normalized train)",
             config.d_out,
-            config.pca_center,
+            PCA_CENTER,
         )
-    encoder = FiLMEncoder(
-        D,
-        config.d_out,
-        width=config.width,
-        depth=config.depth,
-        L=L,
-        affinity_dim=affinity_dim,
-        hyper_width=config.hyper_width,
-        spectral_norm_flag=config.spectral_norm,
-        concat_affinity=config.concat_affinity,
-        pca_skip=config.pca_skip,
-        pca_weight=pca_weight,
-    )
+    if config.conditioning not in ("film", "concat"):
+        raise ValueError(
+            f"conditioning must be 'film' or 'concat', got {config.conditioning!r}"
+        )
+    if config.conditioning == "concat":
+        encoder: Union[FiLMEncoder, ConcatEncoder] = ConcatEncoder(
+            D,
+            config.d_out,
+            width=config.width,
+            depth=config.depth,
+            L=L,
+            affinity_dim=affinity_dim,
+            pca_skip=config.pca_skip,
+            pca_weight=pca_weight,
+        )
+        log.info(
+            "conditioning=concat: a(x) enters as %d extra input columns; "
+            "FiLM hypernetworks are unused",
+            affinity_dim,
+        )
+    else:
+        encoder = FiLMEncoder(
+            D,
+            config.d_out,
+            width=config.width,
+            depth=config.depth,
+            L=L,
+            affinity_dim=affinity_dim,
+            hyper_width=HYPER_WIDTH,
+            pca_skip=config.pca_skip,
+            pca_weight=pca_weight,
+        )
     encoder.set_normalization(x_mean, x_std)
-    decoder = Decoder(config.d_out, D, config.width) if config.use_decoder else None
     model = PLANE(
-        stack, encoder, decoder, encoder_view=encoder_view
+        stack, encoder, encoder_view=encoder_view
     ).to(device)
     if init_state_dict is not None:
         missing, unexpected = model.load_state_dict(init_state_dict, strict=False)
@@ -503,7 +568,26 @@ def fit(
             len(unexpected),
         )
 
-    a_param, b_param = find_ab_params(config.spread, config.min_dist)
+    # Measure from the ambient graph which neighbourhoods are crowded, before
+    # anything is optimised. The layout is later held in correspondence with this
+    # ordering; nothing here sets a contrast magnitude for it to reach.
+    budget = None
+    density_info: Dict[str, Any] = {}
+    if config.lambda_density > 0:
+        budget = density_budget(
+            X_train,
+            graph,
+            metric,
+            d_out=config.d_out,
+            dim=graph.stats.extra.get("epsilon_intrinsic_dim"),
+            seed=config.seed,
+        )
+        density_info.update(
+            intrinsic_dim=budget.dim, ambient_log_r_sd=budget.ambient_sd
+        )
+        log.info("density budget: %s", budget.describe())
+
+    a_param, b_param = find_ab_params(SPREAD, config.min_dist)
     # One EdgeSampler per pyramid level; per-step batch budget is split across
     # levels by weight so a single forward mixes all scales at ~constant cost.
     edge_samps = [
@@ -549,21 +633,51 @@ def fit(
     neg_samp = NegativeSampler(X_train, graph.reps, seed=config.seed)
     # Local-rigidity term: sample fine-graph neighbourhoods ("stars") from the
     # finest level so ambient distance is a good local-geodesic proxy.
+    # The density term reads the same stars: a node's neighbourhood radius is
+    # what both terms are about, one constraining its shape and the other its
+    # size.
     star_samp = (
         StarSampler(X_train, graphs[0], m=config.frame_neighbors, seed=config.seed)
         if config.lambda_frame > 0
         else None
     )
-    frame_centers = (
-        config.frame_centers if config.frame_centers is not None else 128
-    )
+    frame_centers = FRAME_CENTERS
+    # The density term gets its own stars: a wider neighbourhood (``n_neighbors``
+    # rather than the frame term's 6) for a steadier radius, and a fixed
+    # neighbour set so the ambient target and the layout estimate are measured
+    # over identical stars.
+    density_on = budget is not None
+    dens_samp = dens_target = None
+    if density_on:
+        dens_samp = StarSampler(
+            X_train,
+            graphs[0],
+            m=config.n_neighbors,
+            seed=config.seed,
+            deterministic=True,
+        )
+        nbr_idx, nbr_mask = dens_samp.padded_neighbours()
+        star_budget = budget.on_stars(
+            star_log_radius(
+                X_train, graph.reps.rep_idx, nbr_idx, nbr_mask, metric
+            )
+        )
+        dens_target = star_budget.target.to(device)
+        density_info["star_ambient_log_r_sd"] = star_budget.ambient_sd
+        log.info(
+            "density term active: correlating log radii against an ambient "
+            "spread of %.3f on %d-neighbour stars, weight %.3g",
+            star_budget.ambient_sd,
+            config.n_neighbors,
+            config.lambda_density,
+        )
     # Coarse geodesic backbone: classical MDS of landmark geodesics +
     # Procrustes pull (absolute gauge) plus optional pairwise stress.
     geo_pack = None
     if config.lambda_geo > 0:
         gk = (
-            config.landmark_geodesic_k
-            if config.landmark_geodesic_k is not None
+            LANDMARK_GEODESIC_K
+            if LANDMARK_GEODESIC_K is not None
             else config.n_neighbors
         )
         X_lm, G_geo, finite_geo = landmark_geodesic_matrix(
@@ -575,7 +689,32 @@ def fit(
                 "geodesic backbone: no finite landmark pairs — disabling lambda_geo"
             )
         else:
-            Z_mds = classical_mds(G_geo, d=config.d_out, finite=finite_geo)
+            Z_mds, mds_diag = classical_mds(
+                G_geo, d=config.d_out, finite=finite_geo, return_diagnostics=True
+            )
+            graph.stats.extra.update(mds_diag)
+            neg_ratio = float(mds_diag["mds_neg_eigen_ratio"])
+            if neg_ratio > MDS_NEG_EIGEN_WARN:
+                # Reported, not acted on: making a loss weight a hidden function
+                # of a diagnostic is the buried coupling this config avoids.
+                log.warning(
+                    "classical MDS negative-eigenvalue mass = %.3f (> %.2f): the "
+                    "landmark geodesics are not well embeddable in %d-D, so the "
+                    "Procrustes target is a lossy projection. Consider "
+                    "lambda_anchor=0 with lambda_frame > 0, which keeps metric "
+                    "fidelity without pinning a gauge that does not exist.",
+                    neg_ratio,
+                    MDS_NEG_EIGEN_WARN,
+                    config.d_out,
+                )
+            else:
+                log.info(
+                    "classical MDS negative-eigenvalue mass = %.3f; top-%d "
+                    "eigenvalues carry %.3f of the positive spectrum",
+                    neg_ratio,
+                    config.d_out,
+                    float(mds_diag["mds_top_eigen_frac"]),
+                )
             g_vals = G_geo[ii, jj]
             geo_pack = {
                 "X_lm": X_lm,
@@ -587,20 +726,19 @@ def fit(
             n_pairs = int(ii.numel())
             log.info(
                 "geodesic backbone: L=%d MDS+Procrustes + stress pairs=%d "
-                "(%.1f%%) geo median=%.4g lambda_geo=%.3g ramp=%s down=%s",
+                "(%.1f%%) geo median=%.4g lambda_geo=%.3g ramp=%s",
                 X_lm.shape[0],
                 n_pairs,
                 100.0 * n_pairs / max(X_lm.shape[0] * (X_lm.shape[0] - 1) / 2, 1),
                 float(g_vals.median().item()),
                 config.lambda_geo,
                 tuple(config.geo_ramp),
-                bool(config.geo_ramp_down),
             )
     primary_name = stack.primary_factor.name
     ord_by_factor: Dict[str, OrdinalTripletSampler] = {}
     for f, aff in zip(factor_list, affs):
         top1_f, _ = assign_buckets(
-            f.view(X_train), aff.M.detach().cpu(), f.metric, c=min(8, aff.M.shape[0])
+            f.view(X_train), aff.M.detach().cpu(), f.metric, c=min(C_BUCKETS, aff.M.shape[0])
         )
         ord_by_factor[f.name] = OrdinalTripletSampler(
             X_train, top1_f, f.metric, seed=config.seed, view=f.view
@@ -608,50 +746,32 @@ def fit(
     # Ordinal loss / retention always uses PRIMARY factor anchors + view metric
     ord_samp = ord_by_factor[primary_name]
 
-    prepared_align = prepare_alignment_targets(
-        list(alignments or []), whiten_multi_axis=config.whiten_multi_axis
-    )
-    alignment_meta = [
-        {"axis": s.axis, "kind": s.kind, "weight": s.weight, "sign": s.sign}
-        for s in prepared_align
-    ]
-
-    # Optional negative-space co-training: an auxiliary distance-to-support
-    # quantile head trained jointly with the encoder (grad flows into backbone).
-    dist_head: Optional[DistanceQuantileHead] = None
-    dist_feature_groups = tuple(config.dist_features) if config.dist_features else ALL_FEATURES
-    dist_nn_scale = 1.0
-    dist_support_ref: Optional[torch.Tensor] = None
-    if config.lambda_dist > 0:
-        from .negative_space import extract_features as _extract_features
-
-        with torch.no_grad():
-            feat_dim = _extract_features(
-                model, X_train[:2], dist_feature_groups
-            ).shape[1]
-        dist_head = DistanceQuantileHead(
-            feat_dim,
-            width=config.dist_head_width,
-            depth=config.dist_head_depth,
-            input_norm=True,
-        ).to(device)
-        dist_nn_scale = _median_nn_scale(X_train, EuclideanDistance())
-        ref_n = min(X_train.shape[0], 20000)
-        dist_support_ref = X_train[:ref_n].to(device)
-        log.info(
-            "negative-space co-training: lambda_dist=%.3g ramp=%s features=%d "
-            "perturb/step=%d nn_scale=%.4g",
-            config.lambda_dist, tuple(config.dist_ramp), feat_dim,
-            config.dist_perturb_per_step, dist_nn_scale,
+    # Chance level for retention_f, measured on this data rather than asserted.
+    try:
+        retention_chance = estimate_retention_null(
+            ord_samp, edge_samps[0], stack.primary_affinity, device=device
         )
+        log.info(
+            "empirical retention null = %.3f (shuffled landmark ranks; "
+            "the old asserted constant was %.3f)",
+            retention_chance,
+            RETENTION_CHANCE,
+        )
+    except Exception as exc:  # never block a fit on a diagnostic
+        retention_chance = RETENTION_CHANCE
+        log.warning(
+            "retention null estimation failed (%s); falling back to %.3f",
+            exc,
+            RETENTION_CHANCE,
+        )
+    retention_warn = retention_chance + (RETENTION_WARN - RETENTION_CHANCE)
 
     E = graph.edges.shape[0]
     steps_per_epoch = max(1, math.ceil(E / config.batch_edges))
     total_steps = steps_per_epoch * config.epochs
-    opt_params = list(model.parameters())
-    if dist_head is not None:
-        opt_params += list(dist_head.parameters())
-    opt = AdamW(opt_params, lr=config.lr, weight_decay=config.weight_decay)
+    opt = AdamW(
+        _param_groups(model, config), lr=config.lr, weight_decay=WEIGHT_DECAY
+    )
     if config.lr_after is not None and config.lr_switch_epochs > 0:
         switch_steps = int(config.lr_switch_epochs) * steps_per_epoch
         lr0 = float(config.lr)
@@ -670,7 +790,7 @@ def fit(
             lr1,
         )
     else:
-        warmup_steps = max(1, int(config.warmup_frac * total_steps))
+        warmup_steps = max(1, int(WARMUP_FRAC * total_steps))
         sched = SequentialLR(
             opt,
             [
@@ -689,14 +809,10 @@ def fit(
         totals = {
             "geom": 0.0,
             "ord": 0.0,
-            "align": 0.0,
-            "rec": 0.0,
-            "lip": 0.0,
-            "sigreg": 0.0,
             "lm": 0.0,
             "frame": 0.0,
             "geo": 0.0,
-            "dist": 0.0,
+            "dens": 0.0,
         }
         retentions = []
         gammas = []
@@ -704,12 +820,9 @@ def fit(
         usage = []
 
         t_frac = epoch / max(config.epochs - 1, 1)
-        ramp = alignment_ramp(t_frac, *config.align_ramp)
         frame_ramp = alignment_ramp(t_frac, *config.frame_ramp)
-        geo_ramp = alignment_ramp(
-            t_frac, *config.geo_ramp, down=bool(config.geo_ramp_down)
-        )
-        dist_ramp_val = alignment_ramp(t_frac, *config.dist_ramp)
+        geo_ramp = alignment_ramp(t_frac, *config.geo_ramp)
+        dens_ramp = alignment_ramp(t_frac, *config.density_ramp) if density_on else 0.0
 
         pbar = tqdm(
             range(steps_per_epoch),
@@ -760,53 +873,7 @@ def fit(
             )
             retentions.append(retention)
 
-            L_align = z_i.sum() * 0.0
-            if prepared_align and ramp > 0:
-                # Map batch points back to training indices — use values by matching
-                # We don't have indices; for axial, sample property from random train rows
-                # SPEC: alignments have values (N,) on the original training array.
-                # Edge sampler returns raw members; we need their indices.
-                # Re-sample: store last indices in EdgeSampler
-                pass
-            # Axial: use a random train batch for alignment (property from prepared values)
-            if prepared_align and ramp > 0:
-                g = torch.randint(0, X_train.shape[0], (config.batch_edges,))
-                xb = X_train[g].to(device)
-                zb, _, _ = model(xb)
-                for spec in prepared_align:
-                    if spec.kind == "axial":
-                        r = torch.as_tensor(spec.values, dtype=torch.float32)[g].to(device)
-                        L_align = L_align + spec.weight * axial_alignment_loss(
-                            zb, r, spec.axis, spec.sign
-                        )
-                    elif spec.kind == "regional":
-                        labels = torch.as_tensor(spec.labels)[g].to(device)
-                        L_align = L_align + spec.weight * regional_alignment_loss(
-                            zb, labels, spec.targets or {}
-                        )
-
-            L_rec = z_i.sum() * 0.0
-            if decoder is not None:
-                x_hat = decoder(z_i)
-                x_enc_i = model._x_enc(x_i)
-                x_n = (x_enc_i - encoder.x_mean) / encoder.x_std
-                L_rec = reconstruction_loss(x_hat, x_n)
-
-            L_lip = z_i.sum() * 0.0
-            if config.lambda_lip > 0:
-                L_lip = lipschitz_penalty(model, x_i)
-
-            L_sigreg = z_i.sum() * 0.0
-            if config.lambda_sigreg > 0:
-                L_sigreg = sigreg_loss(
-                    z_i,
-                    n_slices=config.sigreg_slices,
-                    n_points=config.sigreg_points,
-                    t_max=config.sigreg_domain,
-                    target_std=config.sigreg_target_std,
-                )
-
-            L_lm = landmark_regularisation(a_i, Dm_i, eta=config.eta_balance)
+            L_lm = landmark_regularisation(a_i, Dm_i, eta=ETA_BALANCE)
 
             L_frame = z_i.sum() * 0.0
             if star_samp is not None and frame_ramp > 0:
@@ -825,8 +892,23 @@ def fit(
                     xnbr,
                     fmask,
                     tangent=config.frame_tangent,
-                    tangent_dim=config.frame_tangent_dim,
-                    normal_thresh=config.frame_normal_thresh,
+                    tangent_dim=FRAME_TANGENT_DIM,
+                    normal_thresh=FRAME_NORMAL_THRESH,
+                )
+
+            L_dens = z_i.sum() * 0.0
+            if dens_target is not None and dens_samp is not None and dens_ramp > 0:
+                xdc, xdn, dmask, dcells = dens_samp.sample_indexed(
+                    config.density_centers
+                )
+                B_d, m_d, _ = xdn.shape
+                zdc, _, _ = model(xdc.to(device))
+                zdn, _, _ = model(xdn.reshape(B_d * m_d, -1).to(device))
+                L_dens = density_correlation_loss(
+                    zdc,
+                    zdn.view(B_d, m_d, -1),
+                    dmask.to(device),
+                    dens_target[dcells.to(device)],
                 )
 
             L_geo = z_i.sum() * 0.0
@@ -836,12 +918,14 @@ def fit(
                 # a subsample keeps metric fidelity without trapping a twist.
                 x_all = geo_pack["X_lm"].to(device)
                 z_all, _, _ = model(x_all)
-                L_anchor = procrustes_anchor_loss(z_all, geo_pack["Z_mds"])
+                L_anchor = (
+                    procrustes_anchor_loss(z_all, geo_pack["Z_mds"])
+                    if config.lambda_anchor != 0.0
+                    else z_all.sum() * 0.0
+                )
                 n_avail = int(geo_pack["ii"].shape[0])
                 n_take = (
-                    config.geo_pairs
-                    if config.geo_pairs is not None
-                    else min(n_avail, 2048)
+                    GEO_PAIRS if GEO_PAIRS is not None else min(n_avail, 2048)
                 )
                 n_take = max(1, min(n_take, n_avail))
                 pick = torch.randint(0, n_avail, (n_take,))
@@ -850,47 +934,15 @@ def fit(
                 L_stress = geodesic_stress_loss(
                     z_all[ia], z_all[ib], geo_pack["g"][pick].to(device)
                 )
-                L_geo = L_anchor + 0.25 * L_stress
-
-            # Negative-space co-training: score perturbations of the batch points
-            # (half on-manifold, half at a random shell radius) with the aux
-            # quantile head; pinball loss back-props into the encoder. The label
-            # is the fixed ambient distance to the train support.
-            L_dist = z_i.sum() * 0.0
-            if dist_head is not None and dist_ramp_val > 0 and dist_support_ref is not None:
-                k = min(config.dist_perturb_per_step, x_i.shape[0])
-                base = x_i[:k]
-                Ddim = base.shape[1]
-                log_lo = math.log(config.dist_r_min_mult * dist_nn_scale)
-                log_hi = math.log(config.dist_r_max_mult * dist_nn_scale)
-                r = torch.empty(k, 1, device=device).uniform_(log_lo, log_hi).exp()
-                dirs = torch.randn(k, Ddim, device=device)
-                dirs = dirs / dirs.norm(dim=1, keepdim=True).clamp_min(1e-12)
-                x_pert = torch.cat([base, base + r * dirs], dim=0)
-                with torch.no_grad():
-                    y_lbl = distance_to_support(
-                        x_pert, dist_support_ref, dist_fn=EuclideanDistance()
-                    ).to(device)
-                phi_d = features_with_grad(model, x_pert, dist_feature_groups)
-                lo_d, med_d, hi_d = dist_head(phi_d, detach_median=True)
-                a_lo, a_hi = config.dist_alpha / 2.0, 1.0 - config.dist_alpha / 2.0
-                L_dist = (
-                    pinball_loss(y_lbl, med_d, 0.5)
-                    + pinball_loss(y_lbl, lo_d, a_lo)
-                    + pinball_loss(y_lbl, hi_d, a_hi)
-                )
+                L_geo = config.lambda_anchor * L_anchor + 0.25 * L_stress
 
             loss = (
                 L_geom
-                + config.lambda_ord * L_ord
-                + ramp * L_align
-                + config.lambda_rec * L_rec
-                + config.lambda_lip * L_lip
-                + config.lambda_sigreg * L_sigreg
+                + LAMBDA_ORD * L_ord
                 + config.lambda_lm * L_lm
                 + config.lambda_frame * frame_ramp * L_frame
                 + config.lambda_geo * geo_ramp * L_geo
-                + config.lambda_dist * dist_ramp_val * L_dist
+                + config.lambda_density * dens_ramp * L_dens
             )
             opt.zero_grad()
             if not torch.isfinite(loss):
@@ -904,16 +956,10 @@ def fit(
 
             totals["geom"] += float(L_geom.item())
             totals["ord"] += float(L_ord.item())
-            totals["align"] += float(L_align.item()) if torch.is_tensor(L_align) else 0.0
-            totals["rec"] += float(L_rec.item()) if torch.is_tensor(L_rec) else 0.0
-            totals["lip"] += float(L_lip.item()) if torch.is_tensor(L_lip) else 0.0
-            totals["sigreg"] += (
-                float(L_sigreg.item()) if torch.is_tensor(L_sigreg) else 0.0
-            )
             totals["lm"] += float(L_lm.item())
             totals["frame"] += float(L_frame.item()) if torch.is_tensor(L_frame) else 0.0
             totals["geo"] += float(L_geo.item()) if torch.is_tensor(L_geo) else 0.0
-            totals["dist"] += float(L_dist.item()) if torch.is_tensor(L_dist) else 0.0
+            totals["dens"] += float(L_dens.item()) if torch.is_tensor(L_dens) else 0.0
             with torch.no_grad():
                 gammas.append(gamma.mean().item())
                 gammas.append(gamma.std().item())
@@ -944,7 +990,7 @@ def fit(
                     "lm": f"{totals['lm'] / steps_done:.3f}",
                     "frame": f"{totals['frame'] / steps_done:.3f}",
                     "geo": f"{totals['geo'] / steps_done:.3f}",
-                    "dist": f"{totals['dist'] / steps_done:.3f}",
+                    "dens": f"{totals['dens'] / steps_done:.3f}",
                     "ret": f"{float(np.mean(retentions)):.2f}" if retentions else "—",
                     "lr": f"{opt.param_groups[0]['lr']:.4g}",
                 },
@@ -960,14 +1006,10 @@ def fit(
         metrics = {
             "geom": totals["geom"] / nstep,
             "ord": totals["ord"] / nstep,
-            "align": totals["align"] / nstep,
-            "rec": totals["rec"] / nstep,
-            "lip": totals["lip"] / nstep,
-            "sigreg": totals["sigreg"] / nstep,
             "lm": totals["lm"] / nstep,
             "frame": totals["frame"] / nstep,
             "geo": totals["geo"] / nstep,
-            "dist": totals["dist"] / nstep,
+            "dens": totals["dens"] / nstep,
             "retention": ret,
             "mean_gamma": g_mean,
             "std_gamma": g_std,
@@ -975,22 +1017,19 @@ def fit(
             "min_dm": float(np.mean(min_dm)) if min_dm else 0.0,
         }
         log.info(
-            "epoch %d: geom=%.4f ord=%.4f align=%.4f rec=%.4f lip=%.4f "
-            "sigreg=%.4f lm=%.4f frame=%.4f geo=%.4f "
+            "epoch %d: geom=%.4f ord=%.4f "
+            "lm=%.4f frame=%.4f geo=%.4f dens=%.4f "
             "retention=%.3f (chance≈%.3f) mean(gamma)=%.3f std(gamma)=%.3f "
             "usage_ent=%.3f minDm=%.4f",
             epoch + 1,
             metrics["geom"],
             metrics["ord"],
-            metrics["align"],
-            metrics["rec"],
-            metrics["lip"],
-            metrics["sigreg"],
             metrics["lm"],
             metrics["frame"],
             metrics["geo"],
+            metrics["dens"],
             metrics["retention"],
-            RETENTION_CHANCE,
+            retention_chance,
             metrics["mean_gamma"],
             metrics["std_gamma"],
             metrics["usage_ent"],
@@ -1000,14 +1039,14 @@ def fit(
         for fname, vals in extra.items():
             rf = float(np.mean(vals)) if vals else 0.0
             metrics[f"retention_{fname}"] = rf
-            if rf < RETENTION_WARN:
+            if rf < retention_warn:
                 log.warning(
                     "factor %r retention_f=%.3f < %.2f (chance≈%.3f) — conditioning "
                     "on noise; other metrics in this run are unreliable",
                     fname,
                     rf,
-                    RETENTION_WARN,
-                    RETENTION_CHANCE,
+                    retention_warn,
+                    retention_chance,
                 )
         model._ret_extra = {}  # type: ignore[attr-defined]
         g_extra = getattr(model, "_g_extra", {})
@@ -1016,14 +1055,14 @@ def fit(
                 metrics[f"mean_gamma_{fname}"] = float(np.mean([v[0] for v in vals]))
                 metrics[f"std_gamma_{fname}"] = float(np.mean([v[1] for v in vals]))
         model._g_extra = {}  # type: ignore[attr-defined]
-        if ret < RETENTION_WARN:
+        if ret < retention_warn:
             log.warning(
                 "factor %r retention_f=%.3f < %.2f (chance≈%.3f) — conditioning "
                 "on noise; other metrics in this run are unreliable",
                 stack.primary_factor.name,
                 ret,
-                RETENTION_WARN,
-                RETENTION_CHANCE,
+                retention_warn,
+                retention_chance,
             )
         if g_std < 1e-3:
             log.info("std(gamma) near zero — FiLM conditioning may be unused")
@@ -1099,33 +1138,13 @@ def fit(
         a=a_param,
         b=b_param,
         graph_stats=asdict(graph.stats),
-        alignment_meta=alignment_meta,
+        metric_name=_metric_name_from_dist_fn(dist_fn),
     )
     result.natural_scale = getattr(metric, "natural_scale", None)
+    result.density = density_info
     if factor_metric is not None:
         result.factor_scales = dict(factor_metric.scales)
     if geo_stats:
         result.graph_stats = {**result.graph_stats, **geo_stats}
-
-    # Finalize negative-space co-training: freeze + recalibrate (CQR) the aux
-    # head on a fresh perturbation set, and attach it to the result.
-    result.negative_space = None
-    result.negative_space_stats = None
-    if dist_head is not None:
-        model.eval()
-        ns_model, ns_stats = calibrate_head(
-            model,
-            dist_head,
-            X_train,
-            feature_groups=dist_feature_groups,
-            alpha=config.dist_alpha,
-            perturb=PerturbationConfig(
-                r_min_mult=config.dist_r_min_mult,
-                r_max_mult=config.dist_r_max_mult,
-                seed=config.seed + 1,
-            ),
-        )
-        result.negative_space = ns_model
-        result.negative_space_stats = ns_stats
 
     return result

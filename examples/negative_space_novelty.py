@@ -23,8 +23,7 @@ import torch
 from sklearn.datasets import make_s_curve
 
 from _demo import OUT_DIR
-from negative_space_cotrain import PERTURB, base_config
-from negative_space_field import uniform_field
+from negative_space_field import PERTURB, base_config, uniform_field
 
 from leanmap import ALL_FEATURES, calibrate_novelty, fit, fit_negative_space
 from leanmap.distance import EuclideanDistance

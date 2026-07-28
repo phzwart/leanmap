@@ -7,7 +7,8 @@ forward pass.
 
 from __future__ import annotations
 
-# Must be set before torch initializes the MPS backend (spectral-norm vdot, etc.).
+# Must be set before torch initializes the MPS backend so ops missing on Metal
+# fall back to CPU (e.g. some cdist / deterministic kernels).
 import os
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -25,8 +26,13 @@ from .conditioning import (
     scale_quotient_factorization,
     validate_factors,
 )
-from .config import AlignmentSpec, PLANEConfig
-from .conformal import ConformalCalibrator, bh_reject, geometry_consistency_score
+from .config import PLANEConfig
+from .conformal import (
+    ConformalCalibrator,
+    LandmarkSupport,
+    bh_reject,
+    geometry_consistency_score,
+)
 from .distance import (
     CallableDistance,
     CosineDistance,
@@ -50,12 +56,14 @@ from .emd import (
     reference_trust_continuity,
 )
 from .evaluate import (
-    alignment_report,
     benchmark_inference,
     geodesic_fidelity,
     knn_recall_out_of_sample,
     density_correspondence,
     knn_local_density,
+    neighborhood_rank_agreement,
+    persistence_summary,
+    procrustes_disagreement,
     shepard_pairs_ambient,
     shepard_pairs_geodesic,
     shepard_stats,
@@ -82,7 +90,7 @@ from .landmarks import (
     quantile_init,
 )
 from .metrics import CompositeMetric, MetricSpec, get_metric, wrap_metric
-from .model import FiLMEncoder, PLANE, fit_pca_weight
+from .model import ConcatEncoder, FiLMEncoder, PLANE, fit_pca_weight
 from .probes import (
     CONTROL_PROBES,
     PROBE_PATTERNS,
@@ -98,11 +106,9 @@ from .negative_space import (
     NegativeSpaceModel,
     PerturbationConfig,
     build_labeled_set,
-    calibrate_head,
     calibrate_novelty,
     distance_to_support,
     extract_features,
-    features_with_grad,
     fit_negative_space,
     NoveltyDetector,
     sample_perturbations,
@@ -112,7 +118,6 @@ from .train import PLANEResult, fit, load_plane
 __version__ = "0.2.0"
 
 __all__ = [
-    "AlignmentSpec",
     "PLANEConfig",
     "PLANE",
     "PLANEResult",
@@ -157,12 +162,13 @@ __all__ = [
     "smooth_knn",
     "union_assign_topc",
     "FiLMEncoder",
+    "ConcatEncoder",
     "fit_pca_weight",
     "ConformalCalibrator",
+    "LandmarkSupport",
     "geometry_consistency_score",
     "bh_reject",
     "fit_negative_space",
-    "calibrate_head",
     "calibrate_novelty",
     "NoveltyDetector",
     "NegativeSpaceModel",
@@ -171,13 +177,11 @@ __all__ = [
     "build_labeled_set",
     "sample_perturbations",
     "extract_features",
-    "features_with_grad",
     "distance_to_support",
     "ALL_FEATURES",
     "DM_ONLY_FEATURES",
     "trustworthiness_continuity",
     "knn_recall_out_of_sample",
-    "alignment_report",
     "benchmark_inference",
     "uniformity_of_pvalues",
     "geodesic_fidelity",
@@ -186,6 +190,9 @@ __all__ = [
     "shepard_pairs_geodesic",
     "knn_local_density",
     "density_correspondence",
+    "procrustes_disagreement",
+    "neighborhood_rank_agreement",
+    "persistence_summary",
     "grid_cost_matrix",
     "image_masses",
     "image_emd",

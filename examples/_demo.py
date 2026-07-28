@@ -37,8 +37,8 @@ def fit_embed(
     pyramid_level_weights=None,
     pyramid_scales=None,
     pyramid_coarse_backbone=None,
+    pyramid_min_reps=None,
     pca_skip: Optional[bool] = None,
-    spectral_norm: Optional[bool] = None,
     width: Optional[int] = None,
     depth: Optional[int] = None,
     n_landmarks: Optional[int] = None,
@@ -57,16 +57,16 @@ def fit_embed(
     tau_init: Optional[float] = None,
     landmark_geodesic: Optional[bool] = None,
     landmark_poisson: Optional[bool] = None,
-    conditioning_pyramid_levels=None,
     lambda_frame: Optional[float] = None,
     frame_neighbors: Optional[int] = None,
     frame_tangent: Optional[bool] = None,
     frame_ramp=None,
     lambda_geo: Optional[float] = None,
     geo_ramp=None,
-    geo_ramp_down: Optional[bool] = None,
+    metric="l2",
     callbacks=None,
     init_state_dict=None,
+    **config_overrides,
 ):
     from leanmap import fit
 
@@ -84,10 +84,10 @@ def fit_embed(
         cfg.pyramid_level_weights = tuple(float(w) for w in pyramid_level_weights)
     if pyramid_coarse_backbone is not None:
         cfg.pyramid_coarse_backbone = float(pyramid_coarse_backbone)
+    if pyramid_min_reps is not None:
+        cfg.pyramid_min_reps = int(pyramid_min_reps)
     if pca_skip is not None:
         cfg.pca_skip = bool(pca_skip)
-    if spectral_norm is not None:
-        cfg.spectral_norm = bool(spectral_norm)
     if width is not None:
         cfg.width = int(width)
     if depth is not None:
@@ -124,8 +124,6 @@ def fit_embed(
         cfg.landmark_geodesic = bool(landmark_geodesic)
     if landmark_poisson is not None:
         cfg.landmark_poisson = bool(landmark_poisson)
-    if conditioning_pyramid_levels is not None:
-        cfg.conditioning_pyramid_levels = tuple(int(n) for n in conditioning_pyramid_levels)
     if lambda_frame is not None:
         cfg.lambda_frame = float(lambda_frame)
     if frame_neighbors is not None:
@@ -138,11 +136,15 @@ def fit_embed(
         cfg.lambda_geo = float(lambda_geo)
     if geo_ramp is not None:
         cfg.geo_ramp = (float(geo_ramp[0]), float(geo_ramp[1]))
-    if geo_ramp_down is not None:
-        cfg.geo_ramp_down = bool(geo_ramp_down)
+    # Any remaining kwarg must name a real config field, so a typo in a sweep
+    # overlay fails loudly instead of being silently ignored.
+    for key, value in config_overrides.items():
+        if not hasattr(cfg, key):
+            raise TypeError(f"unknown PLANEConfig field {key!r} in fit_embed overlay")
+        setattr(cfg, key, value)
     result = fit(
         X,
-        dist_fn="l2",
+        dist_fn=metric,
         config=cfg,
         callbacks=callbacks,
         init_state_dict=init_state_dict,

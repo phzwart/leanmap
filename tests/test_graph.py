@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from scipy import sparse
@@ -106,6 +107,97 @@ def test_estimate_epsilon_positive_median_fallback():
     assert eps > 0.0
     assert diag["used_positive_median_fallback"] is True
     assert diag["frac_exact_zero"] > 0.0
+
+
+def test_estimate_epsilon_uses_all_points():
+    """The quantile is read off every row, not a fixed-size subsample.
+
+    A subsample estimate drifts upward with N like (N/n_sub)^(1/m); reporting
+    the scope lets a caller see which path was taken.
+    """
+    torch.manual_seed(3)
+    X = torch.randn(500, 4)
+    metric = wrap_metric("l2", X=X, n_neighbors=5, seed=0)
+    eps, diag = estimate_epsilon(X, metric, n_sample=50, quantile=0.05, seed=0, metric=metric)
+    assert diag["scope"] == "full"
+    assert diag["subsample_correction"] == 1.0
+    assert eps > 0.0
+
+
+def test_estimate_epsilon_subsample_is_size_corrected():
+    """Without a full pass, the subsample quantile is scaled by (n_sub/N)^(1/m)."""
+    from leanmap import graph as graph_mod
+
+    torch.manual_seed(4)
+    X = torch.randn(800, 3)
+    metric = wrap_metric("l2", X=X, n_neighbors=5, seed=0)
+    eps_full, _ = estimate_epsilon(X, metric, quantile=0.1, seed=0, metric=metric)
+
+    orig = graph_mod._one_nn_all
+    graph_mod._one_nn_all = lambda *a, **k: None
+    try:
+        eps_sub, diag = estimate_epsilon(X, metric, n_sample=200, quantile=0.1, seed=0)
+    finally:
+        graph_mod._one_nn_all = orig
+
+    assert diag["scope"] == "subsample"
+    assert 0.0 < diag["subsample_correction"] < 1.0
+    # The correction must move the subsample estimate toward the full-N value,
+    # which is what stops epsilon from drifting with dataset size.
+    raw = eps_sub / diag["subsample_correction"]
+    assert abs(eps_sub - eps_full) < abs(raw - eps_full)
+
+
+def test_halo_merges_across_landmark_buckets():
+    """Near-duplicates split by a Voronoi boundary collapse into one cell."""
+    from leanmap.graph import _halo_merge, build_representatives
+
+    # Two tight pairs placed on opposite sides of the midplane between the
+    # two landmark seeds, so each pair straddles the bucket boundary.
+    eps = 1e-3
+    X = torch.tensor(
+        [
+            [-1.0, 0.0],
+            [1.0, 0.0],
+            [-0.1 * eps, 0.0],
+            [0.1 * eps, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    metric = wrap_metric("l2", X=X, n_neighbors=2, seed=0)
+    M = X[torch.tensor([0, 1])]
+    top1, topc = assign_buckets(X, M, metric, c=2)
+    assert int(top1[2]) != int(top1[3])
+
+    reps = build_representatives(X, top1, metric, epsilon=float(eps / metric.natural_scale), L=2, seed=0)
+    r_before = int(reps.rep_idx.shape[0])
+    merged, info = _halo_merge(X, reps, topc, metric, float(eps / metric.natural_scale))
+
+    assert info["halo_merged"] == r_before - int(merged.rep_idx.shape[0])
+    assert info["halo_merged"] >= 1
+    # Membership stays a total, contiguous partition of all N points.
+    assert int(merged.weight.sum()) == X.shape[0]
+    assert int(merged.offsets[-1]) == X.shape[0]
+    assert torch.equal(torch.sort(merged.values).values, torch.arange(X.shape[0]))
+    assert int(merged.member_of.max()) == int(merged.rep_idx.shape[0]) - 1
+
+
+def test_halo_merge_is_order_independent():
+    """Union-find over pre-merge pairs: a chain collapses to one component."""
+    from leanmap.graph import _halo_merge, build_representatives
+
+    torch.manual_seed(11)
+    X = torch.randn(120, 3)
+    metric = wrap_metric("l2", X=X, n_neighbors=5, seed=0)
+    M = fps_init(X, metric, 6, seed=0)
+    top1, topc = assign_buckets(X, M, metric, c=4)
+    eps = 0.35
+    reps = build_representatives(X, top1, metric, epsilon=eps, L=6, seed=0)
+
+    a, _ = _halo_merge(X, reps, topc, metric, eps)
+    b, _ = _halo_merge(X, reps, topc, metric, eps)
+    assert torch.equal(a.rep_idx, b.rep_idx)
+    assert torch.equal(a.member_of, b.member_of)
 
 
 def test_epsilon_zero_no_dedup():
@@ -367,7 +459,10 @@ def test_cohesive_pyramid_applies_backbone_by_default():
     )
     assert len(graphs) >= 2
     assert _n_components(graphs[-1]) == 1
-    assert float(graphs[-1].weights.max()) >= 0.99
+    w = graphs[-1].weights
+    # Valid memberships. The default "rational" squash never saturates, so the
+    # top coarse edges keep their ranking instead of flattening to a common 1.
+    assert float(w.min()) > 0.0 and float(w.max()) < 1.0
     # level-weight vector length for pyramid_scales=3 is 4; here scales=2 → ≤3
     from leanmap.config import PLANEConfig
 
@@ -480,3 +575,106 @@ def test_level_weights_keep_coarsest_when_truncated(caplog):
     assert warn, f"expected a truncation warning, got {msgs}"
     assert "kept the coarsest weight 4" in warn[0]
 
+
+
+def test_rational_squash_is_monotone_and_unsaturating():
+    """The top coarse edges must keep their ranking, not flatten to a tie."""
+    from leanmap.graph import _squash_coarse_weights
+
+    # Heavy tail: the top 1% spans two orders of magnitude.
+    w = torch.cat([torch.linspace(0.1, 10.0, 990), torch.linspace(50.0, 5000.0, 10)])
+    w = w.to(torch.float64)
+
+    old = _squash_coarse_weights(w, mode="quantile_clamp")
+    new = _squash_coarse_weights(w, mode="rational")
+
+    top = w >= 50.0
+    # Old scaling ties the entire top tail at exactly 1.0, discarding the order
+    # among the very edges a (1, 2, 8) pyramid exists to exploit.
+    assert int(old[top].unique().numel()) == 1
+    assert float(old[top].max()) == 1.0
+    # New scaling keeps every one of them distinct and strictly increasing.
+    assert int(new[top].unique().numel()) == int(top.sum())
+    assert bool((new[1:] >= new[:-1]).all())
+    assert float(new.max()) < 1.0
+    # Median maps to 0.5 by construction.
+    q50 = float(torch.quantile(w, 0.5))
+    assert abs(float(_squash_coarse_weights(torch.tensor([q50]).double(), "rational")) - 0.5) < 1e-6
+
+
+def test_squash_modes_differ_in_magnitude():
+    """Level weights tuned under one scaling do not transfer to the other."""
+    from leanmap.graph import _squash_coarse_weights
+
+    w = torch.distributions.LogNormal(0.0, 1.5).sample((2000,)).double()
+    old = _squash_coarse_weights(w, mode="quantile_clamp")
+    new = _squash_coarse_weights(w, mode="rational")
+    assert float(new.mean()) > 1.5 * float(old.mean())
+
+
+def test_squash_handles_degenerate_inputs():
+    from leanmap.graph import _squash_coarse_weights
+
+    assert _squash_coarse_weights(torch.zeros(0).double()).numel() == 0
+    # A zero median must not divide by zero.
+    w = torch.cat([torch.zeros(90), torch.ones(10)]).double()
+    out = _squash_coarse_weights(w, mode="rational")
+    assert bool(torch.isfinite(out).all())
+    assert float(out.max()) < 1.0
+    single = _squash_coarse_weights(torch.tensor([3.0]).double(), "rational")
+    assert bool(torch.isfinite(single).all())
+
+
+def test_pyramid_squash_is_selectable():
+    torch.manual_seed(0)
+    X = torch.randn(300, 5)
+    metric = wrap_metric("l2", X=X, n_neighbors=10, seed=0)
+    kw = dict(
+        pyramid_scales=2,
+        pyramid_rep_ratio=3.0,
+        pyramid_min_reps=8,
+        n_neighbors=10,
+        n_landmarks=16,
+        epsilon=0.0,
+        seed=0,
+        knn_mode="brute",
+    )
+    g_new, *_ = build_graph_pyramid(X, metric, pyramid_squash="rational", **kw)
+    g_old, *_ = build_graph_pyramid(X, metric, pyramid_squash="quantile_clamp", **kw)
+    assert float(g_new[-1].weights.max()) < 1.0
+    assert float(g_old[-1].weights.max()) == 1.0
+    with pytest.raises(ValueError):
+        build_graph_pyramid(X, metric, pyramid_squash="nope", **kw)
+
+
+def test_q99_anchor_is_monotone_and_selective():
+    """The default must fix the clamp's ties without diffusing coarse pull.
+
+    Anchoring the rational map at the median is monotone but lifts the mean
+    membership ~6x, making coarse attraction diffuse instead of selective;
+    that measurably degraded density correspondence on clustered data.
+    Anchoring at q99 keeps clamp's magnitude while removing the ties.
+    """
+    from leanmap.graph import _squash_coarse_weights
+
+    torch.manual_seed(0)
+    w = torch.distributions.LogNormal(0.0, 1.5).sample((5000,)).double()
+    clamp = _squash_coarse_weights(w, "quantile_clamp")
+    q50 = _squash_coarse_weights(w, "rational")
+    q99 = _squash_coarse_weights(w, "rational_q99")
+
+    # Monotone and unsaturating: no ties at the top, unlike the clamp.
+    assert int((clamp == clamp.max()).sum()) > 10
+    assert int((q99 == q99.max()).sum()) == 1
+    assert float(q99.max()) < 1.0
+    assert bool((q99[torch.argsort(w)][1:] >= q99[torch.argsort(w)][:-1]).all())
+
+    # Selective: magnitude comparable to the clamp, unlike the median anchor.
+    assert abs(float(q99.mean()) - float(clamp.mean())) < 0.05
+    assert float(q50.mean()) > 4.0 * float(q99.mean())
+
+
+def test_default_squash_is_q99():
+    from leanmap.config import PLANEConfig
+
+    assert PLANEConfig().pyramid_squash == "rational_q99"

@@ -51,5 +51,17 @@ train.log
 examples/out/
 examples/**/__pycache__/
 
+# Live exploratory run output: deliberately un-ignored so the artifacts stay
+# visible in the editor while a run streams. Scratch space -- do not commit.
+!runs/
+!runs/**
+
 # PDB datasets (outside paper scope; large / regenerable)
 examples/data/pdb_*
+
+# LaTeX build products (regenerable from the .tex)
+docs/**/*.aux
+docs/**/*.log
+docs/**/*.out
+docs/**/*.toc
+docs/**/*.pdf

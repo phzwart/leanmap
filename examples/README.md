@@ -1,35 +1,29 @@
-# leanmap examples
+# Examples
 
-Curated toy demos:
+Toy demos and the exploratory paper harness.
+
+| script | role |
+|--------|------|
+| `s_curve.py` | Standalone S-curve fit / plot |
+| `swiss_roll.py` | Standalone swiss-roll fit / plot |
+| `digits.py` | Standalone 8×8 digits fit / plot |
+| `exploratory/` | Paper battery: feeds, sweeps, metrics, EMD, conformal |
+| `negative_space.py` | Frozen distance-to-support probe (post-hoc) |
+| `reusability.py` | Out-of-sample reuse demo |
+
+Paper documentation lives under [`docs/`](../docs/):
+
+- [CONFIGURATION.md](../docs/CONFIGURATION.md) — practical settings
+- [RESULTS.md](../docs/RESULTS.md) — evidence on s-curve, swiss roll, digits, iris
+- [METRICS.md](../docs/METRICS.md) — how to read the battery
 
 ```bash
-pip install -e ".[examples,cpu]"
-
-python examples/s_curve.py
-python examples/swiss_roll.py
-python examples/swiss_cone.py
-python examples/digits.py
-python examples/petiole.py
-python examples/reusability.py
+python examples/exploratory/prepare_feeds.py
+python examples/exploratory/master.py \
+  --X examples/exploratory/data/digits_X.npy \
+  --y examples/exploratory/data/digits_y.npy \
+  --name paper_digits --sweep canonical --only recommended \
+  --holdout 0.2 --seeds 0 1 2 --null shuffle --target-perp 8
 ```
 
-See [`REUSABILITY.md`](REUSABILITY.md) for a walkthrough of why a fitted leanmap
-is a reusable, OOD-aware *model* rather than a one-off layout (with a UMAP
-comparison).
-
-Plots write to `examples/out/` (gitignored).
-
-| script | data | default N |
-|--------|------|-----------|
-| `s_curve.py` | `sklearn.datasets.make_s_curve` (gallery: n=1500, noise=0) | 1500 × 3 |
-| `swiss_roll.py` | `sklearn.datasets.make_swiss_roll` | 2000 × 3 |
-| `swiss_cone.py` | flaring Swiss *roll* ribbon + parameter-space hole | 5000 × 3 |
-| `digits.py` | `sklearn.datasets.load_digits` (8×8) | 1797 × 64 |
-| `petiole.py` | 11×11 patches from petiole tomography (256×256) | 5000 × 121 |
-| `reusability.py` | Swiss cone; reuse + OOD vs UMAP | 2000 train / 10k test |
-
-Systematic axis sweeps (generic array ingest, visual/metric atlas) live under
-[`exploratory/`](exploratory/) — see that README for the master CLI.
-
-Older cell / ligand / sweep scripts and run artifacts live under
-`legacy/examples/` (gitignored).
+See [`exploratory/README.md`](exploratory/README.md) for the harness contract.

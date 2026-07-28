@@ -37,6 +37,11 @@ a factor may condition only (`metric_weight=None`), score only, both, or neither
 
 Composition: `gamma = clamp(∏ gamma_f)`, `beta = Σ beta_f`.
 
+The encoder applies `gelu(gamma * LN(W h) + beta)` — normalise, *then* modulate.
+The order matters for the scalar-`gamma` roles: `LN(c*h) == LN(h)` for `c > 0`,
+so modulating before the norm would make `GAIN` a literal no-op and leave
+`MODULATOR` acting only through `beta`'s relative size.
+
 ### Domain declarations (same API)
 
 | domain | `PRIMARY` | `MODULATOR` | `AXIS` / `GAIN` | notes |
@@ -52,8 +57,17 @@ Helper: `scale_quotient_factorization()` builds direction + log-magnitude factor
 ### `retention_f`
 
 Per-factor fraction of (near, mid, far) triplets — proposed by ranking that
-factor's anchors — that satisfy the factor's **view metric** order. Chance is
-≈ **0.475** when `near` comes from a graph edge. Below **0.55**, the factor is
+factor's anchors — that satisfy the factor's **view metric** order.
+
+Chance is **measured, not asserted**: at fit time the landmark ranks are
+shuffled and the same sampler is re-run, which gives the rate at which a
+triplet passes with no information in the ranking. That rate depends on the
+sampler, the bucket-size distribution, and the data — measured values run
+0.472 (iris) to 0.487 (digits) against the 0.475 that used to be hard-coded.
+The warn threshold floats with the measured null, keeping the same margin.
+Note how narrow that margin is: a `retention_f` of 0.55 is only ~0.07 above
+chance, so treat values in the 0.5–0.6 band as barely-informative rather than
+as a pass. Below the threshold the factor is
 conditioning on noise (WARNING); other metrics in the run are then unreliable.
 
 ---
@@ -76,16 +90,22 @@ Use `"l1"`, `"cosine"`, a `CompositeMetric`, or any batched `DistanceFn`.
 
 | | `N ≤ 5k` | `5k < N ≤ 2e5` | `N > 2e5` |
 |---|---|---|---|
-| `width` | 128 | 384 | 512 |
-| `depth` | 2 | 3 | 3 |
-| `n_landmarks` | 32 | 256 | 512 |
-| `n_neighbors` | 10 | 15 | 15 |
-| `lambda_lip` | 0.1 | 0.01 | 0.0 |
-| `epochs` | 500 | 200 | 50 |
+| `width` | 384 | 384 | 512 |
+| `depth` | 3 | 3 | 3 |
+| `n_landmarks` | 128 | 256 | 512 |
+| `n_neighbors` | 15 | 15 | 15 |
+| `epochs` | 240 | 200 | 50 |
+| `pca_skip` | False | True | True |
+| `lr` | 2e-2 | 1e-3 | 1e-3 |
+| `lambda_geo` | 0.15 | 0.5 | 0.5 |
+| `pyramid_level_weights` | `(1, 2, 8)` | `(1, 1, 2, 4)` | `(1, 1, 2, 4)` |
 | `calib_max` | 200 | 2000 | 2000 |
 
-At small `N` the map can memorise — the small preset shrinks capacity and raises
-`lambda_lip`. The point at that scale is a reusable, differentiable OOS map.
+At small `N` the preset matches the measured digits/s-curve recipe (no PCA
+skip, raised `lr`, mid capacity) so the shipped default reproduces the
+documented result. Raise `lambda_geo` to 0.5 on smooth manifolds; on fold-back
+manifolds add delayed frame rigidity. Full knob guide:
+[`docs/CONFIGURATION.md`](../../docs/CONFIGURATION.md).
 
 ## Graph pyramid (cohesive default)
 
@@ -101,7 +121,6 @@ coarsest level so the embedding stays one component.
 | `pyramid_scales` | `3` | number of coarsenings (0 = single-scale) |
 | `pyramid_level_weights` | `(1, 1, 2, 4)` | attraction weight per level, finest first |
 | `pyramid_coarse_backbone` | `1.0` | weight of bridge edges on the coarsest level (`0` = off) |
-| `pyramid_rep_ratio` | `4.0` | representative shrink factor per level |
 | `pyramid_min_reps` | `256` | stop coarsening near this size |
 
 **Depth is capped by `pyramid_min_reps`, so you often get fewer levels than
@@ -160,6 +179,52 @@ consistent).
    unchanged (e.g. sliding along the manifold) is invisible.
 2. It answers "is this point near the landmark support", not "have I seen this
    exact point before". A novel point sitting on the manifold will correctly pass.
+
+### Sharper support models
+
+Plain cover uses one global scale, so it flags the sparse tail of the training
+distribution as readily as anything off-manifold, and in `D ≫ m` a union of
+balls is exponentially too generous for a thin sheet. `LandmarkSupport` fixes
+both, fit from **training** points:
+
+```python
+from leanmap import ConformalCalibrator, LandmarkSupport
+
+support = LandmarkSupport.from_model(model, X_train)   # mode="chart"
+cal = ConformalCalibrator(support=support)
+cal.fit(model, X_calib)
+p = cal.p_value(cal.cover_score(model, X_test))
+```
+
+`mode="ball"` divides by a per-landmark radius `r_l` (median training
+distance-to-landmark in bucket `l`), buying approximate conditional validity
+from a single pooled calibration set. `mode="chart"` (the default) additionally
+splits each neighbourhood into tangent and normal directions by local PCA and
+scales them separately. On a 2-D sheet in 8-D, the score ratio between an
+off-sheet and an equal-length along-sheet move is:
+
+| sheet thickness | balls | charts |
+|---|---|---|
+| 0.05 | 1.34 | 2.3 |
+| 0.005 | 1.34 | 14.9 |
+| 0.001 | 1.34 | 74.2 |
+
+Balls are indifferent to thickness; charts track it. Buckets with too few
+training points fall back to isotropic balls automatically.
+
+Always score through `cal.cover_score(...)`: calibrating with a support and
+then scoring with the plain cover compares two different score functions and
+voids the guarantee.
+
+**Validity.** `s_nat` and any global `(mu, sigma)` may be estimated on all of
+`X` — they are monotone rescalings and `p_value` depends only on ranks against
+the calibration set. Per-landmark radii and charts are *not* rank-preserving,
+which is why they are fit on the training split instead.
+
+**Repair.** `support.repair(x, tau)` targets the landmark minimising
+`d_l - tau * r_l`, not the nearest one: projection onto a union of balls equals
+projection onto the nearest centre only when the radii are equal, and a farther
+landmark with a generous radius can be the cheaper move.
 
 Retraining or updating landmarks invalidates calibration; `p_value` raises if
 the model weight hash no longer matches.

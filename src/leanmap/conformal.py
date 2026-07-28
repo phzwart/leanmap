@@ -1,8 +1,30 @@
-"""Conformal exchangeability test on OOD scores (landmark cover)."""
+"""Conformal exchangeability test on OOD scores (landmark cover).
+
+Validity note
+-------------
+The conformal guarantee here rests on exchangeability of the *calibration*
+scores with the test scores, and on the score function being fixed before
+calibration. Quantities that only rescale the score are therefore free to be
+estimated on all of ``X``:
+
+* the metric natural scale ``s_nat`` and any global ``(mu, sigma)`` are strictly
+  monotone rescalings of the cover, and :func:`ConformalCalibrator.p_value`
+  depends on scores only through their **ranks** against the calibration set;
+  a common monotone map applied to both sides leaves every p-value unchanged;
+* the per-landmark radii and tangent charts in :class:`LandmarkSupport` are
+  *not* rank-preserving — they reorder points — so they must be fit on data
+  disjoint from the calibration split. :meth:`LandmarkSupport.fit` therefore
+  takes **training** points, which are plentiful, and never the calibration
+  set.
+
+So there is no leak in either case, but for different reasons: the first is
+harmless because it cannot change ranks, the second is handled by the split.
+"""
 
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -56,6 +78,215 @@ def geometry_consistency_score(
     consistency = 0.5 * (a[:, :L] - a_embed[:, :L]).abs().sum(dim=1)
     cover = Dm.min(dim=1).values
     return cover, consistency
+
+
+@dataclass
+class LandmarkSupport:
+    """Per-landmark support model: locally-scaled balls or tangent charts.
+
+    The plain cover :math:`\\min_\\ell d(x, M_\\ell) / s_{\\mathrm{nat}}` uses one
+    global scale, so it flags the sparse tail of the training distribution as
+    readily as anything genuinely off-manifold. Two refinements, both fit from
+    **training** points (never the calibration split — see the module docstring):
+
+    ``mode="ball"``
+        :math:`\\mathrm{cover}(x) = \\min_\\ell d(x, M_\\ell) / r_\\ell`, with
+        :math:`r_\\ell` the median distance-to-landmark among training points
+        whose nearest landmark is :math:`\\ell`. This buys approximate
+        *conditional* validity while keeping a single pooled calibration set.
+
+    ``mode="chart"`` (default)
+        Residual to a per-landmark local PCA chart. Isotropic balls in
+        :math:`D \\gg m` are exponentially too generous: a union of balls has
+        volume :math:`\\sim L\\tau^D` against a support of
+        :math:`\\sim L\\tau^m t^{D-m}` for sheet thickness :math:`t \\ll \\tau`.
+        Splitting each landmark's neighbourhood into tangent and normal
+        directions and scaling them separately replaces balls with ellipsoids
+        that track the sheet.
+
+    Attributes
+    ----------
+    M : (L, D) landmark coordinates in the PRIMARY view.
+    r : (L,) local radii (``mode="ball"``, and the repair target).
+    V : (L, D, m) | None orthonormal tangent bases (``mode="chart"``).
+    sigma_par, sigma_perp : (L,) tangent / normal scales.
+    mode : ``"ball"`` or ``"chart"``.
+
+    Notes
+    -----
+    Charts are linear, so they assume the PRIMARY view is a vector space. For a
+    non-linear view, use ``mode="ball"``.
+    """
+
+    M: torch.Tensor
+    r: torch.Tensor
+    sigma_par: torch.Tensor
+    sigma_perp: torch.Tensor
+    V: Optional[torch.Tensor] = None
+    mode: str = "chart"
+
+    @classmethod
+    @torch.no_grad()
+    def fit(
+        cls,
+        M: torch.Tensor,
+        X_train: torch.Tensor,
+        mode: str = "chart",
+        m_tangent: int = 2,
+        min_bucket: int = 8,
+        floor_frac: float = 1e-3,
+    ) -> "LandmarkSupport":
+        """Fit radii and charts from training points.
+
+        Parameters
+        ----------
+        M : (L, D) landmarks.
+        X_train : (n, D) training points — must be disjoint from calibration.
+        mode : ``"ball"`` or ``"chart"``.
+        m_tangent : intrinsic dimension used for the local chart.
+        min_bucket : buckets with fewer points fall back to an isotropic ball,
+            which the chart score reproduces exactly when ``V_l = 0`` and the
+            two scales are equal.
+        floor_frac : scales are floored at this fraction of the global median
+            distance, so a degenerate direction cannot produce an infinite
+            score.
+        """
+        log = get_logger()
+        M = M.detach().float()
+        X = X_train.detach().float().to(M.device)
+        L, D = M.shape
+        d = torch.cdist(X, M)
+        owner = d.argmin(dim=1)
+        d_own = d.gather(1, owner[:, None]).squeeze(1)
+        global_med = float(d_own.median().item()) if d_own.numel() else 1.0
+        floor = max(global_med * floor_frac, torch.finfo(torch.float32).tiny)
+
+        r = torch.full((L,), global_med, device=M.device)
+        sigma_par = torch.full((L,), global_med, device=M.device)
+        sigma_perp = torch.full((L,), global_med, device=M.device)
+        want_chart = mode == "chart"
+        m_eff = max(1, min(int(m_tangent), D - 1)) if D > 1 else 1
+        V = torch.zeros(L, D, m_eff, device=M.device) if want_chart else None
+
+        n_chart = 0
+        for ell in range(L):
+            sel = owner == ell
+            n_l = int(sel.sum().item())
+            if n_l == 0:
+                continue
+            pts = X[sel]
+            u = pts - M[ell]
+            r_l = float(u.norm(dim=1).median().item())
+            r[ell] = max(r_l, floor)
+            if not want_chart or n_l < max(min_bucket, m_eff + 2):
+                sigma_par[ell] = r[ell]
+                sigma_perp[ell] = r[ell]
+                continue
+            # Tangent directions from the centred bucket scatter (a proper
+            # local PCA); the chart origin stays at the landmark.
+            centred = pts - pts.mean(dim=0, keepdim=True)
+            try:
+                _, _, Vh = torch.linalg.svd(centred, full_matrices=False)
+            except RuntimeError:
+                sigma_par[ell] = r[ell]
+                sigma_perp[ell] = r[ell]
+                continue
+            basis = Vh[:m_eff].T.contiguous()
+            V[ell] = basis
+            par = u @ basis
+            perp = u - par @ basis.T
+            sigma_par[ell] = max(float(par.norm(dim=1).median().item()), floor)
+            sigma_perp[ell] = max(float(perp.norm(dim=1).median().item()), floor)
+            n_chart += 1
+
+        if want_chart:
+            log.info(
+                "LandmarkSupport: charts on %d/%d landmarks (m=%d); "
+                "%d fell back to isotropic balls",
+                n_chart,
+                L,
+                m_eff,
+                L - n_chart,
+            )
+        return cls(
+            M=M,
+            r=r,
+            sigma_par=sigma_par,
+            sigma_perp=sigma_perp,
+            V=V,
+            mode=mode,
+        )
+
+    @classmethod
+    def from_model(
+        cls, model: PLANE, X_train: torch.Tensor, **kwargs
+    ) -> "LandmarkSupport":
+        """Fit against a trained model's PRIMARY landmarks.
+
+        ``X_train`` must be the training split — passing the calibration split
+        would make the score depend on the data it is calibrated against.
+        """
+        M = model.affinity.M.detach()
+        if X_train.shape[1] != M.shape[1]:
+            raise ValueError(
+                f"X_train has {X_train.shape[1]} columns but PRIMARY landmarks "
+                f"have {M.shape[1]}; charts need the PRIMARY view coordinates"
+            )
+        return cls.fit(M, X_train, **kwargs)
+
+    @torch.no_grad()
+    def score(self, x: torch.Tensor) -> torch.Tensor:
+        """Nonconformity score (higher ⇒ more OOD), minimised over landmarks."""
+        return self.score_per_landmark(x).min(dim=1).values
+
+    @torch.no_grad()
+    def score_per_landmark(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, L) per-landmark scores; the cover score is the row-wise min."""
+        x = x.detach().float().to(self.M.device)
+        d2 = torch.cdist(x, self.M).pow(2)
+        if self.mode != "chart" or self.V is None:
+            return d2.clamp_min(0).sqrt() / self.r[None, :]
+        # ||par||^2 without materialising (B, L, D): project onto each basis.
+        proj = torch.einsum("bd,ldm->blm", x, self.V) - torch.einsum(
+            "ld,ldm->lm", self.M, self.V
+        )[None]
+        par2 = proj.pow(2).sum(dim=-1)
+        perp2 = (d2 - par2).clamp_min(0)
+        s2 = par2 / self.sigma_par[None, :].pow(2) + perp2 / self.sigma_perp[
+            None, :
+        ].pow(2)
+        return s2.clamp_min(0).sqrt()
+
+    @torch.no_grad()
+    def repair(self, x: torch.Tensor, tau: float) -> torch.Tensor:
+        """Minimum-norm move into ``{score <= tau}``, with heterogeneous radii.
+
+        Projection onto a union of balls equals projection onto the ball of the
+        *nearest centre* only when the radii are equal. With per-landmark radii
+        the required travel to ball :math:`\\ell` is :math:`d_\\ell - \\tau
+        r_\\ell`, so the correct target minimises **that**, not :math:`d_\\ell`.
+        A distant landmark with a generous radius can be the cheaper repair.
+
+        In ``mode="chart"`` the target landmark is chosen the same way, on the
+        chart score, and the point is then moved onto that landmark's isotropic
+        ball of radius :math:`\\tau r_\\ell` — a conservative inner move, since
+        an exact ellipsoid projection is a 2-D subproblem not needed here.
+        """
+        x = x.detach().float().to(self.M.device)
+        d = torch.cdist(x, self.M)
+        travel = d - float(tau) * self.r[None, :]
+        star = travel.argmin(dim=1)
+        d_star = d.gather(1, star[:, None]).squeeze(1)
+        radius = float(tau) * self.r[star]
+        need = d_star > radius
+        out = x.clone()
+        if not bool(need.any()):
+            return out
+        idx = torch.where(need)[0]
+        centre = self.M[star[idx]]
+        scale = (radius[idx] / d_star[idx].clamp_min(1e-12))[:, None]
+        out[idx] = centre + scale * (x[idx] - centre)
+        return out
 
 
 def model_weight_hash(model: torch.nn.Module) -> str:
@@ -119,16 +350,21 @@ class ConformalCalibrator:
     must match or ``p_value`` raises.
     """
 
-    def __init__(self):
+    def __init__(self, support: Optional[LandmarkSupport] = None):
         self.s_calib: Optional[torch.Tensor] = None  # sorted cover scores
         self.tau_embed: Optional[float] = None
         self.weight_hash: Optional[str] = None
         self.cover_calib: Optional[torch.Tensor] = None  # alias of s_calib
         self.consistency_calib: Optional[torch.Tensor] = None  # diagnostic only
+        self.support = support
 
     @torch.no_grad()
     def fit(self, model: PLANE, X_calib: torch.Tensor, batch_size: int = 1024) -> None:
         """Calibrate on raw held-out points (never epsilon-netted).
+
+        If a :class:`LandmarkSupport` was supplied, its score replaces the plain
+        global-scale cover. The support must have been fit on training points;
+        fitting it on ``X_calib`` would break exchangeability.
 
         Parameters
         ----------
@@ -159,6 +395,8 @@ class ConformalCalibrator:
             cover, consistency = geometry_consistency_score(
                 model, xb, tau_embed=self.tau_embed, z_M=z_M
             )
+            if self.support is not None:
+                cover = self.support.score(xb)
             covers.append(cover.cpu())
             consistencies.append(consistency.cpu())
         cover_all = torch.cat(covers)
@@ -173,6 +411,20 @@ class ConformalCalibrator:
                 n,
                 1.0 / (n + 1),
             )
+
+    @torch.no_grad()
+    def cover_score(self, model: PLANE, x: torch.Tensor) -> torch.Tensor:
+        """Score ``x`` with the same function used at calibration time.
+
+        Calibrating with a :class:`LandmarkSupport` and then scoring with the
+        plain cover silently compares two different score functions, which
+        voids the guarantee. Route both through here.
+        """
+        if self.support is not None:
+            return self.support.score(x)
+        tau = self.tau_embed if self.tau_embed is not None else 1.0
+        cover, _ = geometry_consistency_score(model, x, tau_embed=float(tau))
+        return cover
 
     def _check_hash(self, model: PLANE) -> None:
         if self.weight_hash is None:

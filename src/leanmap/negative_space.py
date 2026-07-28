@@ -65,13 +65,15 @@ def _primary_name(model: PLANE) -> str:
 class _HiddenCapture:
     """Forward-hook context manager capturing post-activation backbone states.
 
-    ``FiLMEncoder`` applies ``gelu`` functionally after each ``LayerNorm``; we
-    hook the norm modules (pre-gelu) and apply ``gelu`` when assembling features
-    so the captured value matches the true hidden activation.
+    ``FiLMEncoder`` applies ``gelu`` functionally after the FiLM modulation; we
+    hook the parameter-free taps that sit at exactly that point (post-FiLM,
+    pre-gelu) and apply ``gelu`` when assembling features, so the captured value
+    matches the true hidden activation. Hooking the ``LayerNorm`` instead would
+    miss ``gamma``/``beta``, which are applied after it.
     """
 
     def __init__(self, model: PLANE):
-        self.norms = list(model.encoder.norms)
+        self.norms = list(getattr(model.encoder, "taps", model.encoder.norms))
         self._handles: List[torch.utils.hooks.RemovableHandle] = []
         self._store: Dict[int, torch.Tensor] = {}
 
@@ -150,20 +152,6 @@ def extract_features(
     model.eval()
     device = next(model.parameters()).device
     return _assemble_features(model, x.to(device), feature_groups).cpu()
-
-
-def features_with_grad(
-    model: PLANE,
-    x: torch.Tensor,
-    feature_groups: Sequence[str] = ALL_FEATURES,
-) -> torch.Tensor:
-    """Internal-state features with the graph retained (for co-training).
-
-    Unlike :func:`extract_features`, this keeps ``x``'s device and lets
-    gradients flow back into the encoder. The caller controls ``model.train()``
-    / ``eval()`` and ensures ``x`` is on the right device.
-    """
-    return _assemble_features(model, x, feature_groups)
 
 
 @torch.no_grad()
@@ -282,13 +270,8 @@ class DistanceQuantileHead(nn.Module):
     ``q_hi = q_med + softplus(off_hi)``.
     """
 
-    def __init__(
-        self, in_dim: int, width: int = 128, depth: int = 2, input_norm: bool = False
-    ):
+    def __init__(self, in_dim: int, width: int = 128, depth: int = 2):
         super().__init__()
-        # BatchNorm on the input adapts to the (shifting) feature scale — needed
-        # for co-training, where the encoder's internals move during fitting.
-        self.input_norm = nn.BatchNorm1d(in_dim) if input_norm else None
         layers: List[nn.Module] = []
         d = in_dim
         for _ in range(depth):
@@ -308,8 +291,6 @@ class DistanceQuantileHead(nn.Module):
         the offset (interval-width) grads do not flow into the median value —
         the median is then shaped only by its own 0.5-pinball term.
         """
-        if self.input_norm is not None:
-            phi = self.input_norm(phi)
         h = self.trunk(phi)
         q_med = F.softplus(self.med(h)).squeeze(1)
         base = q_med.detach() if detach_median else q_med
@@ -584,77 +565,5 @@ def fit_negative_space(
             "CQR: offset=%.4g coverage raw=%.3f -> cqr=%.3f (target=%.3f) "
             "median width=%.4g",
             cqr_offset, cov_raw, cov_cqr, 1.0 - alpha, width_cqr,
-        )
-    return ns_model, stats
-
-
-def calibrate_head(
-    model: PLANE,
-    head: DistanceQuantileHead,
-    X_train: torch.Tensor,
-    feature_groups: Sequence[str] = ALL_FEATURES,
-    *,
-    alpha: float = 0.1,
-    perturb: Optional[PerturbationConfig] = None,
-    dist_fn: Optional[DistanceFn] = None,
-    feat_mean: Optional[torch.Tensor] = None,
-    feat_std: Optional[torch.Tensor] = None,
-    verbose: bool = True,
-) -> Tuple[NegativeSpaceModel, Dict[str, float]]:
-    """Conformalize an *already-trained* head (e.g. one co-trained in ``fit``).
-
-    Generates a fresh perturbation calibration set on the (now frozen) model,
-    computes the CQR offset, and returns a ready :class:`NegativeSpaceModel`.
-    ``feat_mean``/``feat_std`` default to identity — a co-trained head normalizes
-    its own input via BatchNorm, so no external standardizer is needed.
-    """
-    log = get_logger()
-    dist_fn = dist_fn if dist_fn is not None else EuclideanDistance()
-    feature_groups = tuple(feature_groups)
-    X_train = torch.as_tensor(X_train).float()
-
-    phi, y = build_labeled_set(
-        model, X_train, feature_groups=feature_groups, cfg=perturb, dist_fn=dist_fn
-    )
-    F_dim = phi.shape[1]
-    if feat_mean is None:
-        feat_mean = torch.zeros(F_dim)
-    if feat_std is None:
-        feat_std = torch.ones(F_dim)
-    phi_n = (phi - feat_mean) / feat_std
-
-    dev = next(head.parameters()).device
-    head.eval()
-    with torch.no_grad():
-        lo, med, hi = head(phi_n.to(dev))
-        lo, med, hi = lo.cpu(), med.cpu(), hi.cpu()
-    cqr_offset = _cqr_offset(lo, hi, y, alpha)
-
-    ns_model = NegativeSpaceModel(
-        model=model,
-        head=head.to(dev),
-        feature_groups=feature_groups,
-        feat_mean=feat_mean,
-        feat_std=feat_std,
-        alpha=alpha,
-        cqr_offset=cqr_offset,
-        dist_fn=dist_fn,
-    )
-    lo_adj = torch.minimum((lo - cqr_offset).clamp_min(0.0), med)
-    hi_adj = torch.maximum(hi + cqr_offset, med)
-    stats = {
-        "n_calib": int(phi.shape[0]),
-        "cqr_offset": cqr_offset,
-        "coverage_raw": _coverage(y, lo, hi),
-        "coverage_cqr": _coverage(y, lo_adj, hi_adj),
-        "target_coverage": 1.0 - alpha,
-        "median_interval_width": float((hi_adj - lo_adj).median()),
-    }
-    if verbose:
-        log.info(
-            "co-trained head CQR: offset=%.4g coverage raw=%.3f -> cqr=%.3f "
-            "(target=%.3f) median width=%.4g",
-            cqr_offset, stats["coverage_raw"], stats["coverage_cqr"],
-            1.0 - alpha, stats["median_interval_width"],
         )
     return ns_model, stats

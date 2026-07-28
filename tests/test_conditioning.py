@@ -40,7 +40,6 @@ def _legacy_pair(D=8, L=4, d_out=2, width=32, depth=2, hyper_width=16):
         depth=depth,
         L=L,
         hyper_width=hyper_width,
-        spectral_norm_flag=False,
         pca_skip=False,
     )
     enc.set_normalization(mean, std)
@@ -88,7 +87,6 @@ def _legacy_pair(D=8, L=4, d_out=2, width=32, depth=2, hyper_width=16):
         L=L,
         affinity_dim=L,
         hyper_width=hyper_width,
-        spectral_norm_flag=False,
         pca_skip=False,
     )
     enc2.set_normalization(mean, std)
@@ -218,6 +216,32 @@ def test_modulator_gain_gamma_shapes():
             assert b is None
 
 
+def test_gain_role_reaches_the_output():
+    """A GAIN factor emits a scalar gamma only; it must still change z.
+
+    Under modulate-then-normalize this role was a no-op, because LayerNorm
+    cancels any positive scalar rescale. This is the end-to-end guard.
+    """
+    torch.manual_seed(0)
+    X = torch.randn(20, 4)
+    factors = [
+        ConditioningFactor("p", identity_view, EuclideanDistance(), 4, Role.PRIMARY),
+        ConditioningFactor("g", lambda x: x[:, 1:2], EuclideanDistance(), 3, Role.GAIN),
+    ]
+    stack = build_factor_stack(X, factors, width=16, depth=2, hyper_width=8)
+    enc = FiLMEncoder(4, 2, width=16, depth=2, L=4, affinity_dim=7, pca_skip=False)
+    model = PLANE(stack, enc)
+
+    z_before, _, _ = model(X[:8])
+    gain_hyper = stack.hypers[1]
+    assert isinstance(gain_hyper, FactorHyper)
+    with torch.no_grad():
+        # Non-zero bias on the last hyper layer => gamma departs from 1.
+        gain_hyper.hyper[-1].bias.fill_(1.5)
+    z_after, _, _ = model(X[:8])
+    assert not torch.allclose(z_before, z_after, atol=1e-6)
+
+
 def test_axis_monotonicity():
     from leanmap.conditioning import Monotone1D
 
@@ -335,7 +359,7 @@ def test_scale_quotient_factory():
     assert factors[1].role == Role.AXIS
     X = torch.randn(20, 6).abs() + 0.1
     stack = build_factor_stack(X, factors, width=16, depth=2, hyper_width=8, d_out=2)
-    z_enc = FiLMEncoder(6, 2, width=16, depth=2, L=8, affinity_dim=12, spectral_norm_flag=False, pca_skip=False)
+    z_enc = FiLMEncoder(6, 2, width=16, depth=2, L=8, affinity_dim=12, pca_skip=False)
     model = PLANE(stack, z_enc)
     z, a, dm = model(X[:5])
     assert z.shape == (5, 2)
@@ -346,8 +370,6 @@ def test_artefact_roundtrip_single_primary(tmp_path):
     X = np.random.randn(400, 6).astype(np.float32)
     cfg = PLANEConfig.for_scale(len(X))
     cfg.epochs = 1
-    cfg.spectral_norm = False
-    cfg.lambda_lip = 0.0
     cfg.dedup = False
     cfg.n_landmarks = 16
     cfg.width = 32
@@ -385,8 +407,6 @@ def test_synthetic_two_factor_retention():
     )
     cfg = PLANEConfig.for_scale(n)
     cfg.epochs = 3
-    cfg.spectral_norm = False
-    cfg.lambda_lip = 0.0
     cfg.dedup = False
     cfg.width = 64
     cfg.depth = 2

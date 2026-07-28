@@ -134,13 +134,6 @@ def main() -> None:
     )
     ap.set_defaults(landmark_poisson=False)
     ap.add_argument(
-        "--conditioning-pyramid",
-        type=str,
-        default=None,
-        help="comma-separated coarse anchor counts for extra MODULATOR FiLM "
-        "levels (multi-resolution conditioning), e.g. 32,96",
-    )
-    ap.add_argument(
         "--lambda-frame",
         type=float,
         default=0.5,
@@ -237,11 +230,6 @@ def main() -> None:
         learn_tau=args.learn_tau,
         landmark_geodesic=args.landmark_geodesic,
         landmark_poisson=args.landmark_poisson,
-        conditioning_pyramid_levels=(
-            [int(x) for x in args.conditioning_pyramid.split(",") if x.strip()]
-            if args.conditioning_pyramid
-            else None
-        ),
         lambda_frame=args.lambda_frame,
         frame_neighbors=args.frame_neighbors,
         lambda_geo=args.lambda_geo,

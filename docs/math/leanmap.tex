@@ -1,0 +1,1795 @@
+% leanmap — mathematical foundations
+% Compile: pdflatex leanmap && bibtex leanmap && pdflatex leanmap && pdflatex leanmap
+% Or (no bib needed for first pass): pdflatex leanmap
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage[numbers,sort&compress]{natbib}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  citecolor=blue!50!black,
+  urlcolor=blue!40!black,
+}
+
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+\newtheorem{assumption}{Assumption}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\norm}[1]{\left\|#1\right\|}
+\newcommand{\abs}[1]{\left|#1\right|}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\newcommand{\inner}[2]{\left\langle #1,#2\right\rangle}
+\newcommand{\clamp}{\mathrm{clamp}}
+\newcommand{\softplus}{\mathrm{softplus}}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\GELU}{\mathrm{GELU}}
+\newcommand{\LN}{\mathrm{LN}}
+\newcommand{\ind}{\mathbf{1}}
+\newcommand{\loss}{\mathcal{L}}
+
+\title{Mathematical Foundations of leanmap\\
+\large Parametric Landmark-Conditioned Neighbour Embedding\\
+with Multi-Scale Graph Pyramids and Metric Regularisers}
+\author{leanmap technical note}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+leanmap (\emph{LEarn ANother MAPping}) is a parametric neighbour-embedding
+method: a feed-forward map \(f_\theta:\R^D\to\R^d\) is trained once against a
+fuzzy simplicial graph and then evaluates new points by a single network
+forward pass. The neighbour graph is discarded after training; the saved
+artefact holds network weights, landmarks, and conformal calibration scores.
+This note records the mathematics implemented in the reference package
+(\texttt{PLANE} / \texttt{PLANEConfig}): graph construction (including an
+\(\varepsilon\)-net and a Galerkin pyramid), the FiLM-conditioned encoder,
+the composite training objective (fuzzy cross-entropy, ordinal triplets,
+landmark load-balancing, Gram-domain local rigidity, and geodesic Procrustes /
+stress), the \((a,b)\) curve fit that
+implements \texttt{min\_dist}, ramp schedules, evaluation statistics, and
+conformal out-of-distribution scores.
+
+Section~\ref{sec:measurements} reports the seeded evidence behind the shipping
+defaults. Every number there is a mean over three seeds with the spread given,
+and a difference is called resolved only when it exceeds twice the pooled seed
+spread. Several claims made in earlier versions of this note do not survive
+that test and are withdrawn where they appear.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{Setup and notation}
+%==============================================================================
+
+\subsection{Problem}
+\label{sec:problem}
+
+Given a finite sample
+\[
+X = \{x_1,\ldots,x_N\}\subset\R^D
+\]
+and a distance function \(d_X:\R^D\times\R^D\to[0,\infty)\) (the
+\emph{ambient metric}), leanmap constructs a parametric embedding
+\[
+f_\theta:\R^D\to\R^d,\qquad d=2\text{ by default},
+\]
+such that local neighbourhood structure in \(X\) is preserved in the image
+\(Z=\{z_i=f_\theta(x_i)\}\), global geodesic structure is approximately
+retained when requested, and \(f_\theta\) remains well-defined for previously
+unseen points.
+
+Unlike classical UMAP~\citep{mcinnes2018umap}, which stores embedding
+coordinates as free variables, leanmap stores a network. After training the
+fuzzy graph is discarded; inference is a forward pass plus a cover score
+(Section~\ref{sec:conformal}), costing \(3.4\,\mu\)s per point against
+\(781\,\mu\)s for \texttt{UMAP.transform} on the same data
+(Section~\ref{sec:inference}). What that buys, and what it gives up, is stated
+precisely in Remark~\ref{rem:notindexfree}: the neighbour search is replaced by
+a fixed-size computation rather than eliminated.
+
+\subsection{Symbols}
+\label{sec:symbols}
+
+\begin{center}
+\small
+\begin{tabular}{ll}
+\toprule
+Symbol & Meaning \\
+\midrule
+\(N,D\) & number of training points; ambient dimension \\
+\(R\) & number of \(\varepsilon\)-net representatives (\(R\le N\)) \\
+\(L\) & number of landmarks / anchors \\
+\(d\) & embedding dimension (\texttt{d\_out}) \\
+\(k\) & neighbourhood size (\texttt{n\_neighbors}) \\
+\(x_i,z_i\) & ambient point; embedding \(z_i=f_\theta(x_i)\) \\
+\(M_\ell\in\R^D\) & landmark coordinates, \(\ell=1,\ldots,L\) \\
+\(D_{i\ell},a_{i\ell}\) & point--landmark distance and affinity \\
+\(\tau_\ell\) & per-landmark temperature \\
+\(\rho_i,\sigma_i\) & local connectivity offset; bandwidth \\
+\(p_{ij},P^{\mathrm{sym}}\) & directed memberships; symmetrised fuzzy graph \\
+\(w_{ij}\) & edge weight in a training batch \\
+\(a,b\) & fitted low-dimensional kernel parameters \\
+\(\gamma_k,\beta_k\) & FiLM scale / shift at layer \(k\) \\
+\(t\in[0,1]\) & training fraction (for ramps) \\
+\(g_{\ell\ell'}\) & landmark--landmark graph geodesic \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Distances used by the graph and losses are measured in units of a fitted
+\emph{natural scale}: the median \(k\)-NN distance on a subsample of \(X\),
+so that neighbourhood radii are \(\mathcal{O}(1)\) regardless of the raw
+units of \(d_X\).
+
+%==============================================================================
+\section{Overview of the method}
+\label{sec:overview}
+%==============================================================================
+
+Training proceeds in a fixed order:
+
+\begin{enumerate}[leftmargin=*]
+\item Hold out a conformal calibration split from raw \(X\)
+  (fraction \(\texttt{CALIB\_FRAC}=0.05\), capped by \texttt{calib\_max}).
+\item Fit encoder normalisation \((\mu,\sigma)\) and the metric natural scale.
+\item Select landmarks \(M\) and build a multi-scale fuzzy graph pyramid
+  (Section~\ref{sec:graph}).
+\item Instantiate the FiLM encoder \(f_\theta\) (Section~\ref{sec:model}).
+\item Fit kernel parameters \((a,b)\) from \texttt{min\_dist}
+  (Section~\ref{sec:ab}).
+\item Optimise the composite loss (Section~\ref{sec:loss}) by AdamW.
+\item Calibrate conformal cover scores on the held-out split
+  (Section~\ref{sec:conformal}).
+\end{enumerate}
+
+The per-step training objective is
+\begin{equation}
+\label{eq:total}
+\begin{aligned}
+\loss
+&=
+\loss_{\mathrm{geom}}
++ \lambda_{\mathrm{ord}}\,\loss_{\mathrm{ord}}
++ \lambda_{\mathrm{lm}}\,\loss_{\mathrm{lm}} \\
+&\quad
++ \lambda_{\mathrm{frame}}\,r_{\mathrm{frame}}(t)\,\loss_{\mathrm{frame}}
++ \lambda_{\mathrm{geo}}\,r_{\mathrm{geo}}(t)\,\loss_{\mathrm{geo}},
+\end{aligned}
+\end{equation}
+with \(\lambda_{\mathrm{ord}}=0.1\) fixed, and ramps \(r_{\cdot}(t)\) defined in
+Section~\ref{sec:ramps}. The geodesic term itself is
+\(\loss_{\mathrm{geo}}=\loss_{\mathrm{anchor}}+0.25\,\loss_{\mathrm{stress}}\).
+
+%==============================================================================
+\section{Graph construction}
+\label{sec:graph}
+%==============================================================================
+
+\subsection{\texorpdfstring{\(\varepsilon\)-net}{epsilon-net} representatives}
+\label{sec:enet}
+
+Exact and near-duplicates inflate \(k\)-NN graphs and waste capacity. leanmap
+optionally collapses \(X\) to an \(\varepsilon\)-net of representatives before
+neighbour search.
+
+\begin{definition}[Estimated \(\varepsilon\)]
+\label{def:epsilon}
+Let \(r_1(i)\) be the distance from \(x_i\) to its nearest neighbour, taken over
+\emph{all} \(N\) points. Set
+\[
+\varepsilon
+=
+Q_{0.01}\bigl(\{r_1(i)\}_{i=1}^N\bigr).
+\]
+If this quantile is \(\le 0\) (exact-duplicate mass dominates), fall back to
+the median of the strictly positive \(1\)-NN distances (or \(10^{-12}\) if
+none exist).
+\end{definition}
+
+\begin{remark}[Why the quantile is taken over all \(N\)]
+\label{rem:epsdrift}
+Reading the quantile off a fixed-size subsample makes \(\varepsilon\) a
+function of dataset size rather than of the data. On an \(m\)-dimensional
+manifold the typical \(1\)-NN distance scales as \(n^{-1/m}\), so estimating on
+\(n_{\mathrm{sub}}\) of \(N\) points inflates \(\varepsilon\) by
+\((N/n_{\mathrm{sub}})^{1/m}\) — a factor of about \(2\) at \(m\approx 6\),
+\(N=10^6\), \(n_{\mathrm{sub}}=10^4\), and precisely in the regime where
+deduplication is doing real work. The full pass is exact for
+\(N\le 2\times 10^4\); above that an ANN index supplies the candidate
+neighbour and the distance is still evaluated exactly. When no such index is
+available (a metric with no Euclidean embedding, no backend installed) the
+implementation retains a subsample but multiplies the quantile by
+\((n_{\mathrm{sub}}/N)^{1/m}\), with \(m\) the Levina--Bickel
+estimate~\eqref{eq:lb}, which removes the leading size dependence. The path
+taken is recorded in the graph statistics.
+\end{remark}
+
+The value resolved at fit time is written back into the saved configuration.
+A refit therefore reuses the stored radius instead of re-estimating one, which
+makes \(\varepsilon\) \emph{absolute in effect after the first fit}: the merge
+scale is a fixed property of the artefact, reached through a data-driven
+estimator rather than a hand-set tolerance.
+
+Within each top-\(1\) landmark bucket, a greedy \(\varepsilon\)-net is grown
+in random order: accept \(x_i\) into an existing cell with representative
+\(r_j\) iff \(\min_j d_X(x_i,x_{r_j})\le\varepsilon\); otherwise open a new
+cell. Cell weight \(w_i\) equals the number of raw members. Compression ratio
+\(N/R\) near \(1\) means the net was effectively a no-op.
+
+\subsubsection*{Halo pass across bucket boundaries}
+\label{sec:halo}
+
+Growing the net inside top-\(1\) buckets leaves a gap: a near-duplicate pair
+separated by a Voronoi boundary is never compared, so both points survive as
+distinct cells. Those are not incidental survivors — the bucket boundary is
+exactly where the conditioning code \(a(x)\) switches, so a duplicate that
+straddles it is the one most likely to receive two different FiLM
+modulations.
+
+A single post-pass closes them. Candidate pairs are drawn from the top-\(c\)
+landmark shortlist already computed for the inverted index, restricted to pairs
+in \emph{different} top-\(1\) buckets, and accepted when
+\(d_X\le\varepsilon\). All candidates are evaluated against the
+\emph{pre-merge} representative set, and the accepted pairs are then collapsed
+with union--find. The outcome is therefore the connected-component partition of
+the accepted-pair graph, which does not depend on the order in which pairs are
+visited; a chain \(A\!-\!B\!-\!C\) yields one cell rather than whichever pair
+happened to be seen first. Component roots are the lowest representative index,
+so the labelling is reproducible across seeds. Cell weights add.
+
+One invariant is deliberately given up: a merged cell no longer lies inside a
+single landmark bucket. Every consumer of the bucket-to-cell map — the inverted
+index shortlist, cell-to-raw-member expansion in the edge sampler, and ordinal
+mid-sampling — either recomputes bucket assignments from the surviving
+representatives after the merge, or indexes raw points rather than cells, so
+none of them depends on the discarded invariant.
+
+\subsection{Landmarks}
+\label{sec:landmarks}
+
+Landmarks \(\{M_\ell\}_{\ell=1}^L\) serve three roles: (i)~conditioning codes
+for the encoder, (ii)~support of the cover score, and (iii)~nodes of the
+geodesic backbone.
+
+Three selection schemes are available:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Ambient farthest-point sampling (FPS).}
+  Start from a random index; iteratively
+  \(j\leftarrow\arg\max_i\min_{\ell\in\mathrm{chosen}}d_X(x_i,M_\ell)\).
+\item \textbf{Geodesic FPS.}
+  The same greedy max--min rule on shortest-path distances in a symmetrised
+  \(k\)-NN graph of \(X\). Unreachable nodes are treated as farther than any
+  finite path so every connected component is covered.
+\item \textbf{Geodesic Poisson-disk (blue-noise).}
+  Estimate a packing radius \(r\) from a short geodesic-FPS pass of \(L\)
+  points (coverage radius \(\times\) a scale), then accept points in random
+  order iff their geodesic distance to every accepted point is at least \(r\).
+  Unlike FPS, this yields an interior-uniform Delone set with a guaranteed
+  minimum geodesic separation.
+\end{enumerate}
+
+Each training point is assigned to its \(c=\texttt{C\_BUCKETS}=8\) nearest
+landmarks for IVF shortlists and ordinal mid-sampling.
+
+\subsection{\texorpdfstring{\(k\)-nearest}{k-nearest} neighbours}
+\label{sec:knn}
+
+On the \(R\) representatives, a \(k\)-NN graph is built in one of
+\texttt{brute} / \texttt{ivf} / \texttt{ann} modes (\texttt{auto} chooses by
+scale). IVF candidates are the union of the buckets of the query's top
+\(c_{\mathrm{search}}=8\) landmarks; ANN uses FAISS IVF-Flat or HNSW with
+over-fetch and exact re-rank. Recall against a brute probe set is checked
+and the search budget is increased if recall \(<0.9\).
+
+\subsection{\texorpdfstring{Smooth \(k\)-NN}{Smooth k-NN} and fuzzy memberships}
+\label{sec:smoothknn}
+
+Following UMAP's fuzzy simplicial set construction~\citep{mcinnes2018umap}:
+
+\begin{definition}[Local connectivity and bandwidth]
+For each representative \(i\), let \(\rho_i\) be the
+\texttt{local\_connectivity}-th smallest \emph{strictly positive} \(k\)-NN
+distance. Solve \(\sigma_i>0\) by bisection so that
+\begin{equation}
+\label{eq:sigma}
+\sum_{j\in\mathcal{N}_k(i)}
+\exp\!\Bigl(-\frac{\max(d_{ij}-\rho_i,0)}{\sigma_i}\Bigr)
+=
+\log_2 k.
+\end{equation}
+A floor \(\sigma_i\ge\texttt{min\_sigma\_frac}\cdot\overline{\rho}\) prevents
+degenerate rows.
+\end{definition}
+
+Directed memberships are then
+\begin{equation}
+\label{eq:pij}
+p_{ij}
+=
+\exp\!\Bigl(-\frac{\max(d_{ij}-\rho_i,0)}{\sigma_i}\Bigr),
+\qquad j\in\mathcal{N}_k(i).
+\end{equation}
+
+\subsection{Fuzzy union, multiplicity, and backbone}
+\label{sec:fuzzyunion}
+
+Let \(P\) be the sparse directed matrix of \(p_{ij}\). Symmetrisation uses the
+probabilistic \(t\)-conorm (fuzzy union), \emph{not} mutual \(k\)-NN:
+\begin{equation}
+\label{eq:fuzzyunion}
+P^{\mathrm{sym}}
+=
+P + P^\top - P\circ P^\top.
+\end{equation}
+Mutual \(k\)-NN orphans sparse regions; the fuzzy union retains one-sided
+memberships.
+
+Cell multiplicities re-enter as
+\begin{equation}
+\label{eq:multiplicity}
+P^{\mathrm{sym}}_{ij}
+\;\leftarrow\;
+P^{\mathrm{sym}}_{ij}\,(w_i w_j)^{\beta},
+\qquad
+\beta=\texttt{beta\_multiplicity},
+\end{equation}
+followed by normalisation \(\max_{ij}P^{\mathrm{sym}}=1\).
+
+\begin{remark}[\(\beta\) is a modelling choice, not plumbing]
+\label{rem:beta}
+The exponent \(\beta\) states what a repeated row \emph{means}, which is a
+property of the dataset and not of the solver, so it is a configuration field
+rather than a module constant. At \(\beta\to 0\) multiplicity is ignored and an
+\(\varepsilon\)-cell contributes as a single point: the right choice when
+duplicates are a deposition artefact carrying no density information, such as
+repeated PDB submissions of the same structure or redundant crystal forms of
+one compound. At \(\beta\to 1\) the reweighting is proportional and
+multiplicity is treated as genuine sampling density that the layout should
+reproduce. The default \(\beta=0.5\) splits the difference, letting a cell of
+weight \(w\) act like \(\sqrt{w}\) points. Note the interaction with
+\(\varepsilon\): the two together decide how much density a duplicate-heavy
+region is credited with, so a change to one should be read against the other.
+\end{remark}
+
+An optional landmark MST backbone inserts edges of fixed weight
+\(\lambda_{\mathrm{backbone}}=0.01\) between landmarks (mapped to nearest
+representatives), merged into \(P^{\mathrm{sym}}\) by elementwise maximum and
+renormalised. The training edge list retains the upper triangle
+(\(i<j\), weight \(>0\)).
+
+\subsection{Multi-scale Galerkin pyramid}
+\label{sec:pyramid}
+
+Coarse levels supply long-range attraction so distant regions do not drift
+apart.
+
+\begin{definition}[Level sizes]
+With finest representative count \(R_0\) and ratio
+\(\rho=\texttt{PYRAMID\_REP\_RATIO}=4\),
+\[
+R_\ell^{\mathrm{target}}
+=
+\max\Bigl(\mathrm{round}(R_0/\rho^\ell),\;
+\texttt{pyramid\_min\_reps}\Bigr),
+\quad \ell=1,\ldots,\texttt{pyramid\_scales}.
+\]
+Coarsening stops when the target is no smaller than the previous level.
+\end{definition}
+
+Coarsening of level \(\ell\) to \(\ell{+}1\):
+
+\begin{enumerate}[leftmargin=*]
+\item Coarse representatives = FPS among current representatives.
+\item Every fine representative is assigned to its nearest coarse
+  representative; CSR maps compose down to raw points.
+\item \textbf{Galerkin aggregation.} A coarse edge weight is the sum of
+  fine-edge weights that cross between the two coarse cells; intra-cell
+  (self-loop) edges are dropped. Connectivity is therefore inherited from
+  fine edges---no Isomap shortcuts across folds are invented.
+\item Aggregated weights are heavy-tailed and must be squashed into a
+  membership in \((0,1)\). The default (\texttt{pyramid\_squash} \(=\)
+  \texttt{rational\_q99}) is the monotone rational map anchored at the
+  \(0.99\)-quantile \(q_{99}\),
+  \begin{equation}
+  \label{eq:squash}
+  \tilde w = \frac{w/q_{99}}{w/q_{99}+c},
+  \qquad c=\tfrac{1}{99},
+  \end{equation}
+  so that \(w=q_{99}\mapsto 0.99\). The plain variant \(w/(w+q_{50})\) and the
+  legacy quantile-clamp are both selectable.
+\end{enumerate}
+
+If the coarsest level is disconnected, exactly \(n_{\mathrm{comp}}-1\) bridge
+edges of weight \texttt{pyramid\_\allowbreak coarse\_\allowbreak backbone} are
+added via a union-find seeded with existing components (candidates from an MST
+over representative distances). This joins islands without overwriting existing
+edge weights.
+
+During training the per-step edge budget \(B_e=\texttt{batch\_edges}\) is
+split across levels proportionally to
+\texttt{pyramid\_level\_weights} \(=(w_0,\ldots,w_{L_{\mathrm{pyr}}-1})\)
+(finest first). Sampled edges from level \(\ell\) are further multiplied by
+\(w_\ell\). Coarse-heavy schedules (e.g.\ \((1,2,8)\)) improve geodesic and
+density Spearman relative to flat weights.
+
+\subsection{Choosing the squash}
+\label{sec:squash}
+
+\begin{remark}[Why not quantile-normalise and clamp]
+\label{rem:squash}
+The original rule divided by \(q_{99}\) and clamped to \([0,1]\).
+Max-normalisation is indeed wrong --- it would squash the bulk toward zero ---
+but the clamp variant flattens \emph{every} coarse edge above the \(0.99\)
+quantile to a common weight of exactly \(1\). Those are precisely the strongest
+long-range bridges, the edges a coarse-heavy schedule such as \((1,2,8)\)
+exists to exploit; the rule discarded the ordering among them. Any rational
+map is strictly monotone and never saturates, so the ranking survives intact.
+\end{remark}
+
+Monotonicity alone was not sufficient, and the measurement is worth recording
+because the obvious fix regressed badly. Replacing the clamp with the
+median-anchored \(w/(w+q_{50})\) cost \(0.21\) of digits density Spearman ---
+five times the pooled seed spread, and by far the largest resolved effect
+anywhere in this note. Density structure is exactly what the pyramid is
+supposed to supply, so the strictly-better-shaped map made the map
+substantially worse at its own job.
+
+The re-tune anticipated above was run and did \emph{not} rescue it. Sweeping
+\texttt{pyramid\_level\_weights} across flat \((1,1,1)\), matched, ramp
+\((1,2,8)\), and steep schedules moves density Spearman between \(0.27\) and
+\(0.56\), all resolved-worse than the clamp's \(0.725\). So the loss is not a
+level-weight mismatch that a compensating schedule can absorb.
+
+The cause is where in the distribution the map is anchored. Sending the
+\emph{median} coarse edge to \(0.5\) lifts the bulk of the coarse graph to a
+strength it never had under the clamp, and the strong bridges --- which under
+the clamp stood out by magnitude as well as rank --- are compressed into the
+same range as everything else. Anchoring the same rational map at \(q_{99}\)
+keeps the bulk small and sends the top percentile to \(0.99\) without ever
+reaching \(1\), preserving both the magnitude profile and strict monotonicity:
+
+\begin{center}
+\small
+\begin{tabular}{lcccc}
+\toprule
+Squash & density Spearman & geodesic Sp. & spacing CV & monotone? \\
+\midrule
+\texttt{quantile\_clamp}       & \(0.725\pm0.009\) & \(0.712\pm0.015\) & \(0.583\pm0.084\) & no \\
+\texttt{rational} (\(q_{50}\)) & \(0.520\pm0.039\) & \(0.724\pm0.058\) & \(0.389\pm0.034\) & yes \\
+\texttt{rational\_q99}         & \(0.678\pm0.017\) & \(0.689\pm0.075\) & \(0.477\pm0.057\) & yes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\(q_{99}\)-anchoring recovers about \(77\%\) of the lost density fidelity. The
+remaining \(-0.047\) against the clamp is still resolved, and that is the price
+of monotonicity: some of what the clamp bought was the flattening itself, not
+merely the magnitude profile. It is a price worth paying, since the clamp's
+advantage comes from discarding the ordering among the strongest long-range
+bridges, and it comes with a compensating resolved gain --- spacing CV falls
+from \(0.583\) to \(0.477\). Geodesic Spearman, label accuracy,
+trustworthiness, and \(k\)-NN overlap are all unresolved between the three.
+
+\texttt{rational\_q99} is therefore the default, and the level weights
+\((1,2,8)\) transfer unchanged --- which was the point of matching the
+magnitude profile rather than re-tuning around a mismatched one.
+
+%==============================================================================
+\section{Parametric model}
+\label{sec:model}
+%==============================================================================
+
+\subsection{Anchor affinity}
+\label{sec:affinity}
+
+\begin{definition}[Softmax landmark affinity]
+With learnable temperatures \(\tau_\ell=\tau_{\min}+e^{\log\tau_\ell}\)
+(\(\tau_{\min}=10^{-3}\)),
+\begin{equation}
+\label{eq:affinity}
+D_{i\ell}=d_X(x_i,M_\ell),
+\qquad
+a_{i\ell}
+=
+\frac{\exp(-D_{i\ell}/\tau_\ell)}
+{\sum_{\ell'}\exp(-D_{i\ell'}/\tau_{\ell'})}.
+\end{equation}
+\end{definition}
+
+Default \(\tau_\ell\) equals the mean distance from landmark \(\ell\) to its
+\(\min(32,L-1)\) nearest landmarks, times \texttt{tau\_scale}. Anchors are
+frozen automatically if \(d_X\) is non-differentiable in its second argument.
+
+Affinity perplexity
+\[
+\mathrm{perp}_i
+=
+\exp\Bigl(-\sum_\ell a_{i\ell}\log a_{i\ell}\Bigr)
+\]
+is monotone in \(\tau\); \texttt{calibrate.py} bisects \texttt{tau\_scale} so
+that the median perplexity meets a target (default \(8\)). Perplexity near
+\(1\) is a Voronoi indicator; near \(L\) the code is uninformative.
+
+\subsection{FiLM encoder}
+\label{sec:film}
+
+Let \(x_n=(x-\mu)/\sigma\) be the encoder-normalised input. A depth-\(K\)
+MLP with width \(W\) applies, at each layer \(k=1,\ldots,K\),
+\begin{equation}
+\label{eq:film}
+\begin{aligned}
+h_0 &= x_n,\\
+\tilde h_k &= W_k h_{k-1}
+  \qquad\text{(bias-free)},\\
+h_k &= \GELU\Bigl(\gamma_k\odot \LN\bigl(\tilde h_k\bigr) + \beta_k\Bigr),
+\end{aligned}
+\end{equation}
+with FiLM parameters \((\gamma_k,\beta_k)\in\R^W\) produced from the affinity
+code (Section~\ref{sec:factors}). The embedding is
+\begin{equation}
+\label{eq:z}
+z
+=
+\begin{cases}
+W_{\mathrm{PCA}}\,x_n + W_{\mathrm{head}}\,h_K + b
+  & \text{if \texttt{pca\_skip}=True},\\[4pt]
+W_{\mathrm{head}}\,h_K + b
+  & \text{otherwise}.
+\end{cases}
+\end{equation}
+When the PCA skip is enabled, \(W_{\mathrm{PCA}}\) holds the top-\(d\) right
+singular vectors of the (optionally centred) normalised training matrix, and
+the residual head is initialised \(\mathcal{N}(0,10^{-4})\) with zero bias, so
+training \emph{starts at plain PCA}.
+
+\begin{remark}[Coupled \texttt{pca\_skip} / learning rate]
+With the skip on and \(\mathrm{lr}=10^{-3}\), the unconstrained linear path
+tends to dominate the layout. Turning the skip off at the same learning rate
+undertrains the near-zero head. Escaping both regimes requires
+\texttt{pca\_skip}=\texttt{False} \emph{and} a raised learning rate
+(\(\sim 2\cdot 10^{-2}\) for \(N\le 5\cdot 10^3\)). The two knobs are one
+decision~\cite{leanmap-config}.
+\end{remark}
+
+\subsection{Factor roles and FiLM composition}
+\label{sec:factors}
+
+Multiple conditioning factors may be stacked. Each factor \(f\) emits a
+contribution \((\gamma^{(f)},\beta^{(f)})\) according to a role:
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+Role & \(\gamma^{(f)}\) & \(\beta^{(f)}\) \\
+\midrule
+\texttt{PRIMARY} & per-channel \((B,K,W)\) & per-channel \\
+\texttt{MODULATOR} & per-layer scalar & per-channel \\
+\texttt{GAIN} & per-layer scalar & --- \\
+\texttt{AXIS} & --- (monotone output axis) & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Composition is multiplicative in scale and additive in shift,
+\begin{equation}
+\label{eq:filmcompose}
+\gamma
+=
+\clamp\Bigl(\prod_f \gamma^{(f)},\;\gamma_{\min},\;\gamma_{\max}\Bigr),
+\qquad
+\beta
+=
+\sum_f \beta^{(f)},
+\end{equation}
+with \(\gamma_{\min}=0.1\), \(\gamma_{\max}=10\). The clamp hit-rate is
+monitored as an extrapolation diagnostic.
+
+\begin{remark}[Why FiLM must follow the normalisation]
+\label{rem:filmorder}
+Equation~\eqref{eq:film} normalises \emph{before} modulating. The opposite
+order, \(\GELU(\LN(\gamma\odot\tilde h+\beta))\), silently disables two of the
+roles: layer normalisation satisfies \(\LN(c\,h)=\LN(h)\) for any \(c>0\), so a
+per-layer \emph{scalar} \(\gamma\) is exactly invisible. A \texttt{GAIN} factor
+would then contribute nothing to the forward pass while still receiving
+gradient noise, and a \texttt{MODULATOR} would act only through the ratio
+\(|\gamma\,\tilde h|:|\beta|\) rather than through its scale at all.
+\texttt{PRIMARY} is unaffected either way, because a per-channel rescale
+changes the cross-channel pattern that \(\LN\) normalises. Earlier revisions of
+this package used the modulate-first order; role comparisons involving
+\texttt{GAIN} or \texttt{MODULATOR} predate the fix and are not comparable
+across it, whereas single-\texttt{PRIMARY} results (the default path) remain
+qualitatively valid.
+\end{remark}
+
+An \texttt{AXIS} factor contributes a monotone scalar MLP (non-negative
+weights via \(\softplus\)) added to a dedicated output coordinate.
+
+%==============================================================================
+\section{Low-dimensional similarity and \texorpdfstring{\texttt{min\_dist}}{min\_dist}}
+\label{sec:ab}
+%==============================================================================
+
+\subsection{Curve fit}
+\label{sec:curvefit}
+
+As in UMAP, the low-dimensional similarity kernel is parameterised by
+\((a,b)\) fitted to a piecewise target. On a grid \(x\in[0,3\cdot\mathrm{spread}]\),
+\begin{equation}
+\label{eq:target}
+y(x)
+=
+\begin{cases}
+1, & x < \texttt{min\_dist},\\
+\exp\bigl(-(x-\texttt{min\_dist})/\mathrm{spread}\bigr),
+  & x\ge\texttt{min\_dist},
+\end{cases}
+\end{equation}
+and
+\begin{equation}
+\label{eq:curve}
+\hat y(x)
+=
+\frac{1}{1+a\,x^{2b}}.
+\end{equation}
+Parameters are obtained by bounded least squares
+(\(a,b>0\), initialisation \((1,1)\)). Fallback:
+\((a,b)=(1.577,0.895)\) (UMAP's \texttt{min\_dist}\,{=}\,0.1 values).
+Default \(\mathrm{spread}=1\).
+
+The embedding kernel used in the geometric loss is then
+\begin{equation}
+\label{eq:q}
+q(u,v)
+=
+\bigl(1 + a\,\norm{u-v}^{2b}\bigr)^{-1},
+\end{equation}
+clamped to \([10^{-7},1-10^{-7}]\) for logarithms.
+
+\subsection{Stability of the attractive force}
+\label{sec:bstability}
+
+\begin{proposition}[Near-contact attraction]
+For small separation \(r=\norm{z_i-z_j}\), the attractive force derived from
+\(-\log q\) scales as \(2ab\,r^{2b-1}\). The force \emph{per unit separation}
+is therefore \(\propto r^{2b-2}\), which diverges as \(r\to 0\) whenever
+\(b<1\): a pair that is already close is pulled proportionally harder.
+\end{proposition}
+
+This positive feedback is the mechanism that collapses neighbourhoods into
+knots separated by voids, and it is a statement about the ratio of force to
+separation, not about the force itself.
+
+\begin{remark}[Correcting the ``hard floor'' argument]
+\label{rem:bfloor}
+An earlier version of this note argued that because leanmap differentiates the
+loss directly rather than using UMAP's clipped SGD kernel, \(b\ge 1\) is a hard
+floor. That mechanism does not hold. The attractive force \(2ab\,r^{2b-1}\)
+diverges at contact only for \(b<\tfrac12\); for \(\tfrac12<b<1\) --- which is
+the entire range in question, since UMAP's default \(b\approx 0.895\) sits
+there --- it \emph{vanishes} sublinearly. There is nothing for autodiff to blow
+up on.
+
+What actually diverges in UMAP is the \emph{repulsive} gradient, whose
+\(1/(\varepsilon+r^2)\) factor grows without bound as a negative sample
+approaches its anchor, and that is what UMAP's clipping addresses. It is a
+property of the repulsive term, not a consequence of clipped versus exact
+differentiation of the attractive one.
+
+The consequence is that \(b\ge 1\) has no derivation behind it. What survives
+is the proposition above --- sub-unit \(b\) does produce a relative pull that
+grows without bound at contact --- plus whatever the measurements support. Any
+threshold on \(b\) is stated below as an empirical rule.
+\end{remark}
+
+\paragraph{The seeded ladder.}
+An earlier version of this table was single-seed, and reported digits 5-NN of
+\(0.958/0.969/0.947/0.939\) across \(\texttt{min\_dist}=0.1/0.2/0.5/0.8\) --- a
+spread of \(0.03\) --- from which it concluded that accuracy ``degrades
+monotonically past \(0.2\)''. Re-run at three seeds, with the seed spread
+reported (\(\pm\) is the sample sd over seeds, \(n=3\)):
+
+\begin{center}
+\small
+\begin{tabular}{cc|ccc|cc}
+\toprule
+& & \multicolumn{3}{c|}{digits} & \multicolumn{2}{c}{s-curve} \\
+\texttt{min\_dist} & \(b\) & 5-NN & trust\(_{15}\) & spacing CV
+  & \(k\)NN overlap & area sd \\
+\midrule
+0.1 & 0.895 & \(0.936\pm0.029\) & \(0.948\pm0.009\) & \(0.612\pm0.110\)
+    & \(0.813\pm0.006\) & \(0.231\pm0.022\) \\
+0.2 & 1.003 & \(0.929\pm0.028\) & \(0.944\pm0.009\) & \(0.504\pm0.077\)
+    & \(0.824\pm0.019\) & \(0.193\pm0.019\) \\
+0.5 & 1.334 & \(0.921\pm0.034\) & \(0.938\pm0.010\) & \(0.398\pm0.050\)
+    & \(0.858\pm0.016\) & \(0.152\pm0.017\) \\
+0.8 & 1.681 & \(0.906\pm0.030\) & \(0.921\pm0.011\) & \(0.334\pm0.028\)
+    & \(0.858\pm0.041\) & \(0.141\pm0.032\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{remark}[The accuracy trend is real but unresolved; the uniformity trend
+is large]
+\label{rem:mindistseeded}
+Digits 5-NN does decline monotonically, by \(0.030\) across the full ladder ---
+but the seed sd is itself \(0.028\)--\(0.034\), so not one pairwise difference
+in that column is resolved, including the endpoints. The direction is
+consistent with the single-seed table; the magnitude is not established. What
+the earlier text called ``degrades monotonically past \(0.2\)'' should be read
+as a trend the data cannot presently distinguish from noise. Note also that the
+seeded means sit \emph{below} the single-seed numbers at every rung, which is
+what one expects when a single run is implicitly the best of an unrecorded few.
+
+The uniformity trend, by contrast, is large and resolved: digits spacing CV
+falls from \(0.612\) to \(0.334\), with \(0.5\) and \(0.8\) both resolved
+against \(0.1\). On the s-curve, \(\texttt{min\_dist}=0.5\) is resolved
+\emph{better} than \(0.1\) on \(k\)-NN overlap (\(+0.044\)),
+trustworthiness, and \(\mathrm{area\_sd}\) (\(-0.079\)) --- on a smooth
+manifold, raising \texttt{min\_dist} improves neighbourhood preservation
+outright rather than trading it away.
+\end{remark}
+
+The default \(\texttt{min\_dist}=0.5\) is retained, and the ladder now says why
+rather than asserting a regime boundary. It is the largest value with no
+resolved loss anywhere: at \(0.8\), digits trustworthiness is resolved-worse
+(\(-0.027\)), while the additional uniformity over \(0.5\) is small and the
+s-curve metrics stop improving. Going the other way, \(0.1\) and \(0.2\) give
+up the whole uniformity gain and, on the s-curve, real neighbourhood fidelity,
+for an accuracy difference the seeds cannot resolve.
+
+Two claims from the earlier text are withdrawn: ``values below \(0.2\) are
+never safe'', which the \(0.1\) row does not support, and the collapse /
+marginal / stable regimes stated as thresholds on \(b\), which rested on the
+mechanism corrected in Remark~\ref{rem:bfloor}. The surviving rule is
+empirical: prefer the top of the ladder, back off if trustworthiness degrades.
+
+%==============================================================================
+\section{Training objective}
+\label{sec:loss}
+%==============================================================================
+
+\subsection{Fuzzy cross-entropy}
+\label{sec:geom}
+
+Positive edges \((i,j)\) are drawn proportional to \(P^{\mathrm{sym}}_{ij}\)
+(Vose alias sampling), expanded from \(\varepsilon\)-net cells to random raw
+members. Negatives \(z_i^-\) are uniform over representatives
+(\(n_{\mathrm{neg}}=5\) by default).
+
+\begin{equation}
+\label{eq:geom}
+\begin{aligned}
+\loss_{\mathrm{geom}}
+&=
+-\frac{1}{B}\sum_{(i,j)\in E_B} w_{ij}\log q(z_i,z_j) \\
+&\quad
+-\frac{1}{B\,n_{\mathrm{neg}}}
+\sum_i\sum_{m=1}^{n_{\mathrm{neg}}}
+\log\bigl(1-q(z_i,z_{i,m}^-)\bigr).
+\end{aligned}
+\end{equation}
+
+This is the UMAP-style cross-entropy between fuzzy memberships and the
+low-dimensional kernel~\eqref{eq:q}, with direct autodiff rather than a
+clipped-force approximation.
+
+\subsection{Ordinal triplet loss}
+\label{sec:ord}
+
+For verified quadruples (anchor, near, mid, far) with
+\(d_{\mathrm{an}}<d_{\mathrm{am}}<d_{\mathrm{af}}\) in a factor's view
+metric, with adaptive scale \(s\leftarrow 0.9\,s+0.1\,\overline{d_{\mathrm{af}}}\),
+\begin{equation}
+\label{eq:ord}
+\loss_{\mathrm{ord}}
+=
+\E\Bigl[
+-\log\sigma\!\Bigl(\frac{d_{\mathrm{am}}-d_{\mathrm{an}}}{s}\Bigr)
+-\log\sigma\!\Bigl(\frac{d_{\mathrm{af}}-d_{\mathrm{am}}}{s}\Bigr)
+\Bigr].
+\end{equation}
+Mid points are drawn from the bucket of the anchor's rank-\(r\) landmark with
+log-uniform \(r\sim\mathrm{round}(\exp\mathcal{U}(\log 2,\log L))\). The
+weight \(\lambda_{\mathrm{ord}}=0.1\) is fixed plumbing.
+
+\paragraph{Retention and its null.}
+Retention is the fraction of proposed triplets that survive verification. It is
+interpretable only against the rate at which a triplet would pass with
+\emph{no} information in the landmark ranking, and that rate is not a universal
+constant: it depends on the sampler, on the bucket-size distribution, and on
+the data. The note previously asserted a chance level of \(0.475\), which is
+not recoverable from the log-uniform scheme above.
+
+The null is therefore \emph{measured} at fit time by permuting each row's
+landmark ordering and re-running the identical sampler, which destroys the
+rank--distance association while leaving the rank draw, the bucket-based mid
+selection, and the uniform far point untouched. Measured values are \(0.472\)
+(iris), \(0.484\) (swiss roll), and \(0.487\) (digits) --- close to the old
+constant, but data-dependent, and correct by construction if the sampling
+scheme ever changes. The warning threshold floats with the measured null at the
+same margin. That margin is narrow: a retention of \(0.55\) sits only
+\(\approx 0.07\) above chance, so values in the \(0.5\)--\(0.6\) band should be
+read as barely informative rather than as a pass.
+
+\subsection{Landmark regularisation}
+\label{sec:lm}
+
+\begin{equation}
+\label{eq:lm}
+\loss_{\mathrm{lm}}
+=
+\frac{1}{B}\sum_i\sum_\ell a_{i\ell}\,D_{i\ell}
+-
+\eta\sum_\ell \bar a_\ell\log\bar a_\ell,
+\qquad
+\bar a_\ell=\frac{1}{B}\sum_i a_{i\ell},
+\end{equation}
+with \(\eta=\texttt{ETA\_BALANCE}=1\). The first term is soft quantisation
+error; the second is a load-balancing entropy over mean affinities.
+
+\subsection{Local rigidity (frame term)}
+\label{sec:frame}
+
+The frame term is an as-rigid-as-possible~\citep{sorkine2007arap} penalty in
+the Gram domain. For a centre \(c\) with neighbours \(\{k\}\) (a
+\emph{star}), write offsets \(u_k=x_k-x_c\) and \(v_k=z_k-z_c\). A similarity
+preserves all pairwise inner products up to one scalar, so
+\begin{equation}
+\label{eq:grams}
+(G_x)_{kl}=\inner{u_k}{u_l},\qquad
+(G_z)_{kl}=\inner{v_k}{v_l}.
+\end{equation}
+With pair mask \(M_{kl}=m_k m_l\) (padding / dropped neighbours),
+\begin{equation}
+\label{eq:frame}
+s^2
+=
+\frac{\inner{G_z}{G_x}_M}{\inner{G_x}{G_x}_M}
+\quad\text{(detached)},
+\qquad
+\loss_{\mathrm{frame}}
+=
+\frac{\sum\norm{G_z-s^2 G_x}_M^2}
+{\sum\norm{G_z}_M^2}.
+\end{equation}
+The diagonal recovers edge-length isometry; off-diagonals encode relative
+orientation, so a length-preserving shear (frame twist) is penalised. The
+objective is rotation/reflection-invariant and needs no SVD in the backward
+pass. Scale invariance follows from the detached \(s^2\) and the
+normalisation by \(\norm{G_z}^2\).
+
+\paragraph{Tangent / geodesic mode.}
+On folded manifolds, ambient \(k\)-NN includes across-sheet shortcuts. With
+\texttt{frame\_tangent}=\texttt{True}, under \(\mathrm{no\_grad}\):
+
+\begin{enumerate}[leftmargin=*]
+\item Distance-weight offsets
+  \(w_k=\exp(-\tfrac12(\norm{u_k}/h)^2)\) with \(h\) the mean neighbour
+  distance.
+\item Estimate a local tangent basis as the top-\(d_{\mathrm{eff}}\) right
+  singular vectors of the weighted offset cloud.
+\item Drop neighbours with normal residual fraction
+  \(\norm{u-\Pi_T u}/\norm{u}>\texttt{FRAME\_NORMAL\_THRESH}=0.5\).
+\item Match Grams on tangent-projected offsets \(u\leftarrow u\,T\).
+\end{enumerate}
+This yields a first-order geodesic rigidity safe on swiss-roll-like data.
+
+In this mode the term is essentially LTSA~\citep{zhang2004ltsa}: steps 1--2 are
+LTSA's weighted local tangent estimate, and step 4 imposes LTSA's requirement
+that the tangent-coordinate structure agree between data and embedding. The
+departures are that the agreement is enforced on Gram matrices with a detached
+scale rather than by aligning coordinates, and that it is a penalty on a
+parametric map rather than a global eigenproblem solved for the embedding.
+
+\paragraph{Why the ramp must be delayed on fold-back manifolds.}
+Local rigidity cannot distinguish a rolled manifold from its unrolled
+isometry: it penalises the \emph{transient} stretch of unrolling. On such
+data, \(r_{\mathrm{frame}}\) should rise only after the neighbour loss has
+globally unrolled (e.g.\ \((0.5,0.75)\)); it then cleans up width and twist.
+On non-folding sheets early or delayed both help; delayed remains safer.
+
+An older length-only local isometry loss (pairwise \(\norm{z_i-z_j}\) vs.\
+\(\norm{x_i-x_j}\) up to detached scale) is implemented but unused in the
+default trainer; the Gram term supersedes it.
+
+\subsection{Geodesic backbone}
+\label{sec:geo}
+
+Landmarks are mapped to nearest training rows; a symmetrised \(k\)-NN graph
+on \(X\) yields landmark--landmark shortest paths \(g_{\ell\ell'}\). Classical
+MDS~\citep{torgerson1952,isomap2000} produces a frozen target \(Y\in\R^{L\times d}\):
+\begin{equation}
+\label{eq:cmds}
+J=I-\tfrac1L\ind\ind^\top,\qquad
+B=-\tfrac12 J\,G^{(2)}\,J,\qquad
+Y=V_d\,\Lambda_d^{1/2},
+\end{equation}
+with \(\Lambda_d=\max(\lambda_d,0)\) from the eigendecomposition of the
+symmetrised Gram \(B\).
+
+\begin{remark}[The clamp discards evidence; report it]
+\label{rem:negeigen}
+\(B\) is positive semi-definite only when the geodesic distances \(g\) are
+Euclidean-embeddable. They generally are not --- a manifold with a hole, or one
+whose shortest paths wrap around a fold, produces genuinely non-Euclidean
+\(g\), and the negative eigenvalues of \(B\) are precisely the record of that.
+The clamp \(\max(\lambda,0)\) throws the record away silently, leaving a target
+\(Y\) that looks unremarkable no matter how badly it fits.
+
+The negative mass is therefore emitted as a first-class diagnostic,
+\begin{equation}
+\label{eq:negeigen}
+\nu = \frac{\sum_{\lambda_i<0}\abs{\lambda_i}}{\sum_i\abs{\lambda_i}},
+\end{equation}
+alongside the fraction of positive spectrum captured by the retained \(d\)
+components. Large \(\nu\) means the MDS target is a poor summary of the
+geodesic structure and \(\loss_{\mathrm{anchor}}\) is pulling towards
+something the data does not support.
+
+The response is a warning, not an adjustment. Making
+\(\lambda_{\mathrm{anchor}}\) a hidden function of \(\nu\) would reintroduce
+exactly the buried-coupling problem that motivated exposing \(\beta\)
+(Remark~\ref{rem:beta}): the recipe would no longer say what the objective is.
+The diagnostic is reported, a threshold triggers a warning, and the weight
+stays under the user's control.
+\end{remark}
+
+\paragraph{Scale-invariant stress.}
+On sampled landmark pairs,
+\begin{equation}
+\label{eq:stress}
+s=\frac{\inner{d_z}{g}}{\inner{g}{g}}
+\quad\text{(detached)},
+\qquad
+\loss_{\mathrm{stress}}
+=
+\frac{\E[(d_z-s\,g)^2]}{\E[d_z^2]},
+\end{equation}
+where \(d_z=\norm{z_a-z_b}\). This constrains \emph{how far} landmarks sit---the
+global metric gauge that affinity losses leave free (the ``banana'' bend of an
+otherwise isometric unrolling).
+
+\paragraph{Procrustes anchor.}
+Let \(Z_M\in\R^{L\times d}\) be current landmark embeddings. Under
+\(\mathrm{no\_grad}\), optimally align the frozen MDS target \(Y\) to \(Z_M\)
+by a similarity:
+\begin{equation}
+\label{eq:procrustes}
+\begin{aligned}
+M &= Y_c^\top Z_{M,c},
+\quad
+U\Sigma V^\top=\mathrm{SVD}(M),
+\quad
+R=UV^\top
+\quad\text{(reflection-fixed if \(\det R<0\))},\\
+c &= \frac{\mathrm{tr}\,\Sigma}{\norm{Y_c}_F^2},
+\quad
+t = \bar z_M - c\,\bar Y R,\\
+\loss_{\mathrm{anchor}}
+&=
+\frac{1}{Ld}\norm{Z_M - (c\,YR + t)}_F^2.
+\end{aligned}
+\end{equation}
+Gradients flow only into \(Z_M\). Stress alone is invariant to local frame
+twists that approximately preserve pairwise distances; the absolute-position
+prior selects the untwisted developable layout.
+
+Combined:
+\begin{equation}
+\label{eq:lgeocombined}
+\loss_{\mathrm{geo}}
+=
+\lambda_{\mathrm{anchor}}\,\loss_{\mathrm{anchor}}
++ 0.25\,\loss_{\mathrm{stress}},
+\qquad
+\lambda_{\mathrm{anchor}}=1\ \text{by default}.
+\end{equation}
+The anchor weight is a config knob rather than the hardcoded \(1\) of earlier
+versions. Setting \(\lambda_{\mathrm{anchor}}=0\) keeps the scale-invariant
+stress while dropping the absolute-position prior, which is worth testing
+whenever \(\loss_{\mathrm{frame}}\) is active --- the frame term already
+penalises local twist, and does so without committing to a global MDS target
+that Remark~\ref{rem:negeigen} may show to be unsupported. The measured
+consequence is in \S\ref{sec:ablations}: on swiss roll the means are
+indistinguishable, but the seed spread of \(\mathrm{area\_sd}\) grows by
+roughly an order of magnitude, so the default stays at \(1\).
+
+\begin{remark}[A Lipschitz penalty was removed]
+\label{rem:nolip}
+Earlier versions carried a one-sided gradient penalty
+\(\E[(\norm{\partial z/\partial\tilde x}_F-1)_+^2]\) on random convex mixtures,
+with weight \(\lambda_{\mathrm{lip}}\). It has been deleted rather than
+retuned. It was never swept, defaulted to zero in the small-\(N\) recipe that
+ships, and — more importantly — it penalises the \emph{absolute} Frobenius norm
+of the Jacobian against a hard threshold of \(1\). That contradicts the rest of
+the objective: both \(\loss_{\mathrm{frame}}\) and \(\loss_{\mathrm{stress}}\)
+are deliberately scale-free, fitting and detaching a global scale \(s\) so that
+no term can dictate the overall size of the embedding. A penalty anchored to a
+fixed Jacobian norm silently does exactly that. No scale-free replacement was
+substituted, because there is no measurement showing the term was needed.
+\end{remark}
+
+\subsection{Ramp schedules}
+\label{sec:ramps}
+
+For training fraction \(t\in[0,1]\) and breakpoints \((t_0,t_1)\),
+\begin{equation}
+\label{eq:ramp}
+r_\uparrow(t)
+=
+\begin{cases}
+1, & t_0=t_1=0,\\
+0, & t<t_0,\\
+\dfrac{t-t_0}{t_1-t_0}, & t_0\le t<t_1,\\
+1, & t\ge t_1.
+\end{cases}
+\end{equation}
+Default \(\texttt{geo\_ramp}=(0.2,0.45)\); \(\texttt{frame\_ramp}=(0,0)\)
+(on immediately) unless delayed for fold-back data.
+
+%==============================================================================
+\section{Optimisation}
+\label{sec:opt}
+%==============================================================================
+
+AdamW with weight decay \(10^{-4}\). Default schedule: linear warmup over
+\(5\%\) of total steps (start factor \(0.01\)), then cosine annealing to the
+end. Gradients are clipped to \(\ell_2\)-norm \(5\). Non-finite losses skip
+the step. Steps per epoch equal \(\lceil E_{\mathrm{fine}}/B_e\rceil\) where
+\(E_{\mathrm{fine}}\) is the finest-level edge count.
+
+An optional two-phase override holds a constant learning rate for
+\texttt{lr\_switch\_epochs} then switches to \texttt{lr\_after}, disabling
+warmup{+}cosine.
+
+%==============================================================================
+\section{Evaluation statistics}
+\label{sec:eval}
+%==============================================================================
+
+\subsection{Shepard / stress}
+\label{sec:shepard}
+
+For paired distances \((g_i,e_i)\) (ambient or geodesic vs.\ embedding),
+\begin{equation}
+\label{eq:shepard}
+\alpha=\frac{\inner{g}{e}}{\inner{e}{e}},
+\qquad
+\mathrm{stress}
+=
+\sqrt{\frac{\sum_i(\alpha e_i-g_i)^2}{\sum_i g_i^2}},
+\end{equation}
+plus Spearman rank correlation. Ambient Shepard uses random distinct pairs;
+geodesic Shepard uses Dijkstra on the fuzzy graph with hop length
+\(1/\clamp(w,10^{-6},\infty)\).
+
+\subsection{Trustworthiness and continuity}
+\label{sec:trust}
+
+With ambient ranks \(r^X_{ij}\) and embedding \(k\)-NN sets \(\mathcal{N}^Z_k\),
+\begin{equation}
+\label{eq:trust}
+T_k
+=
+1-\frac{2}{nk(2n-3k-1)}
+\sum_i\sum_{j\in\mathcal{N}^Z_k(i)\setminus\mathcal{N}^X_k(i)}
+\bigl(r^X_{ij}-k\bigr),
+\end{equation}
+and continuity by exchanging the roles of \(X\) and \(Z\). Overlap
+\(\mathrm{knn\_overlap}_k\) is the mean fraction of shared neighbours.
+
+\subsection{Density correspondence}
+\label{sec:density}
+
+Local density \(\mathrm{dens}(x_i)=(k^{-1}\sum_{j\in\mathcal{N}_k(i)}d_{ij})^{-1}\).
+Log-densities \(\ell_a=\log_{10}\mathrm{dens}_X\), \(\ell_z=\log_{10}\mathrm{dens}_Z\)
+are compared by OLS slope, residual, Spearman, and Pearson-on-logs.
+
+\subsection{Uniformity}
+\label{sec:uniformity}
+
+With \(k\)-NN radii \(r_X(i),r_Z(i)\) (default \(k=10\)) on an interior mask,
+\begin{equation}
+\label{eq:uniformity}
+\mathrm{spacing\_cv}
+=
+\frac{\mathrm{sd}\,r_Z}{\overline{r_Z}},
+\qquad
+\mathrm{area\_sd}
+=
+\mathrm{sd}\Bigl[\log\frac{r_Z}{r_X}\Bigr].
+\end{equation}
+Zero \(\mathrm{area\_sd}\) means every neighbourhood is blown up by the same
+factor (area-preserving up to global scale). A layout can be perfectly uniform
+on the page while badly misrepresenting a non-uniform sample; \(\mathrm{area\_sd}\)
+is the honest target for that distinction.
+
+\subsection{Persistence: would you get the same map twice?}
+\label{sec:persistence}
+
+Every statistic above measures whether \emph{a} map is good. None measures
+whether refitting reproduces it --- which is the property a saved
+\texttt{.pt} artefact actually sells, since downstream coordinates, stored
+cluster labels, and figures all assume the map is stable.
+
+Two maps \(Z,Z'\) of the same points are compared after refits at (i)
+\(\ge 3\) seeds and (ii) \(\ge 3\) training subsamples (80\% draws).
+
+\paragraph{Coordinate disagreement.}
+The embedding is defined only up to a similarity, so the comparison fits a
+Procrustes similarity \((s,Q,t)\) and reports the median residual
+\begin{equation}
+\label{eq:procdis}
+\mathrm{disagree}(Z,Z')
+=
+\operatorname{median}_i\ \norm{\,sQz_i+t-z'_i\,}\Big/\operatorname{median}_i\norm{z'_i-\bar z'}.
+\end{equation}
+The transform is fit on a shared \emph{anchor} set and evaluated on
+\emph{held-out} points, so the alignment is not scored on the points it was fit
+to.
+
+\paragraph{Neighbourhood rank agreement.}
+Spearman correlation between the neighbour rankings the two maps induce on a
+shared probe set, plus \(k\)-NN Jaccard overlap.
+
+\begin{remark}[Which number is primary]
+\label{rem:persprimary}
+Rank agreement is the primary number and coordinate disagreement the secondary
+one. Procrustes can absorb a rotation but cannot repair genuine topological
+ambiguity --- which arm of a branching structure lands on which side is a
+discrete choice, and no similarity transform undoes it. A large coordinate
+disagreement together with high rank agreement is therefore a gauge artefact,
+not instability, and should be reported as such rather than as a failure.
+The converse --- small coordinate disagreement with degraded rank agreement ---
+is the genuinely bad case.
+\end{remark}
+
+\subsection{Matched null}
+\label{sec:null}
+
+A configuration is re-fit on column-shuffled input (joint structure destroyed,
+marginals retained). Only the margin of a metric over this null carries
+information.
+
+\subsection{Intrinsic dimension (calibration)}
+\label{sec:id}
+
+Levina--Bickel MLE~\citep{levina2005}:
+\begin{equation}
+\label{eq:lb}
+\hat m
+=
+\Biggl(\frac1n\sum_i\frac1{k-1}\sum_{j=1}^{k-1}
+\log\frac{r_k(i)}{r_j(i)}\Biggr)^{-1}.
+\end{equation}
+
+%==============================================================================
+\section{Conformal scores and out-of-distribution detection}
+\label{sec:conformal}
+%==============================================================================
+
+\subsection{Cover score}
+\label{sec:cover}
+
+\begin{definition}[Cover]
+\begin{equation}
+\label{eq:cover}
+\mathrm{cover}(x)
+=
+\min_\ell \frac{d_X(x,M_\ell)}{s_{\mathrm{nat}}},
+\end{equation}
+where \(s_{\mathrm{nat}}\) is the metric natural scale.
+\end{definition}
+
+This is the baseline nonconformity score. A secondary chart-quality diagnostic
+compares ambient affinity \(a(x)\) to an embedding-space softmax over landmark
+embeddings; it is \emph{not} used as an OOD gate.
+
+\begin{remark}[What may be estimated on all of \(X\), and why]
+\label{rem:validity}
+The conformal guarantee needs the score function fixed before calibration and
+the calibration scores exchangeable with the test scores. Two different
+arguments apply here, and conflating them invites a spurious leak report.
+
+\(s_{\mathrm{nat}}\), and any global \((\mu,\sigma)\) standardisation, are
+\emph{strictly monotone rescalings} applied identically to calibration and test
+scores. Equation~\eqref{eq:pvalue} depends on the scores only through the
+count \(\#\{s_j\ge s(x)\}\), which is invariant under any common increasing
+map. They may therefore be estimated on all of \(X\) with no effect whatsoever
+on the \(p\)-values.
+
+The per-landmark radii and charts of \S\ref{sec:localscale} are \emph{not}
+rank-preserving --- they deliberately reorder points --- so the same argument
+does not cover them. They are instead fit on the \emph{training} split, which
+is disjoint from calibration by construction (\S\ref{sec:overview}: the
+calibration split is taken before landmark selection). Both are sound; only the
+second needs the split.
+\end{remark}
+
+\subsection{Per-landmark local scale}
+\label{sec:localscale}
+
+A single global \(s_{\mathrm{nat}}\) makes~\eqref{eq:cover} a statement about
+absolute distance, so the sparse tail of the training distribution is flagged
+as readily as anything genuinely off-manifold. Replacing the global scale by a
+local one,
+\begin{equation}
+\label{eq:covlocal}
+\mathrm{cover}(x)=\min_\ell \frac{d_X(x,M_\ell)}{r_\ell},
+\qquad
+r_\ell=\operatorname{median}\{\,d_X(x_i,M_\ell): \ell(x_i)=\ell,\ x_i\in\text{train}\,\},
+\end{equation}
+buys approximate \emph{conditional} validity while keeping one pooled
+calibration set: a typical point scores \(\approx 1\) in a dense or a sparse
+region alike.
+
+\begin{remark}[Why not Mondrian]
+\label{rem:mondrian}
+The textbook route to conditional validity is Mondrian conformal prediction,
+which pools \emph{calibration} points per bucket. That is not viable at these
+shapes: with \(L\sim 64\)--\(256\) landmarks against
+\(n_{\mathrm{cal}}\lesssim 200\)--\(2000\), most buckets receive zero or one
+calibration point, and a per-bucket \(p\)-value has resolution
+\(1/(n_\ell+1)\). The radii in~\eqref{eq:covlocal} and the charts below are fit
+from \emph{training} points, which are plentiful, so they do not hit the same
+sparsity wall. The asymmetry is deliberate: condition the \emph{score} on the
+bucket, keep the \emph{calibration} pooled.
+\end{remark}
+
+\subsection{Tangent charts as the default nonconformity}
+\label{sec:chartscore}
+
+Isotropic balls are the wrong shape in \(D\gg m\). The acceptance region
+\(\{\mathrm{cover}\le\tau\}\) is a union of \(L\) balls of volume
+\(\sim\tau^D\) each, whereas the support near a landmark is a sheet of
+extent \(\tau\) in \(m\) tangent directions and thickness \(t\ll\tau\) in the
+remaining \(D-m\), i.e.\ volume \(\sim\tau^m t^{D-m}\). The ratio is
+\((\tau/t)^{D-m}\): exponentially generous.
+
+The fix is to split each neighbourhood by a local PCA chart. Let \(V_\ell\in
+\R^{D\times m}\) be the top-\(m\) right singular vectors of the centred
+training scatter in bucket \(\ell\), and for \(u=x-M_\ell\) write
+\(u_\parallel=V_\ell^{\top}u\), \(u_\perp=u-V_\ell u_\parallel\). With
+\(\sigma^\parallel_\ell,\sigma^\perp_\ell\) the median training magnitudes of
+each part,
+\begin{equation}
+\label{eq:chartscore}
+s(x)=\min_\ell
+\sqrt{
+\frac{\norm{u_\parallel}^2}{(\sigma^\parallel_\ell)^2}
++
+\frac{\norm{u_\perp}^2}{(\sigma^\perp_\ell)^2}
+}.
+\end{equation}
+This replaces balls with tangent-aligned ellipsoids. It is the \emph{default}
+score; \eqref{eq:covlocal} is the fallback, and is recovered exactly by
+setting \(V_\ell=0\) and
+\(\sigma^\parallel_\ell=\sigma^\perp_\ell=r_\ell\), which is what buckets with
+too few training points to estimate a chart fall back to automatically.
+
+Measured on a 2-D sheet embedded in \(\R^8\), the ratio between the score of an
+off-sheet displacement and an along-sheet displacement of equal length is:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+sheet thickness \(t\) & locally-scaled balls & tangent charts \\
+\midrule
+\(0.05\)  & 1.34 & 2.3 \\
+\(0.02\)  & 1.35 & 4.3 \\
+\(0.005\) & 1.34 & 14.9 \\
+\(0.001\) & 1.34 & 74.2 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Balls are indifferent to thickness --- the discrimination sits at 1.34
+regardless --- while the chart score scales as \(1/t\), which is the
+\((\tau/t)^{D-m}\) argument showing up as a measurable quantity rather than an
+asymptotic remark.
+
+\subsection{\texorpdfstring{Conformal \(p\)-values}{Conformal p-values}}
+\label{sec:pvalue}
+
+With calibration scores \(\{s_j\}_{j=1}^{n_{\mathrm{cal}}}\) sorted
+descending,
+\begin{equation}
+\label{eq:pvalue}
+p(x)
+=
+\frac{1+\#\{s_j\ge s(x)\}}{n_{\mathrm{cal}}+1}.
+\end{equation}
+Small \(p\) means large cover (OOD). The resolution floor is
+\(1/(n_{\mathrm{cal}}+1)\). Under exchangeability, \(p\) is super-uniform, so
+flagging \(p\le\alpha\) controls the on-manifold false-alarm rate at level
+\(\alpha\)~\citep{vovk2005}.
+
+Batch tests use a permutation Mann--Whitney \(U\) on score samples; multiple
+testing uses Benjamini--Hochberg.
+
+\subsection{Closed-form minimum-norm repair}
+\label{sec:repair}
+
+The acceptance region \(\{\mathrm{cover}(x)\le\tau\}\) is a union of balls
+\(\bigcup_\ell B(M_\ell,\tau r_\ell)\). Projection onto a union of balls is the
+projection onto \emph{one} of them, but --- and this is where the earlier
+statement of this section was wrong --- not in general the one with the nearest
+centre. The travel required to reach ball \(\ell\) is \(d_\ell-\tau r_\ell\),
+so the correct target is
+\begin{equation}
+\label{eq:repairstar}
+\ell^\star=\argmin_\ell\ \bigl(d_\ell-\tau r_\ell\bigr),
+\qquad
+d_\ell=\norm{x-M_\ell},
+\end{equation}
+which coincides with \(\argmin_\ell d_\ell\) only when all \(r_\ell\) are
+equal. A farther landmark with a more generous radius can be the cheaper
+repair, and with the per-landmark radii of~\eqref{eq:covlocal} the radii are
+never equal by design. Given \(\ell^\star\) the move is still closed form,
+\begin{equation}
+\label{eq:repair}
+\delta^\star
+=
+\Bigl(1-\frac{\tau r_{\ell^\star}}{d_{\ell^\star}}\Bigr)(M_{\ell^\star}-x),
+\end{equation}
+equivalently the convex combination \(x_{\mathrm{repaired}}=
+(\tau r_{\ell^\star}/d_{\ell^\star})\,x+
+(1-\tau r_{\ell^\star}/d_{\ell^\star})\,M_{\ell^\star}\), and is a no-op when
+\(x\) is already inside. The repair cannot invent structure outside the
+landmark support. Because landmarks are a coarse support model, the certificate
+can be loose relative to finer manifold geometry (e.g.\ EMD to real digits).
+
+Under the chart score~\eqref{eq:chartscore} the target is selected the same
+way and the point is moved onto that landmark's isotropic ball of radius
+\(\tau r_{\ell^\star}\), a conservative inner move; the exact ellipsoid
+projection reduces to a 2-D problem in
+\((\norm{\delta_\parallel},\norm{\delta_\perp})\) and is not needed to certify
+membership.
+
+\subsection{Amortised negative space (CQR)}
+\label{sec:negspace}
+
+An optional quantile head predicts distance-to-support
+\(y(\tilde x)=\min_j\norm{\tilde x-x_j}\) from FiLM features, trained with
+pinball loss on isotropic perturbations and calibrated by conformalised
+quantile regression~\citep{romano2019cqr}. Novelty detection calibrates only
+the on-manifold null (raw median head output), remaining valid under covariate
+shift of the negatives.
+
+\begin{remark}[Why map-AUROC of unstructured probes misleads]
+UMAP's \texttt{transform} places new points as convex combinations of training
+neighbours' embeddings, so it cannot emit coordinates outside the convex hull
+of the training map. Detectability of unstructured probes is therefore largely
+about reserved empty space in the layout, not about representing ``far away.''
+\end{remark}
+
+%==============================================================================
+\section{Measurements}
+\label{sec:measurements}
+%==============================================================================
+
+Every number in this section is a mean over three seeds with the sample sd
+reported, at \(120\) epochs on the shipping recipe, with a \(20\%\) holdout. A
+difference is called \emph{resolved} only when it exceeds twice the pooled seed
+sd of the two arms; otherwise it is inside run-to-run noise and is reported as
+such. The seed spread is not a formality: on digits, \(\mathrm{5NN}\) accuracy
+alone carries \(\mathrm{sd}=0.031\) across seeds, which is larger than most of
+the differences this note previously drew conclusions from.
+
+\subsection{Net effect of the changes}
+\label{sec:regression}
+
+A seeded snapshot was taken \emph{before} any of the changes described in this
+note, so that a post-change regression could be told apart from a fix. Against
+that baseline, on the shipping recipe, four differences are resolved out of
+thirty metric--dataset pairs:
+
+\begin{center}
+\small
+\begin{tabular}{llrr}
+\toprule
+Dataset & Metric & before & after \\
+\midrule
+digits     & density Spearman & \(0.717\pm0.020\) & \(0.670\pm0.007\) \\
+swiss roll & \(k\)NN overlap  & \(0.793\pm0.005\) & \(0.840\pm0.004\) \\
+swiss roll & area sd          & \(0.201\pm0.015\) & \(0.149\pm0.009\) \\
+swiss roll & trustworthiness  & \(0.9953\pm0.0002\) & \(0.9972\pm0.0004\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Three are improvements on the manifold dataset and one is the known price of
+the monotone squash (\S\ref{sec:squash}), at the magnitude that section
+predicts. Everything else --- including all of the s-curve column, where
+\(k\)-NN overlap rises by \(0.061\) and density Spearman by \(0.105\) but the
+seed spread is too wide to resolve either --- is unchanged within noise. In
+particular the FiLM reordering, the \(\varepsilon\) quantile estimator, and the
+halo pass do not show up as regressions anywhere.
+
+\subsection{Is FiLM conditioning earning its keep?}
+\label{sec:filmvsconcat}
+
+The landmark affinity \(a(x)\) is a deterministic function of \(x\), so
+conditioning adds no information the encoder could not compute for itself. FiLM
+is therefore an \emph{inductive bias} --- a soft partition-of-unity mixture of
+experts --- and not extra capacity. The honest test is a plain MLP of identical
+width, depth, and skip structure with \(a(x)\) simply \emph{concatenated} to
+the normalised input.
+
+\begin{center}
+\small
+\begin{tabular}{llcc}
+\toprule
+Dataset & Metric & FiLM & concat \\
+\midrule
+digits & 5-NN accuracy      & \(0.914\pm0.031\) & \(0.908\pm0.022\) \\
+digits & trustworthiness    & \(0.937\pm0.010\) & \(0.934\pm0.006\) \\
+digits & kNN overlap        & \(0.557\pm0.034\) & \(0.540\pm0.023\) \\
+digits & geodesic Spearman  & \(0.724\pm0.060\) & \(0.629\pm0.024\)\;\textbf{*} \\
+swiss roll & 5-NN accuracy  & \(0.922\pm0.024\) & \(0.918\pm0.029\) \\
+swiss roll & kNN overlap    & \(0.860\pm0.005\) & \(0.850\pm0.009\) \\
+swiss roll & geodesic Spearman & \(0.751\pm0.030\) & \(0.751\pm0.030\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{*} is the only resolved difference in the table. FiLM buys global
+geodesic fidelity on clustered data --- \(+0.096\), roughly four times the
+pooled spread --- and nothing else that is measurable. On the manifold dataset
+the two are indistinguishable on every metric, to three decimals on geodesic
+Spearman.
+
+This is a narrower claim than the architecture's prominence suggests, and it is
+the claim the evidence supports: the roles, temperatures, clamps, and
+perplexity calibration are justified by one axis on one kind of data. Where
+global structure is not the goal, concatenation is a legitimate and simpler
+choice, and is available as \(\texttt{conditioning}=\texttt{"concat"}\).
+
+\subsection{Persistence}
+\label{sec:persistenceresults}
+
+Following the protocol of \S\ref{sec:persistence}: three refits, Procrustes
+fit on a shared anchor set and scored on held-out points.
+
+\begin{center}
+\small
+\begin{tabular}{llccc}
+\toprule
+Dataset & Refit varies & rank Spearman & Jaccard@15 & coord.\ disagreement \\
+\midrule
+digits     & seed      & 0.712 & 0.377 & 0.729 \\
+digits     & subsample & 0.633 & 0.377 & 0.726 \\
+s-curve    & seed      & 0.998 & 0.727 & 0.032 \\
+s-curve    & subsample & 0.995 & 0.657 & 0.264 \\
+swiss roll & seed      & 0.998 & 0.716 & 0.030 \\
+swiss roll & subsample & 0.862 & 0.609 & 0.724 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Three things follow.
+
+\emph{Manifold maps are reproducible; the clustered map is not.} At a fixed
+training set, s-curve and swiss roll return the same map to rank Spearman
+\(0.998\) and \(3\%\) coordinate disagreement. Digits reaches only \(0.712\),
+with a Jaccard overlap of \(0.377\) --- under two neighbours in five are shared
+between two runs that differ only in seed. Any downstream use of digits
+coordinates as if they were stable is unsupported.
+
+\emph{The s-curve subsample row is the gauge artefact of
+Remark~\ref{rem:persprimary}, exactly as predicted.} Coordinate disagreement
+rises eightfold (\(0.032\to0.264\)) while rank agreement is essentially
+unchanged (\(0.998\to0.995\)). Reading the coordinate number alone would call
+this a large instability; it is a reparameterisation.
+
+\emph{Subsampling is the harder perturbation, and not uniformly so.} Swiss roll
+degrades genuinely under subsampling (rank \(0.998\to0.862\)) rather than
+merely moving, which is a real sensitivity of the unrolling to which points are
+present.
+
+\subsection{Ablations}
+\label{sec:ablations}
+
+\paragraph{Multiplicity \(\beta\).}
+On digits, \(\beta\in\{0,0.5,1\}\) is inert: every metric differs by less than
+\(0.01\) and none is resolved. This is the expected result and a useful
+negative --- digits has no duplicate mass for the reweighting to act on, which
+confirms \(\beta\) is a property of the data rather than a solver knob
+(Remark~\ref{rem:beta}). It should be exercised where redundancy is real.
+
+\paragraph{Pyramid against the geodesic anchor.}
+The question was whether coarse-heavy level weights and
+\(\lambda_{\mathrm{geo}}\) are substitutes. On swiss roll they are not, and the
+result is stronger than a null:
+
+\begin{center}
+\small
+\begin{tabular}{lccc}
+\toprule
+& \((1,1,1)\), \(\lambda_{\mathrm{geo}}{=}0.5\)
+& \((1,2,8)\), \(\lambda_{\mathrm{geo}}{=}0.5\)
+& \((1,2,8)\), \(\lambda_{\mathrm{geo}}{=}0\) \\
+\midrule
+\(k\)NN overlap & \(0.920\pm0.006\) & \(0.868\pm0.004\) & \(0.817\pm0.029\) \\
+area sd         & \(0.081\pm0.004\) & \(0.124\pm0.006\) & \(0.181\pm0.040\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Removing the anchor at fixed \((1,2,8)\) costs \(0.051\) of \(k\)-NN overlap
+and \(0.057\) of \(\mathrm{area\_sd}\), both resolved: the pyramid supplies
+long-range attraction but not the global gauge, and cannot stand in for it.
+
+The unexpected column is the first. At fixed \(\lambda_{\mathrm{geo}}=0.5\),
+\emph{flat} level weights beat the coarse-heavy ramp by \(0.052\) of \(k\)-NN
+overlap and \(0.043\) of \(\mathrm{area\_sd}\), both resolved. On a smooth
+manifold with the geodesic anchor active, the ramp is not merely unnecessary
+--- it is harmful, presumably because the anchor already carries global
+structure and the coarse levels then compete with the fine ones for the edge
+budget. The \((1,2,8)\) default is retained for the general case, where
+\(\lambda_{\mathrm{geo}}=0.15\), but \S\ref{sec:defaults} now pairs raising
+\(\lambda_{\mathrm{geo}}\) on smooth manifolds with flattening the level
+weights, which was previously left as two independent knobs.
+
+\paragraph{Geodesic anchor weight.}
+On swiss roll with the frame term on, \(\lambda_{\mathrm{anchor}}=0\) is not
+resolved from \(\lambda_{\mathrm{anchor}}=1\) on any metric, which supports the
+view that \(\loss_{\mathrm{frame}}\) already carries local metric fidelity. It
+is, however, markedly less \emph{stable}: \(\mathrm{area\_sd}\) is
+\(0.131\pm0.072\) with the anchor off against \(0.075\pm0.008\) with it on, an
+order of magnitude more seed spread. The default stays at \(1\); turning it off
+is reasonable when the MDS diagnostic of \S\ref{sec:geo} is large, and should
+be checked across seeds rather than one.
+
+\paragraph{PCA skip and differential learning rates.}
+On digits the differential rate does what \S\ref{sec:film} predicts, without
+overturning the shipping recipe. Against the \(\texttt{pca\_skip}=
+\texttt{False}\) control, the skip path at a flat rate loses \(0.098\) of
+geodesic Spearman (resolved); at \(10\)--\(20\times\) on the head and
+hypernetworks that loss falls to \(0.013\)--\(0.009\) and is no longer
+resolved, and 5-NN accuracy recovers from \(0.851\) to \(0.871\).
+Trustworthiness and kNN overlap remain resolved-worse than the no-skip control
+in every arm, so the multiplier is a genuine improvement \emph{to the skip
+path} rather than a reason to prefer it. Defaults are unchanged.
+
+\subsection{Inference cost}
+\label{sec:inference}
+
+Out-of-sample speed is an explicit design goal, so it should carry numbers.
+Digits (\(N=1797\), \(D=64\)), CPU, median of 15 repeats after warm-up, against
+\texttt{UMAP.transform} and a PCA projection:
+
+\begin{center}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+& model on disk & \(B=1\) & \(B=512\) & \(\mu\)s / point at \(B=512\) \\
+\midrule
+leanmap & 944 KB & 0.25 ms & 1.73 ms & 3.4 \\
+UMAP    & 605 KB & 3.22 ms & 399.9 ms & 781.0 \\
+PCA     & 1 KB   & 0.03 ms & 0.05 ms & 0.09 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+leanmap is \(231\times\) faster than \texttt{UMAP.transform} per point at
+\(B=512\) and \(13\times\) at \(B=1\); PCA is another \(38\times\) faster than
+leanmap and is the honest floor --- a single \(D\times d\) matmul with no
+conditioning --- included so the comparison is not read as leanmap being fast
+in absolute terms.
+
+\begin{remark}[What is actually eliminated]
+\label{rem:notindexfree}
+The neighbour search is not removed. It is \emph{replaced}: an exact
+variable-size search against the training set becomes a fixed \(L\times D\)
+dense distance computation against the landmarks, followed by a forward pass.
+That is a different computation with a different answer, not a faster route to
+the same one; the speed comes from having decided in advance how many
+comparisons inference is allowed to make.
+
+The trade is still the right one for the intended use, and for reasons that are
+structural rather than constant-factor: no index to build or keep warm, no
+training data shipped with the model, and a differentiable map that composes
+into a downstream network. The last of these has no analogue in the UMAP
+column at any speed.
+\end{remark}
+
+The artefact size difference is asymptotic, not the \(944\) versus \(605\) KB
+the table shows at this \(N\). \texttt{UMAP.transform} needs the training data
+and its neighbour graph retained, so the pickle grows linearly --- measured at
+\(431\) bytes per point, flat to within \(1\%\) over \(N=250\) to \(1797\)
+(\(106\to756\) KB). The leanmap artefact is \(L\times D\) landmarks plus
+weights and is independent of \(N\). The crossover is near \(N\approx 2200\);
+by \(N=10^6\) the UMAP artefact is roughly \(400\) MB against an unchanged
+\(944\) KB.
+
+%==============================================================================
+\section{Default hyperparameters and interaction rules}
+\label{sec:defaults}
+%==============================================================================
+
+Selected defaults for \(N\le 5\cdot 10^3\) via \texttt{PLANEConfig.for\_scale}:
+
+\begin{center}
+\small
+\begin{tabular}{llc}
+\toprule
+Knob & Default (\(N\le 5\mathrm{k}\)) & Role \\
+\midrule
+\texttt{pca\_skip} & \texttt{False} & free residual layout \\
+\texttt{lr} & \(2\cdot 10^{-2}\) & paired with skip off \\
+\texttt{pca\_lr\_mult} & \(1\) & raise to \(10\)--\(20\) \emph{with} the skip \\
+\texttt{min\_dist} & \(0.5\) & uniformity; see \S\ref{sec:bstability} \\
+\(\lambda_{\mathrm{geo}}\) & \(0.15\) & \(0.5\) on smooth manifolds, with
+flat weights \\
+\(\lambda_{\mathrm{anchor}}\) & \(1\) & seed stability; \S\ref{sec:ablations} \\
+\texttt{epochs} & \(240\) & --- \\
+\texttt{pyramid\_level\_weights} & \((1,2,8)\) & coarse-heavy \\
+\texttt{pyramid\_squash} & \texttt{rational\_q99} & monotone; \S\ref{sec:squash} \\
+\texttt{conditioning} & \texttt{film} & see \S\ref{sec:filmvsconcat} \\
+\texttt{width}/\texttt{depth} & \(384/3\) & capacity \\
+\(\lambda_{\mathrm{frame}}\) & \(0\) & enable on fold-back sheets \\
+\texttt{geo\_ramp} & \((0.2,0.45)\) & delayed gauge lock \\
+\(\beta\) (\texttt{beta\_multiplicity}) & \(0.5\) & duplicate credit; see
+Remark~\ref{rem:beta} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Fixed plumbing (not exposed as knobs):
+\(\lambda_{\mathrm{backbone}}=0.01\), \(\lambda_{\mathrm{ord}}=0.1\),
+\(\eta=1\), \(\mathrm{spread}=1\), \(\texttt{FRAME\_CENTERS}=128\),
+\(\texttt{FRAME\_NORMAL\_THRESH}=0.5\), \(\gamma\in[0.1,10]\).
+
+Three non-separable design rules:
+
+\begin{enumerate}[leftmargin=*]
+\item \texttt{pca\_skip}, \(\mathrm{lr}\), and \texttt{pca\_lr\_mult} are one
+  decision (Section~\ref{sec:film}). The escape from the shared-rate conflict
+  is the parameter group, not a compromise rate.
+\item Raising \texttt{min\_dist} buys uniformity at no measured cost in label
+  accuracy; \(0.5\) captures nearly all of the available gain
+  (Remark~\ref{rem:mindistseeded}). The former ``never below \(0.2\)'' rule is
+  withdrawn.
+\item Fold-back manifolds need delayed frame rigidity
+  (Section~\ref{sec:frame}).
+\item \(\lambda_{\mathrm{geo}}\) and \texttt{pyramid\_level\_weights} are one
+  decision, not two. With the anchor strong on a smooth manifold, flat weights
+  are resolved-better than the coarse-heavy ramp (\S\ref{sec:ablations}).
+\end{enumerate}
+
+Defaults \emph{not} changed by this pass, and why: \(\beta\) is inert on the
+data measured and is a property of the corpus rather than the solver;
+\(\lambda_{\mathrm{anchor}}\) is unresolved on the mean but halves the seed
+spread; \texttt{conditioning} stays on FiLM for the one axis where it is
+resolved. In each case the evidence is reported in \S\ref{sec:measurements}
+rather than compiled into a silent adaptive rule.
+
+%==============================================================================
+\section{Relation to prior methods}
+\label{sec:related}
+%==============================================================================
+
+leanmap sits at the intersection of several classical threads:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Fuzzy neighbour embedding.} The geometric loss and \((a,b)\)
+  kernel follow UMAP~\citep{mcinnes2018umap}; the graph uses the same
+  \(\sigma/\rho\) solve and fuzzy union. Differences: parametric \(f_\theta\),
+  direct autodiff (hence the raised \(\texttt{min\_dist}\)), multi-scale
+  Galerkin pyramid, and metric regularisers.
+\item \textbf{Isomap / classical MDS.} Landmark geodesics and
+  \(\loss_{\mathrm{anchor}}\) import the Isomap gauge~\citep{isomap2000} as a
+  soft prior rather than as the embedding itself.
+\item \textbf{Local tangent space alignment.} In tangent mode
+  \(\loss_{\mathrm{frame}}\) is closest to LTSA~\citep{zhang2004ltsa}: both
+  estimate a weighted local tangent basis at each neighbourhood and require the
+  structure expressed in those tangent coordinates to agree between the ambient
+  data and the embedding. The differences are that leanmap matches Gram
+  matrices rather than aligning tangent coordinates through a global
+  eigenproblem, detaches the similarity scale so the objective is scale-free,
+  and applies the constraint as a penalty on a parametric map instead of
+  solving for the embedding in closed form. LTSA is the closer ancestor; ARAP
+  is the secondary reading.
+\item \textbf{As-rigid-as-possible deformation.} \(\loss_{\mathrm{frame}}\) can
+  equally be read as ARAP~\citep{sorkine2007arap} expressed through neighbour
+  Gram matrices with a detached similarity scale.
+\item \textbf{Parametric UMAP / NN embedding.} The FiLM-conditioned MLP is a
+  parametric embedder in the spirit of parametric
+  UMAP~\citep{sainburg2021parametric}, with landmark affinities as the
+  conditioning code and an optional PCA residual path.
+\item \textbf{Conformal prediction.} Cover scores yield finite-sample,
+  distribution-free OOD control under exchangeability~\citep{vovk2005}.
+\end{itemize}
+
+%==============================================================================
+\section*{Appendix: loss assembly (implementation mirror)}
+%==============================================================================
+
+\begin{sloppypar}
+The reference trainer assembles~\eqref{eq:total} each step from the modules
+\texttt{fuzzy\_cross\_entropy}, \texttt{ordinal\_triplet\_loss},
+\texttt{landmark\_regularisation}, \texttt{local\_rigidity\_loss},
+\texttt{procrustes\_anchor\_loss}, and \texttt{geodesic\_stress\_loss} in
+\path{src/leanmap/losses.py}, with ramps from \texttt{alignment\_ramp}. Graph
+stages live in \path{src/leanmap/graph.py}; landmarks and classical MDS in
+\path{src/leanmap/landmarks.py}; the encoder in \path{src/leanmap/model.py};
+conformal scores in \path{src/leanmap/conformal.py}.
+\end{sloppypar}
+
+\begin{thebibliography}{99}
+
+\bibitem{mcinnes2018umap}
+L.~McInnes, J.~Healy, and J.~Melville.
+\newblock UMAP: Uniform Manifold Approximation and Projection for Dimension
+Reduction.
+\newblock \emph{arXiv:1802.03426}, 2018.
+
+\bibitem{isomap2000}
+J.~B.~Tenenbaum, V.~de~Silva, and J.~C.~Langford.
+\newblock A global geometric framework for nonlinear dimensionality reduction.
+\newblock \emph{Science}, 290(5500):2319--2323, 2000.
+
+\bibitem{torgerson1952}
+W.~S.~Torgerson.
+\newblock Multidimensional scaling: I.\ Theory and method.
+\newblock \emph{Psychometrika}, 17(4):401--419, 1952.
+
+\bibitem{sorkine2007arap}
+O.~Sorkine and M.~Alexa.
+\newblock As-Rigid-As-Possible Surface Modeling.
+\newblock In \emph{Symposium on Geometry Processing}, 2007.
+
+\bibitem{zhang2004ltsa}
+Z.~Zhang and H.~Zha.
+\newblock Principal manifolds and nonlinear dimensionality reduction via
+tangent space alignment.
+\newblock \emph{SIAM Journal on Scientific Computing}, 26(1):313--338, 2004.
+
+\bibitem{sainburg2021parametric}
+T.~Sainburg, L.~McInnes, and T.~Q.~Gentner.
+\newblock Parametric UMAP embeddings for representation and semi-supervised
+learning.
+\newblock \emph{Neural Computation}, 33(11):2881--2907, 2021.
+
+\bibitem{levina2005}
+E.~Levina and P.~J.~Bickel.
+\newblock Maximum likelihood estimation of intrinsic dimension.
+\newblock In \emph{NeurIPS}, 2005.
+
+\bibitem{vovk2005}
+V.~Vovk, A.~Gammerman, and G.~Shafer.
+\newblock \emph{Algorithmic Learning in a Random World}.
+\newblock Springer, 2005.
+
+\bibitem{romano2019cqr}
+Y.~Romano, E.~Patterson, and E.~J.~Cand\`es.
+\newblock Conformalized Quantile Regression.
+\newblock In \emph{NeurIPS}, 2019.
+
+\bibitem{leanmap-config}
+leanmap documentation.
+\newblock Configuration guide.
+\newblock \texttt{docs/CONFIGURATION.md}, 2026.
+
+\end{thebibliography}
+
+\end{document}

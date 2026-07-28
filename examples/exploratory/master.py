@@ -335,9 +335,25 @@ def run_one(
             "pyramid_coarse_backbone": float(result.config.pyramid_coarse_backbone),
             "n_landmarks": int(result.config.n_landmarks),
             "lambda_geo": float(result.config.lambda_geo),
+            "lambda_anchor": float(getattr(result.config, "lambda_anchor", 1.0)),
             "lambda_frame": float(result.config.lambda_frame),
+            "beta_multiplicity": float(getattr(result.config, "beta_multiplicity", 0.5)),
+            "conditioning": str(getattr(result.config, "conditioning", "film")),
+            "min_dist": float(result.config.min_dist),
+            "epsilon": float(result.graph_stats.get("epsilon", float("nan"))),
+            "n_reps": int(result.graph_stats.get("n_reps", 0)),
         }
     )
+    extra = result.graph_stats.get("extra") or {}
+    for key in (
+        "mds_neg_eigen_ratio",
+        "mds_top_eigen_frac",
+        "epsilon_scope",
+        "halo_merged",
+        "halo_pairs",
+    ):
+        if key in extra:
+            metrics[key] = extra[key]
     write_json(metrics_path, metrics)
     np.save(out_dir / "Z.npy", Z_all.astype(np.float32))
     print(

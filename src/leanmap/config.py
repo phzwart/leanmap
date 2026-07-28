@@ -5,15 +5,43 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Optional, Sequence, Tuple
 
+# ---------------------------------------------------------------------------
+# Plumbing constants — never varied as knobs; demoted from PLANEConfig.
+# ---------------------------------------------------------------------------
+BETA_MULTIPLICITY: float = 0.5
+LAMBDA_BACKBONE: float = 0.01
+C_BUCKETS: int = 8
+C_SEARCH: int = 8
+PYRAMID_REP_RATIO: float = 4.0
+HYPER_WIDTH: int = 128
+ETA_BALANCE: float = 1.0
+WEIGHT_DECAY: float = 1e-4
+WARMUP_FRAC: float = 0.05
+# None => min(L*(L-1)/2, 2048) at the geodesic stress sample site.
+GEO_PAIRS: Optional[int] = None
+# None => fall back to ``n_neighbors``.
+LANDMARK_GEODESIC_K: Optional[int] = None
+PCA_CENTER: bool = True
+CALIB_FRAC: float = 0.05
+SPREAD: float = 1.0
+LAMBDA_ORD: float = 0.1
+# Frame sub-dials (frame-keep plan): only λ / ramp / tangent / neighbors stay
+# on the config; these are fixed.
+FRAME_CENTERS: int = 128
+FRAME_TANGENT_DIM: Optional[int] = None  # None => embedding dim ``d_out``
+FRAME_NORMAL_THRESH: float = 0.5
+# Warn above this share of negative eigenvalue mass in the classical-MDS Gram.
+# Diagnostic only -- no loss weight is adjusted automatically.
+MDS_NEG_EIGEN_WARN: float = 0.10
+
 
 @dataclass
 class PLANEConfig:
     """Hyperparameters for graph construction, model, losses, and training.
 
-    At ``N <= 5k`` a parametric map has enough capacity to memorise, which is
-    why :meth:`for_scale` shrinks the model and raises ``lambda_lip``. The
-    advantage at that scale is a reusable, differentiable, out-of-sample-
-    capable map — not better fidelity than UMAP.
+    At ``N <= 5k`` :meth:`for_scale` ships the measured digits/s-curve recipe
+    (no PCA skip, raised ``lr``, mid capacity, ``lambda_geo=0.15``). Larger
+    ``N`` keeps a milder default schedule.
     """
 
     # geometry
@@ -39,22 +67,37 @@ class PLANEConfig:
     # separation matters more than an undistorted layout, accepting that the
     # layout there keeps clumping with the epoch budget. Below 0.2 is b < 1 and
     # is never safe.
+    #
+    # Note what that measurement was made on: a UNIFORMLY sampled s-curve, whose
+    # intrinsic dimension equals the embedding dimension and which therefore has
+    # no density contrast to reproduce. The criterion it fixes -- spacing CV
+    # stops drifting -- is a statement about training stability, not about
+    # whether the layout's density matches the data's. On data with real density
+    # structure, or with dimensions being discarded, this constant decides how
+    # much contrast the map shows while knowing nothing about how much the data
+    # has. ``lambda_density`` constrains which neighbourhoods end up crowded
+    # regardless of where this constant puts the overall contrast.
     min_dist: float = 0.5
-    spread: float = 1.0
-    beta_multiplicity: float = 0.5
-    hub_correction: bool = False
-    lambda_backbone: float = 0.01
     # Near-duplicate collapse via ε-net before kNN. Default on — much faster at
     # large N and principled for tied / near-tied rows. Set False (or pass
     # epsilon=0) to keep every point as its own graph node.
     dedup: bool = True
-    epsilon: Optional[float] = None  # None => estimate when dedup; ignored if dedup=False
+    # None => estimate when dedup; ignored if dedup=False. ``fit`` writes the
+    # resolved value back, so a saved artefact carries a fixed merge radius.
+    epsilon: Optional[float] = None
+    # Exponent on the cell-multiplicity reweighting (w_i w_j)^beta of edge
+    # memberships. This is a statement about what a duplicate row *means*, so it
+    # belongs to the dataset, not to the plumbing. Use beta -> 0 when repeated
+    # rows are a deposition artefact (PDB resubmissions, redundant crystal
+    # forms) and carry no density information; beta -> 1 when multiplicity is
+    # genuine sampling density that the layout should reflect. 0.5 splits the
+    # difference and is the historical default.
+    beta_multiplicity: float = BETA_MULTIPLICITY
 
     # Cohesive multi-scale graph pyramid (coarse levels supply long-range /
     # geodesic attraction so far regions do not drift apart). 0 => single-scale.
     # Default: 3 coarsenings (4 levels) with coarse-heavy weights + MST backbone.
     pyramid_scales: int = 3
-    pyramid_rep_ratio: float = 4.0
     # Coarsening stops once a level reaches this size, so the number of levels
     # actually built is often < pyramid_scales + 1: with these defaults 4 levels
     # need N >~ 17k, and smaller N yields 3.
@@ -72,9 +115,16 @@ class PLANEConfig:
     # weights of edges that already exist.
     pyramid_coarse_backbone: float = 1.0
 
+    # How aggregated coarse crossing weights are mapped into a membership.
+    # "rational" is w/(w + median): monotone and unsaturating, so the strongest
+    # coarse edges keep their ranking. "quantile_clamp" is the older
+    # min(w/q99, 1), which flattens the top 1% to a common weight — the very
+    # edges a (1, 2, 8) pyramid exists to exploit. The two differ in magnitude,
+    # so pyramid_level_weights does not transfer between them.
+    pyramid_squash: str = "rational_q99"
+
     # landmarks
     n_landmarks: int = 256
-    c_buckets: int = 8
     # Select landmarks by farthest-point sampling on geodesic (kNN shortest-
     # path) distances instead of the ambient metric. Spreads anchors uniformly
     # over the intrinsic manifold; helps folded manifolds (S-curve, swiss roll).
@@ -84,16 +134,6 @@ class PLANEConfig:
     # ~n_landmarks. More uniform interior coverage than FPS (which over-samples
     # boundaries/tips). Takes precedence over ``landmark_geodesic`` when set.
     landmark_poisson: bool = False
-    # kNN neighbors for the geodesic graph (None => use ``n_neighbors``). Shared
-    # by geodesic FPS and geodesic Poisson-disk sampling.
-    landmark_geodesic_k: Optional[int] = None
-    # Conditioning pyramid: extra COARSE anchor sets (each a frozen MODULATOR
-    # FiLM factor) added on top of the fine PRIMARY anchors. Anchor counts,
-    # coarsest-first, e.g. (32, 96). Each level's temperature auto-scales with
-    # its spacing (coarse => large tau / broad modulation; fine => sharp), so a
-    # single ``tau_scale`` yields genuinely multi-resolution tau. None => the
-    # single-resolution conditioning (current default).
-    conditioning_pyramid_levels: Optional[Sequence[int]] = None
     learn_landmarks: bool = True
     learn_tau: bool = True
     # Multiplies the default per-anchor temperature at init. >1 spreads each
@@ -109,10 +149,6 @@ class PLANEConfig:
     width: int = 384
     depth: int = 3
     d_out: int = 2
-    hyper_width: int = 128
-    spectral_norm: bool = True
-    use_decoder: bool = False
-    concat_affinity: bool = False
     # Linear PCA skip: output is ``pca(x_n) + residual`` with the residual head
     # initialized near zero, so training starts AT plain PCA. Convenient, but the
     # unconstrained linear path can end up supplying most of the layout: on 8x8
@@ -122,33 +158,36 @@ class PLANEConfig:
     # WORSE (~0.41) -- so pca_skip=False needs ``lr`` raised with it (5e-3..2e-2
     # reached ~0.94, matching UMAP). Treat the two as one decision, not two.
     pca_skip: bool = True
-    # classical PCA centers before SVD; False = uncentered (ablation)
-    pca_center: bool = True
+
+    # Learning-rate multiplier for the residual head and FiLM hypernetworks
+    # relative to the PCA skip and backbone. With pca_skip=True a single flat
+    # rate couples two decisions -- how fast the skip drifts from its PCA seed
+    # and how fast the head builds a residual on top of it. Raising this
+    # (10-20x) decouples them. 1.0 reproduces the flat-rate behaviour exactly
+    # and is the default until the ablation says otherwise. Ignored when
+    # pca_skip=False, where there is no skip to hold back.
+    pca_lr_mult: float = 1.0
+    # "film" conditions the backbone through per-layer scale/shift produced from
+    # a(x); "concat" appends a(x) to the input of an otherwise identical MLP.
+    # Since a(x) is a deterministic function of x, concat is the control that
+    # says whether the FiLM apparatus earns its complexity, not a weaker model.
+    conditioning: str = "film"
 
     # losses
     n_negatives: int = 5
-    lambda_ord: float = 0.1
-    lambda_rec: float = 0.1
-    lambda_lip: float = 0.0
     # Local-rigidity (as-rigid-as-possible) loss on fine-graph neighbourhoods:
     # matches each node's neighbour Gram matrix (all pairwise offset inner
     # products) up to one scale, so it constrains edge length *and* relative
     # orientation and opposes the parametric frame-rotation twist/pinch. This
     # replaces the older length-only ``lambda_iso`` term. 0 = off.
     lambda_frame: float = 0.0
-    # Neighbours per star (padded) and centres sampled per step for the frame
-    # loss. ``frame_centers=None`` => 128. Kept small so the extra forward is
-    # cheap relative to ``batch_edges``.
+    # Neighbours per star (padded) for the frame loss.
     frame_neighbors: int = 6
-    frame_centers: Optional[int] = None
     # Geodesic/tangent-aware rigidity: estimate each star's local tangent plane,
     # drop off-tangent (across-sheet shortcut) neighbours and match Grams in the
     # tangent frame. Required for manifolds that fold back on themselves (swiss
-    # roll); harmless on non-folding ones (S-curve). ``frame_tangent_dim=None``
-    # uses the embedding dim ``d_out``.
+    # roll); harmless on non-folding ones (S-curve).
     frame_tangent: bool = True
-    frame_tangent_dim: Optional[int] = None
-    frame_normal_thresh: float = 0.5
     # Ramp (start, end) as fractions of training for the frame weight. Local
     # rigidity cannot distinguish a rolled manifold from its unrolled isometry
     # and penalises the *transient* stretch of unrolling, so on fold-back
@@ -163,46 +202,41 @@ class PLANEConfig:
     # alone cannot escape. 0 = off. Default 0.5: strong enough to unroll
     # S-curve / swiss-roll bananas without dominating local affinity.
     lambda_geo: float = 0.5
-    # Landmark pairs sampled per step for the geodesic stress (None =>
-    # min(L*(L-1)/2, 2048)).
-    geo_pairs: Optional[int] = None
     # Ramp (start, end) as fractions of training for the geodesic weight.
     # Mild delay lets local affinity establish topology before the global
     # metric gauge locks in. (0.0, 0.0) => on from the start.
-    # With ``geo_ramp_down=True`` the schedule is inverted: full weight until
-    # ``start``, linear down to 0 by ``end``, then off — e.g. (0.0, 0.25)
-    # front-loads the MDS gauge then releases it.
     geo_ramp: Tuple[float, float] = (0.2, 0.45)
-    geo_ramp_down: bool = False
-    # SIGReg (LeJEPA) isotropic-Gaussian anti-collapse regularizer
-    lambda_sigreg: float = 0.0
-    sigreg_slices: int = 256
-    sigreg_points: int = 17
-    sigreg_domain: float = 5.0
-    sigreg_target_std: float = 1.0
+    # Split of the geodesic term: L_geo = lambda_anchor * L_anchor + 0.25 *
+    # L_stress, the whole thing scaled by lambda_geo * ramp. The two halves do
+    # different jobs — the Procrustes anchor pins an absolute gauge against a
+    # classical-MDS layout, while stress only constrains pairwise landmark
+    # distances and is blind to a global twist. Set lambda_anchor=0 to keep
+    # metric fidelity while letting the local frame term choose the gauge; that
+    # is the right test when the MDS negative-eigenvalue ratio is large and the
+    # anchor target is not faithfully embeddable.
+    lambda_anchor: float = 1.0
     lambda_lm: float = 0.1
-    eta_balance: float = 1.0
-    whiten_multi_axis: bool = True
 
-    # Negative-space co-training (opt-in). An auxiliary distance-to-support
-    # quantile head is trained *jointly* with the encoder; its pinball loss also
-    # back-props into the backbone, so the embedding learns to keep off-manifold
-    # ("negative space") geometry legible in its internal states. The regression
-    # target (ambient min-distance to the train support) is fixed, so this is a
-    # stationary auxiliary task. 0 = off (default: purely two-stage frozen probe).
-    # The head is re-calibrated (CQR) on the frozen model after training; use a
-    # small, ramped weight so it does not distort the on-manifold chart.
-    lambda_dist: float = 0.0
-    # Ramp (start, end) as fractions of training — switch on only after the
-    # chart has formed, like the geodesic/frame terms.
-    dist_ramp: Tuple[float, float] = (0.5, 0.75)
-    dist_alpha: float = 0.1              # miscoverage; head targets 1 - alpha
-    dist_perturb_per_step: int = 256     # perturbations scored per step
-    dist_r_min_mult: float = 0.25        # min perturbation radius / median 1-NN
-    dist_r_max_mult: float = 25.0        # max perturbation radius / median 1-NN
-    dist_head_width: int = 128
-    dist_head_depth: int = 2
-    dist_features: Optional[Sequence[str]] = None  # None => ALL_FEATURES
+    # Which neighbourhoods come out crowded. Left alone that is decided by
+    # wherever the attraction/repulsion equilibrium lands, which is a property of
+    # ``min_dist`` and not of the data -- so a map can invent clumps, or flatten
+    # real ones, with nothing in the objective objecting. The density term
+    # correlates each neighbourhood's log radius with the ambient graph's, which
+    # constrains the *ordering* of density and deliberately not its magnitude
+    # (see ``leanmap.density`` for why targeting magnitude cannot work when the
+    # intrinsic dimension greatly exceeds ``d_out``).
+    #
+    # Because the term is scale free it has nothing to saturate against and needs
+    # no per-dataset decision: one weight, on by default. Set 0 to opt out.
+    # 1.0 puts it on the same footing as the other unit-scale terms, being the
+    # score of a layout whose density is unrelated to the data's.
+    lambda_density: float = 1.0
+    # Ramp (start, end) as fractions of training, like ``geo_ramp``. Density is
+    # a refinement of a layout that already has the right topology, so pinning
+    # it from step 0 fights the unrolling; the default mirrors ``geo_ramp``.
+    density_ramp: Tuple[float, float] = (0.2, 0.45)
+    # Stars per step for the density term (reuses the frame-loss sampler).
+    density_centers: int = 256
 
     # optimisation
     batch_edges: int = 4096
@@ -215,18 +249,12 @@ class PLANEConfig:
     # (disables the default warmup+cosine schedule).
     lr_after: Optional[float] = None
     lr_switch_epochs: int = 0
-    weight_decay: float = 1e-4
-    warmup_frac: float = 0.05
-    align_ramp: Tuple[float, float] = (0.3, 0.6)
 
     # conformal
-    calib_frac: float = 0.05
     calib_max: int = 2000
 
-    # metric / knn
-    metric: str = "l2"
+    # knn
     knn_mode: str = "auto"
-    c_search: int = 8
 
     seed: int = 0
     device: Optional[str] = None
@@ -236,15 +264,19 @@ class PLANEConfig:
         """Return scale-appropriate presets for dataset size ``N``."""
         base = cls()
         if N <= 5_000:
+            # Measured DIGITS_MATCHED recipe (digits / s-curve scale).
             return replace(
                 base,
-                width=128,
-                depth=2,
-                n_landmarks=32,
-                n_neighbors=10,
-                lambda_lip=0.1,
-                epochs=500,
+                width=384,
+                depth=3,
+                n_landmarks=128,
+                n_neighbors=15,
+                epochs=240,
                 calib_max=200,
+                pca_skip=False,
+                lr=2e-2,
+                lambda_geo=0.15,
+                pyramid_level_weights=(1.0, 2.0, 8.0),
             )
         if N <= 200_000:
             return replace(
@@ -253,7 +285,6 @@ class PLANEConfig:
                 depth=3,
                 n_landmarks=256,
                 n_neighbors=15,
-                lambda_lip=0.01,
                 epochs=200,
                 calib_max=2000,
             )
@@ -263,35 +294,6 @@ class PLANEConfig:
             depth=3,
             n_landmarks=512,
             n_neighbors=15,
-            lambda_lip=0.0,
             epochs=50,
             calib_max=2000,
         )
-
-
-@dataclass
-class AlignmentSpec:
-    """Steering constraint: axial property or regional label targets.
-
-    Attributes
-    ----------
-    axis : int
-        Embedding axis to align (axial kind).
-    values : Tensor (N,)
-        Per-point property values (axial).
-    kind : {"axial", "regional"}
-    weight : float
-    sign : +1 | -1
-    labels : Tensor (N,), optional
-        For regional alignment.
-    targets : dict[label -> (d_out,)], optional
-        Target centroids per label.
-    """
-
-    axis: int = 0
-    values: Optional[object] = None  # torch.Tensor (N,)
-    kind: str = "axial"
-    weight: float = 1.0
-    sign: int = 1
-    labels: Optional[object] = None
-    targets: Optional[dict] = None

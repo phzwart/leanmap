@@ -1,4 +1,4 @@
-"""FiLM encoder backbone, optional decoder, and top-level PLANE model."""
+"""FiLM encoder backbone and top-level PLANE model."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils.parametrizations import spectral_norm
 
 from .conditioning import FactorStack, Role
 from .landmarks import AnchorAffinity, LandmarkAffinity
@@ -56,11 +55,7 @@ class FiLMEncoder(nn.Module):
     ----------
     D, d_out, width, depth : architecture
     affinity_dim : int
-        Total affinity dims when ``concat_affinity`` (sum of L_f).
-    spectral_norm : bool
-        Wrap backbone Linears only (not head).
-    concat_affinity : bool
-        Concatenate concatenated affinities to the input before the first layer.
+        Total affinity dims across factors (sum of L_f); used for legacy hyper.
     pca_skip : bool
         If True, output is ``pca(x_n) + residual`` with near-zero residual head.
     pca_weight : (d_out, D) | None
@@ -73,8 +68,6 @@ class FiLMEncoder(nn.Module):
         width: int = 384,
         depth: int = 3,
         affinity_dim: int = 0,
-        spectral_norm_flag: bool = True,
-        concat_affinity: bool = False,
         pca_skip: bool = True,
         pca_weight: Optional[torch.Tensor] = None,
         *,
@@ -89,22 +82,21 @@ class FiLMEncoder(nn.Module):
         # Legacy: L was both #landmarks and concat dim; keep attribute for tests.
         self.L = int(L) if L is not None else int(affinity_dim)
         self.affinity_dim = int(affinity_dim) if affinity_dim else self.L
-        self.concat_affinity = concat_affinity
         self.pca_skip = bool(pca_skip)
         self.hyper_width = hyper_width
-        in_dim = D + (self.affinity_dim if concat_affinity else 0)
 
         self.register_buffer("x_mean", torch.zeros(D))
         self.register_buffer("x_std", torch.ones(D))
 
         layers = []
         for i in range(depth):
-            lin = nn.Linear(in_dim if i == 0 else width, width, bias=False)
-            if spectral_norm_flag:
-                lin = spectral_norm(lin)
+            lin = nn.Linear(D if i == 0 else width, width, bias=False)
             layers.append(lin)
         self.backbone = nn.ModuleList(layers)
         self.norms = nn.ModuleList([nn.LayerNorm(width) for _ in range(depth)])
+        # Parameter-free tap sitting after FiLM and before the activation, so
+        # feature extraction can hook the true pre-activation state.
+        self.taps = nn.ModuleList([nn.Identity() for _ in range(depth)])
         self.head = nn.Linear(width, d_out)
 
         if self.pca_skip:
@@ -155,22 +147,22 @@ class FiLMEncoder(nn.Module):
         a: Optional[torch.Tensor] = None,
         gamma: Optional[torch.Tensor] = None,
         beta: Optional[torch.Tensor] = None,
-        a_concat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """x: (B, D). Provide either ``a`` (legacy) or ``gamma``/``beta`` (+ optional concat)."""
+        """x: (B, D). Provide either ``a`` (legacy) or ``gamma``/``beta``."""
         x_n = (x - self.x_mean) / self.x_std
         if gamma is None or beta is None:
             if a is None:
                 raise ValueError("FiLMEncoder.forward requires a= or gamma=/beta=")
             gamma, beta = self.film_params(a)
-            a_cat = a
-        else:
-            a_cat = a_concat if a_concat is not None else a
-        h = torch.cat([x_n, a_cat], dim=1) if self.concat_affinity and a_cat is not None else x_n
-        for k, (lin, norm) in enumerate(zip(self.backbone, self.norms)):
+        h = x_n
+        for k, (lin, norm, tap) in enumerate(zip(self.backbone, self.norms, self.taps)):
             h = lin(h)
-            h = gamma[:, k, :] * h + beta[:, k, :]
+            # Normalize *then* modulate. LayerNorm is exactly invariant to a
+            # positive scalar rescale, so modulating first made a per-layer
+            # scalar gamma a no-op (GAIN) and left a scalar-gamma factor acting
+            # only through the size of beta relative to gamma * h (MODULATOR).
             h = norm(h)
+            h = tap(gamma[:, k, :] * h + beta[:, k, :])
             h = F.gelu(h)
         residual = self.head(h)
         if self.pca is not None:
@@ -178,22 +170,96 @@ class FiLMEncoder(nn.Module):
         return residual
 
 
-class Decoder(nn.Module):
-    """Plain MLP ``d_out -> width -> width -> D`` (no FiLM / spectral norm)."""
+class ConcatEncoder(nn.Module):
+    """Plain MLP on ``[x_n, a(x)]`` — the baseline FiLM has to beat.
 
-    def __init__(self, d_out: int, D: int, width: int = 384):
+    FiLM adds no information: ``a(x)`` is a deterministic function of ``x``, so
+    the roles, temperatures, gamma clamps, and perplexity calibration buy an
+    inductive bias (a soft partition-of-unity mixture of experts), not capacity.
+    The honest control is to hand the same affinity vector to an ordinary
+    network as extra input columns and keep everything else — width, depth,
+    head, PCA skip — identical.
+
+    The interface matches :class:`FiLMEncoder` closely enough for
+    :class:`PLANE` to switch on ``conditioning``.
+    """
+
+    conditioning = "concat"
+
+    def __init__(
+        self,
+        D: int,
+        d_out: int,
+        width: int = 384,
+        depth: int = 3,
+        affinity_dim: int = 0,
+        pca_skip: bool = True,
+        pca_weight: Optional[torch.Tensor] = None,
+        *,
+        L: Optional[int] = None,
+    ):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_out, width),
-            nn.GELU(),
-            nn.Linear(width, width),
-            nn.GELU(),
-            nn.Linear(width, D),
-        )
+        self.D = D
+        self.d_out = d_out
+        self.width = width
+        self.depth = depth
+        self.L = int(L) if L is not None else int(affinity_dim)
+        self.affinity_dim = int(affinity_dim) if affinity_dim else self.L
+        self.pca_skip = bool(pca_skip)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """z: (B, d_out). Returns x_hat: (B, D)."""
-        return self.net(z)
+        self.register_buffer("x_mean", torch.zeros(D))
+        self.register_buffer("x_std", torch.ones(D))
+
+        in_dim = D + self.affinity_dim
+        self.backbone = nn.ModuleList(
+            [nn.Linear(in_dim if i == 0 else width, width, bias=False) for i in range(depth)]
+        )
+        self.norms = nn.ModuleList([nn.LayerNorm(width) for _ in range(depth)])
+        self.taps = nn.ModuleList([nn.Identity() for _ in range(depth)])
+        self.head = nn.Linear(width, d_out)
+
+        if self.pca_skip:
+            self.pca = nn.Linear(D, d_out, bias=False)
+            if pca_weight is not None:
+                with torch.no_grad():
+                    self.pca.weight.copy_(pca_weight.float())
+            nn.init.normal_(self.head.weight, mean=0.0, std=1e-4)
+            nn.init.zeros_(self.head.bias)
+        else:
+            self.pca = None
+
+    def set_normalization(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        self.x_mean.copy_(mean.float().view(-1))
+        self.x_std.copy_(std.float().view(-1).clamp_min(1e-6))
+
+    def set_pca_weight(self, weight: torch.Tensor) -> None:
+        if self.pca is None:
+            return
+        with torch.no_grad():
+            self.pca.weight.copy_(weight.float())
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        a: Optional[torch.Tensor] = None,
+        gamma: Optional[torch.Tensor] = None,
+        beta: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """x: (B, D), a: (B, affinity_dim). ``gamma``/``beta`` are ignored."""
+        if a is None:
+            raise ValueError("ConcatEncoder.forward requires a=")
+        x_n = (x - self.x_mean) / self.x_std
+        if a.shape[1] != self.affinity_dim:
+            raise ValueError(
+                f"affinity width {a.shape[1]} != expected {self.affinity_dim}"
+            )
+        h = torch.cat([x_n, a], dim=1)
+        for lin, norm, tap in zip(self.backbone, self.norms, self.taps):
+            h = F.gelu(tap(norm(lin(h))))
+        residual = self.head(h)
+        if self.pca is not None:
+            return self.pca(x_n) + residual
+        return residual
 
 
 class PLANE(nn.Module):
@@ -208,7 +274,6 @@ class PLANE(nn.Module):
         self,
         factors: Union[FactorStack, AnchorAffinity, LandmarkAffinity],
         encoder: FiLMEncoder,
-        decoder: Optional[Decoder] = None,
         encoder_view: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ):
         super().__init__()
@@ -220,11 +285,14 @@ class PLANE(nn.Module):
             self.factors = None
             self.affinity = factors  # type: ignore[assignment]
         self.encoder = encoder
-        self.decoder = decoder
         self.encoder_view = encoder_view  # None → identity
 
     def _x_enc(self, x: torch.Tensor) -> torch.Tensor:
         return self.encoder_view(x) if self.encoder_view is not None else x
+
+    @property
+    def is_concat(self) -> bool:
+        return getattr(self.encoder, "conditioning", "film") == "concat"
 
     def forward(
         self, x: torch.Tensor
@@ -233,9 +301,11 @@ class PLANE(nn.Module):
         x_enc = self._x_enc(x)
         if self.factors is not None:
             a_map, dm_map, a_list = self.factors.affinities_forward(x, for_geom=True)
-            gamma, beta, _, _, _ = self.factors.film_params_from_affinities(a_list)
-            a_cat = self.factors.concat_affinity(a_list)
-            z = self.encoder(x_enc, gamma=gamma, beta=beta, a_concat=a_cat)
+            if self.is_concat:
+                z = self.encoder(x_enc, a=self.factors.concat_affinity(a_list))
+            else:
+                gamma, beta, _, _, _ = self.factors.film_params_from_affinities(a_list)
+                z = self.encoder(x_enc, gamma=gamma, beta=beta)
             z = self.factors.apply_axis_skips(z, x, for_geom=True)
             name = self.factors.primary_factor.name
             return z, a_map[name], dm_map[name]
@@ -262,9 +332,16 @@ class PLANE(nn.Module):
             z = self.encoder(x_enc, a=a)
             return z, {"primary": a}, {"primary": Dm}, gamma, beta, {"primary": gamma}, 0.0
         a_map, dm_map, a_list = self.factors.affinities_forward(x, for_geom=True)
+        if self.is_concat:
+            z = self.encoder(x_enc, a=self.factors.concat_affinity(a_list))
+            z = self.factors.apply_axis_skips(z, x, for_geom=True)
+            # No FiLM parameters exist on this path; report the identity so the
+            # trainer's gamma diagnostics stay well-defined.
+            shape = (z.shape[0], self.encoder.depth, self.encoder.width)
+            ones = torch.ones(shape, device=z.device, dtype=z.dtype)
+            return z, a_map, dm_map, ones, torch.zeros_like(ones), {}, 0.0
         gamma, beta, g_by, _, hit = self.factors.film_params_from_affinities(a_list)
-        a_cat = self.factors.concat_affinity(a_list)
-        z = self.encoder(x_enc, gamma=gamma, beta=beta, a_concat=a_cat)
+        z = self.encoder(x_enc, gamma=gamma, beta=beta)
         z = self.factors.apply_axis_skips(z, x, for_geom=True)
         return z, a_map, dm_map, gamma, beta, g_by, hit
 
@@ -292,13 +369,20 @@ class PLANE(nn.Module):
             return z_M
 
         a_m, _ = self.affinity(M)
+        if self.is_concat:
+            x0 = torch.zeros(M.shape[0], self.encoder.D, device=device)
+            width = int(self.encoder.affinity_dim)
+            a_full = torch.zeros(M.shape[0], width, device=device)
+            take = min(width, a_m.shape[1])
+            a_full[:, :take] = a_m[:, :take]
+            return self.encoder(x0, a=a_full)
         if self.factors is not None and len(self.factors.factor_defs) == 1:
             hyp = self.factors.hypers[0]
             assert isinstance(hyp, FactorHyper)
             g, b = hyp(a_m)
             assert g is not None and b is not None
             x0 = torch.zeros(M.shape[0], self.encoder.D, device=device)
-            return self.encoder(x0, gamma=g, beta=b, a_concat=a_m)
+            return self.encoder(x0, gamma=g, beta=b)
         if self.factors is not None:
             # Multi-factor: PRIMARY from a(M); other roles contribute identity FiLM
             from .conditioning import GAMMA_MAX, GAMMA_MIN
@@ -333,7 +417,7 @@ class PLANE(nn.Module):
                 )
             gamma = gamma.clamp(GAMMA_MIN, GAMMA_MAX)
             x0 = torch.zeros(M.shape[0], self.encoder.D, device=device)
-            return self.encoder(x0, gamma=gamma, beta=beta, a_concat=a_m)
+            return self.encoder(x0, gamma=gamma, beta=beta)
         x0 = torch.zeros(M.shape[0], self.encoder.D, device=device)
         L = self.encoder.L
         if a_m.shape[1] != L:

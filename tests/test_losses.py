@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
-import logging
-
 import numpy as np
 import torch
 
-from leanmap.config import AlignmentSpec
 from leanmap.losses import (
-    axial_alignment_loss,
     find_ab_params,
     fuzzy_cross_entropy,
     geodesic_stress_loss,
     local_rigidity_loss,
     ordinal_triplet_loss,
-    prepare_alignment_targets,
     procrustes_anchor_loss,
 )
 
@@ -47,14 +42,6 @@ def test_ordinal_decreases_when_corrected():
     zf_good = torch.ones(16, 2) * 3
     good, _ = ordinal_triplet_loss(za, zn_good, zm, zf_good, mask)
     assert float(good) < float(bad)
-
-
-def test_axial_alignment_perfect():
-    z = torch.linspace(-1, 1, 100).unsqueeze(1).repeat(1, 2)
-    z[:, 1] = torch.randn(100)
-    r = torch.linspace(-1, 1, 100)
-    loss = axial_alignment_loss(z, r, axis=0, sign=1)
-    assert float(loss) < 0.05
 
 
 def _rigidity_batch(seed=0, B=8, m=6, D=3):
@@ -236,24 +223,3 @@ def test_procrustes_anchor_positive_for_twist():
     right = z[:, 0] > 0
     z[right, 1] = -z[right, 1]  # flip width on one side = twist
     assert float(procrustes_anchor_loss(z, target)) > 1e-2
-
-
-def test_whitening_correlated_and_warning(caplog):
-    n = 200
-    rng = np.random.default_rng(0)
-    v0 = rng.standard_normal(n)
-    v1 = v0.copy()  # perfectly correlated
-    specs = [
-        AlignmentSpec(axis=0, values=v0, kind="axial", weight=1.0, sign=1),
-        AlignmentSpec(axis=1, values=v1, kind="axial", weight=1.0, sign=1),
-    ]
-    # Raw residual of v1 on v0 should have ~0 variance
-    A = np.column_stack([v0, np.ones(n)])
-    coef, _, _, _ = np.linalg.lstsq(A, v1, rcond=None)
-    resid = v1 - A @ coef
-    assert resid.std() < 1e-10
-    prep = prepare_alignment_targets(specs, whiten_multi_axis=True)
-    assert len(prep) == 2
-    with caplog.at_level(logging.WARNING, logger="leanmap"):
-        prepare_alignment_targets(specs, whiten_multi_axis=False)
-    assert any("whiten_multi_axis" in r.message for r in caplog.records)

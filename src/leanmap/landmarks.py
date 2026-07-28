@@ -185,12 +185,27 @@ def landmark_geodesic_matrix(
     return X_lm, G_t, finite_t
 
 
-def classical_mds(D: torch.Tensor, d: int = 2, finite: Optional[torch.Tensor] = None) -> torch.Tensor:
+def classical_mds(
+    D: torch.Tensor,
+    d: int = 2,
+    finite: Optional[torch.Tensor] = None,
+    return_diagnostics: bool = False,
+):
     """Classical MDS (Isomap embedding) from a pairwise distance matrix.
 
     Double-centres ``D^2``, takes the top-``d`` eigenvectors. Unreachable
     (non-finite) entries are replaced by the max finite distance so a single
     connected component still embeds; prefer passing a fully-finite ``D``.
+
+    With ``return_diagnostics=True`` also returns the negative-eigenvalue mass
+    ``sum|lambda_-| / sum|lambda|`` of the double-centred Gram. The
+    ``Lambda = max(lambda, 0)`` clamp below silently discards that mass, and it
+    is the only evidence in the pipeline that the geodesic matrix is not
+    embeddable in *any* Euclidean space -- a manifold with a hole, a cone, or a
+    graph whose shortest paths cut across a gap. A large ratio means the
+    Procrustes target is a projection of something the embedding cannot
+    represent, so pulling hard toward it fights the local terms rather than
+    guiding them.
     """
     import numpy as np
 
@@ -212,8 +227,22 @@ def classical_mds(D: torch.Tensor, d: int = 2, finite: Optional[torch.Tensor] = 
     evals, evecs = np.linalg.eigh(B)
     order = np.argsort(evals)[::-1][:d]
     lam = np.maximum(evals[order], 0.0)
-    Z = evecs[:, order] * np.sqrt(lam)[None, :]
-    return torch.as_tensor(Z, dtype=torch.float32)
+    Z = torch.as_tensor(evecs[:, order] * np.sqrt(lam)[None, :], dtype=torch.float32)
+    if not return_diagnostics:
+        return Z
+
+    total = float(np.abs(evals).sum())
+    neg = float(np.abs(evals[evals < 0]).sum())
+    top = np.sort(evals)[::-1][:d]
+    pos_total = float(evals[evals > 0].sum())
+    diag = {
+        "mds_neg_eigen_ratio": (neg / total) if total > 0 else 0.0,
+        "mds_top_eigen_frac": (float(top.clip(min=0).sum()) / pos_total)
+        if pos_total > 0
+        else 0.0,
+        "mds_n_landmarks": int(n),
+    }
+    return Z, diag
 
 
 def poisson_disk_indices_geodesic(

@@ -18,31 +18,41 @@ def compute_metrics(
     n_neighbors: int = 10,
     seed: int = 0,
     include_geodesic: bool = True,
+    metric: str = "l2",
 ) -> Dict[str, Any]:
-    """Trustworthiness / continuity + ambient (and optional geodesic) Shepard."""
-    from leanmap.distance import EuclideanDistance
+    """Trustworthiness / continuity + ambient (and optional geodesic) Shepard.
+
+    ``metric`` names the ambient geometry. Pass whatever the map was trained
+    under: scoring against a different metric measures transfer between
+    geometries, not fidelity to the training objective.
+    """
     from leanmap.evaluate import (
         shepard_pairs_ambient,
         shepard_stats,
         trustworthiness_continuity,
     )
+    from leanmap.metrics import get_metric
 
     X = np.asarray(X, dtype=np.float32)
     Z = np.asarray(Z, dtype=np.float32)
     out: Dict[str, Any] = {}
+    dist_fn = get_metric(metric).fn
+    out["metric"] = metric
 
     k_list = tuple(
         sorted({k for k in (5, 15, min(50, max(5, len(X) // 20))) if k < len(X)})
     )
     try:
         tc = trustworthiness_continuity(
-            X, Z, EuclideanDistance(), k_list=k_list or (5,), n_sample=min(5000, len(X)), seed=seed
+            X, Z, dist_fn, k_list=k_list or (5,), n_sample=min(5000, len(X)), seed=seed
         )
         out.update(tc)
     except Exception as exc:  # noqa: BLE001
         out["trust_error"] = str(exc)
 
-    d_orig, d_embed = shepard_pairs_ambient(X, Z, n_pairs=32768, seed=seed)
+    d_orig, d_embed = shepard_pairs_ambient(
+        X, Z, n_pairs=32768, seed=seed, dist_fn=dist_fn
+    )
     st = shepard_stats(d_orig, d_embed)
     out["ambient_spearman"] = st["spearman"]
     out["ambient_stress"] = st["stress"]
@@ -51,7 +61,9 @@ def compute_metrics(
 
     if include_geodesic:
         try:
-            geo = _geodesic_on_knn(X, Z, n_neighbors=n_neighbors, seed=seed)
+            geo = _geodesic_on_knn(
+                X, Z, n_neighbors=n_neighbors, seed=seed, metric=metric
+            )
             out.update(geo)
         except Exception as exc:  # noqa: BLE001
             out["geodesic_error"] = str(exc)
@@ -68,6 +80,7 @@ def _geodesic_on_knn(
     *,
     n_neighbors: int,
     seed: int,
+    metric: str = "l2",
 ) -> Dict[str, float]:
     """Rebuild a light kNN fuzzy graph and score geodesic fidelity."""
     import torch
@@ -76,12 +89,12 @@ def _geodesic_on_knn(
     from leanmap.metrics import get_metric
 
     Xt = torch.as_tensor(X, dtype=torch.float32)
-    metric = get_metric("l2")
+    spec = get_metric(metric)
     # Small landmark budget — evaluation graph only, not the trained one.
     n_lm = int(min(64, max(16, len(X) // 20)))
     graph, *_ = build_graph(
         Xt,
-        metric,
+        spec,
         n_neighbors=int(n_neighbors),
         n_landmarks=n_lm,
         dedup=False,

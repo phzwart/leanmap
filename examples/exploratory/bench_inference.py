@@ -39,6 +39,12 @@ import numpy as np
 
 BATCHES = (1, 8, 64, 512)
 
+
+def _batches_for(n: int) -> tuple[int, ...]:
+    """Keep batch sizes that fit in the pool (small-N feeds like iris)."""
+    return tuple(b for b in BATCHES if b <= n) or (1,)
+
+
 # Apple's Accelerate BLAS raises FP flags on large float32 matmuls that do not
 # correspond to any bad value -- the results are finite and match float64 to the
 # last digit. Checked, not assumed: --verify compares every transform against the
@@ -140,30 +146,33 @@ def main(argv=None) -> int:
                 f"max |delta| vs saved = {dev:.2e} ({dev / scale:.1e} of range)"
             )
 
+    batches = _batches_for(len(X))
     print(f"\nCPU, torch threads = {torch.get_num_threads()}, "
-          f"repeats = {args.repeats} (median reported), n_features = {X.shape[1]}")
-    print(f"\n{'method':<12}{'model on disk':>15}" + "".join(f"{f'B={b}':>16}" for b in BATCHES))
-    print("-" * (27 + 16 * len(BATCHES)))
+          f"repeats = {args.repeats} (median reported), n_features = {X.shape[1]}, "
+          f"N={len(X)}")
+    print(f"\n{'method':<12}{'model on disk':>15}" + "".join(f"{f'B={b}':>16}" for b in batches))
+    print("-" * (27 + 16 * len(batches)))
 
-    results: dict = {"batches": list(BATCHES), "methods": {}}
+    results: dict = {"batches": list(batches), "methods": {}}
     per_point: dict = {}
     for name, fn, size in methods:
         cells, rec = [], {}
-        for b in BATCHES:
+        for b in batches:
             P = X[rng.choice(len(X), size=b, replace=False)].astype(np.float32)
             med, best = _time(lambda P=P: fn(P), args.repeats)
-            rec[b] = {"median_s": med, "min_s": best, "per_point_us": med / b * 1e6}
+            rec[str(b)] = {"median_s": med, "min_s": best, "per_point_us": med / b * 1e6}
             cells.append(f"{med * 1e3:>9.2f} ms" + f"{'':>3}")
-        per_point[name] = rec[max(BATCHES)]["per_point_us"]
+        per_point[name] = rec[str(max(batches))]["per_point_us"]
         results["methods"][name] = {"model_bytes": size, "timings": rec}
         print(f"{name:<12}{size / 1024:>12.0f} KB" + "".join(cells))
 
-    print(f"\n{'method':<12}{'us / point at B=1':>20}{'us / point at B=512':>22}{'speedup vs slowest':>21}")
+    bmax = max(batches)
+    print(f"\n{'method':<12}{'us / point at B=1':>20}{f'us / point at B={bmax}':>22}{'speedup vs slowest':>21}")
     slowest = max(per_point.values())
     for name, _, _ in methods:
         r = results["methods"][name]["timings"]
         print(
-            f"{name:<12}{r[1]['per_point_us']:>20.1f}{r[max(BATCHES)]['per_point_us']:>22.2f}"
+            f"{name:<12}{r['1']['per_point_us']:>20.1f}{r[str(bmax)]['per_point_us']:>22.2f}"
             f"{slowest / per_point[name]:>20.1f}x"
         )
 

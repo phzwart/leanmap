@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -134,13 +134,29 @@ class OrdinalTripletSampler:
         x_anchor: torch.Tensor,
         x_near: torch.Tensor,
         affinity: AnchorAffinity,
+        shuffle_ranks: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
-        """Return ``x_mid (B,D), x_far (B,D), mask (B,), retention``."""
+        """Return ``x_mid (B,D), x_far (B,D), mask (B,), retention``.
+
+        ``shuffle_ranks`` permutes each row's landmark ordering, which draws the
+        mid point from an arbitrary landmark's bucket instead of the r-th
+        nearest. Everything else — the log-uniform rank draw, bucket-based mid
+        selection, uniform far point — is untouched, so the resulting retention
+        is the **chance level** for this sampler on this data. See
+        :func:`estimate_retention_null`.
+        """
         B = x_anchor.shape[0]
         with torch.no_grad():
             v_a = self.view(x_anchor)
             _, Dm = affinity(v_a)
             order = torch.argsort(Dm, dim=1)  # (B, L) ascending
+            if shuffle_ranks:
+                perm = torch.as_tensor(
+                    np.argsort(self.rng.random(order.shape), axis=1),
+                    dtype=torch.int64,
+                    device=order.device,
+                )
+                order = torch.gather(order, 1, perm)
         L = order.shape[1]
         log2, logL = np.log(2.0), np.log(max(L, 2))
         ranks = np.round(np.exp(self.rng.uniform(log2, logL, size=B))).astype(int)
@@ -169,6 +185,8 @@ class OrdinalTripletSampler:
         d_far = self.dist_fn(v_a, v_far).diag()
         mask = (d_near < d_mid) & (d_mid < d_far)
         retention = float(mask.float().mean().item())
+        if shuffle_ranks:
+            return x_mid, x_far, mask, retention
         self.last_retention = retention
         if retention < 0.3:
             get_logger().info(
@@ -177,6 +195,36 @@ class OrdinalTripletSampler:
                 retention,
             )
         return x_mid, x_far, mask, retention
+
+
+def estimate_retention_null(
+    ord_samp: "OrdinalTripletSampler",
+    edge_sampler: Any,
+    affinity: AnchorAffinity,
+    n_batches: int = 8,
+    batch_size: int = 512,
+    device: Optional[torch.device] = None,
+) -> float:
+    """Chance retention for the ordinal triplet loss, measured not asserted.
+
+    ``retention_f`` is only interpretable against the rate at which a triplet
+    would satisfy ``d_near < d_mid < d_far`` with no information in the
+    landmark ranking. That rate depends on the sampler (log-uniform ranks,
+    bucket-based mid selection), on the bucket-size distribution, and on the
+    data — it is not a universal constant, and the previously asserted 0.475 is
+    not recoverable from the stated scheme.
+
+    Measuring it by shuffling the landmark ranks is correct whatever the
+    sampling scheme, and stays correct if the scheme changes.
+    """
+    rates = []
+    for _ in range(max(1, n_batches)):
+        x_i, x_j, _, _ = edge_sampler.sample(batch_size)
+        if device is not None:
+            x_i, x_j = x_i.to(device), x_j.to(device)
+        _, _, _, r = ord_samp.sample(x_i, x_j, affinity, shuffle_ranks=True)
+        rates.append(r)
+    return float(np.mean(rates)) if rates else 0.0
 
 
 class StarSampler:
@@ -190,9 +238,23 @@ class StarSampler:
     :class:`EdgeSampler`).
     """
 
-    def __init__(self, X: torch.Tensor, graph: Graph, m: int = 6, seed: int = 0):
+    def __init__(
+        self,
+        X: torch.Tensor,
+        graph: Graph,
+        m: int = 6,
+        seed: int = 0,
+        deterministic: bool = False,
+    ):
+        """``deterministic`` takes each node's first ``m`` neighbours instead of
+        a fresh random ``m``. The density term needs it: its target is the
+        ambient radius of a fixed neighbour set, so the layout radius it is
+        compared against has to be measured over that same set, not a different
+        draw each step (which would attenuate the fitted contrast).
+        """
         self.X = X
         self.m = int(m)
+        self.deterministic = bool(deterministic)
         self.rep_idx = graph.reps.rep_idx.cpu().numpy().astype(np.int64)  # (R,)
         R = int(self.rep_idx.shape[0])
         edges = graph.edges.cpu().numpy().astype(np.int64)
@@ -214,6 +276,34 @@ class StarSampler:
         self, B: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns ``x_c (B,D), x_nbr (B,m,D), mask (B,m)``."""
+        return self.sample_indexed(B)[:3]
+
+    def padded_neighbours(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Every node's neighbour cells as ``(R, m)`` ids plus an ``(R, m)`` mask.
+
+        Uses the same first-``m`` rule as :meth:`sample_indexed` under
+        ``deterministic``, so a per-node quantity tabulated from this is exactly
+        the one a sampled star will see.
+        """
+        R = int(self.rep_idx.shape[0])
+        m = self.m
+        idx = np.zeros((R, m), dtype=np.int64)
+        mask = np.zeros((R, m), dtype=np.float32)
+        for i in range(R):
+            sel = self.nbrs[i][:m]
+            k = int(sel.size)
+            idx[i, :k] = sel
+            mask[i, :k] = 1.0
+        return torch.as_tensor(idx), torch.as_tensor(mask)
+
+    def sample_indexed(
+        self, B: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """As :meth:`sample`, plus the centre *cell* ids ``(B,)``.
+
+        The density term needs the ids to look up each centre's ambient
+        neighbour radius, which is tabulated per graph node.
+        """
         m = self.m
         if self.centers.size == 0:
             D = self.X.shape[1]
@@ -221,6 +311,7 @@ class StarSampler:
                 self.X.new_zeros(B, D),
                 self.X.new_zeros(B, m, D),
                 torch.zeros(B, m, dtype=torch.float32),
+                torch.zeros(B, dtype=torch.int64),
             )
         pick = self.rng.integers(0, self.centers.size, size=B)
         cells = self.centers[pick]
@@ -230,6 +321,8 @@ class StarSampler:
             nb = self.nbrs[int(cells[r])]
             if nb.size <= m:
                 sel = nb
+            elif self.deterministic:
+                sel = nb[:m]
             else:
                 sel = self.rng.choice(nb, size=m, replace=False)
             k = int(sel.size)
@@ -239,4 +332,9 @@ class StarSampler:
         nbr_raw = self.rep_idx[nbr_cells.reshape(-1)].reshape(B, m)  # (B, m)
         x_c = self.X[torch.as_tensor(c_raw, dtype=torch.int64)]
         x_nbr = self.X[torch.as_tensor(nbr_raw, dtype=torch.int64)]
-        return x_c, x_nbr, torch.as_tensor(mask, dtype=torch.float32)
+        return (
+            x_c,
+            x_nbr,
+            torch.as_tensor(mask, dtype=torch.float32),
+            torch.as_tensor(cells, dtype=torch.int64),
+        )

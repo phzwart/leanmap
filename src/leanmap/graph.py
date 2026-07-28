@@ -19,6 +19,13 @@ from .landmarks import (
     fps_init_indices_geodesic,
     poisson_disk_indices_geodesic,
 )
+from .config import (
+    BETA_MULTIPLICITY,
+    C_BUCKETS,
+    C_SEARCH,
+    LAMBDA_BACKBONE,
+    PYRAMID_REP_RATIO,
+)
 from .metrics import MetricSpec
 from .utils import get_logger
 
@@ -90,27 +97,111 @@ class Graph:
     stats: GraphStats
 
 
+def _intrinsic_dim_levina_bickel(
+    X: torch.Tensor, dist_fn: DistanceFn, k: int = 10, seed: int = 0
+) -> float:
+    """Levina-Bickel MLE intrinsic dimension on a subsample (clamped to [1, D])."""
+    n, D = X.shape
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    take = min(2000, n)
+    Xs = X[torch.randperm(n, generator=g)[:take]]
+    kk = min(k, max(2, take - 1))
+    vals, _ = chunked_cdist(dist_fn, Xs, Xs, topk=kk + 1, out_device=Xs.device)
+    r = vals[:, 1 : kk + 1].clamp_min(1e-12).double()
+    ratio = torch.log(r[:, -1:] / r[:, :-1]).mean(dim=1)
+    ratio = ratio[torch.isfinite(ratio) & (ratio > 0)]
+    if ratio.numel() == 0:
+        return float(D)
+    m = float(1.0 / ratio.mean().clamp_min(1e-12))
+    return float(min(max(m, 1.0), float(D)))
+
+
+def _one_nn_all(
+    X: torch.Tensor,
+    dist_fn: DistanceFn,
+    metric: Optional[MetricSpec] = None,
+    max_dense: int = 20_000,
+) -> Optional[torch.Tensor]:
+    """Exact 1-NN distance for **every** row, or None if it would be too costly.
+
+    Dense for small ``N``. For large ``N`` an ANN index supplies the candidate
+    neighbour and the returned distance is still evaluated with ``dist_fn``, so
+    the value is exact whenever the candidate is correct.
+    """
+    n = X.shape[0]
+    if n < 2:
+        return None
+    if n <= max_dense:
+        vals, _ = chunked_cdist(dist_fn, X, X, topk=2, out_device=X.device)
+        return vals[:, 1].contiguous()
+
+    if metric is None or metric.l2_transform is None or not _faiss_available():
+        return None
+    import faiss
+
+    Xt = metric.l2_transform(X).detach().cpu().numpy().astype(np.float32)
+    d = Xt.shape[1]
+    nlist = max(1, min(int(np.sqrt(n)), n // 10))
+    quant = faiss.IndexFlatL2(d)
+    index = faiss.IndexIVFFlat(quant, d, nlist)
+    index.train(Xt)
+    index.add(Xt)
+    index.nprobe = min(32, nlist)
+    # k=8 over-fetch: the true 1-NN can be missed at nprobe=32, and exact ties
+    # to self must be skipped.
+    _, cand = index.search(Xt, min(8, n))
+    out = torch.full((n,), float("inf"), dtype=torch.float32)
+    chunk = 4096
+    for s in range(0, n, chunk):
+        e = min(n, s + chunk)
+        for i in range(s, e):
+            cidx = [int(j) for j in cand[i].tolist() if j >= 0 and j != i]
+            if not cidx:
+                continue
+            C = X[torch.tensor(cidx, dtype=torch.int64, device=X.device)]
+            out[i] = float(dist_fn(X[i : i + 1], C)[0].min().item())
+    finite = torch.isfinite(out)
+    if not bool(finite.all()):
+        out[~finite] = out[finite].max() if bool(finite.any()) else 0.0
+    return out
+
+
 def estimate_epsilon(
     X: torch.Tensor,
     dist_fn: DistanceFn,
     n_sample: int = 10_000,
     quantile: float = 0.01,
     seed: int = 0,
+    metric: Optional[MetricSpec] = None,
 ) -> Tuple[float, dict]:
-    """Estimate duplicate scale from 1-NN distances on a subsample.
+    """Estimate the duplicate scale as the ``quantile`` of 1-NN distances.
 
-    Primary estimate is ``quantile(nn1, quantile)`` (§4.1). When that collapses
-    to ≤0 because exact duplicates dominate the low tail, fall back to the
-    median of *strictly positive* 1-NN distances (same idea as leanmap's cull
-    radius) so the ε-net still merges near-ties.
+    The quantile is taken over **all** ``N`` rows whenever that is affordable,
+    because a 1-NN distance shrinks like ``n^{-1/m}``: reading it off a fixed
+    subsample makes ε a function of dataset size. A 10^4 subsample of a 10^6
+    point set inflates ε by ``100^{1/m}`` (a factor of ~2 at m = 6), and it does
+    so precisely at the scale where deduplication matters.
+
+    When the full pass is unaffordable (no ANN backend, or a metric with no
+    Euclidean transform), the subsample estimate is kept but rescaled by
+    ``(n_sample / N)^(1/m)`` with ``m`` the Levina-Bickel intrinsic dimension,
+    which removes the leading size dependence.
+
+    If the quantile collapses to <= 0 because exact duplicates dominate the low
+    tail, fall back to the median of *strictly positive* 1-NN distances so the
+    ε-net still merges near-ties.
 
     Parameters
     ----------
     X : (N, D) float32
     dist_fn : DistanceFn
     n_sample : int
+        Subsample size for the fallback path.
     quantile : float
     seed : int
+    metric : MetricSpec, optional
+        Enables the ANN path for the full-N pass.
 
     Returns
     -------
@@ -119,17 +210,36 @@ def estimate_epsilon(
     """
     log = get_logger()
     n = X.shape[0]
-    g = torch.Generator(device="cpu")
-    g.manual_seed(seed)
-    take = min(n_sample, n)
-    idx = torch.randperm(n, generator=g)[:take]
-    Xs = X[idx]
-    Dmat = chunked_cdist(dist_fn, Xs, Xs, out_device=Xs.device)
-    assert isinstance(Dmat, torch.Tensor)
-    Dmat = Dmat.clone()
-    Dmat.fill_diagonal_(float("inf"))
-    nn1 = Dmat.min(dim=1).values
-    eps = float(torch.quantile(nn1, quantile).item())
+    nn1 = _one_nn_all(X, dist_fn, metric=metric)
+    scope = "full"
+    subsample_correction = 1.0
+    intrinsic_dim = float("nan")
+
+    if nn1 is None:
+        scope = "subsample"
+        g = torch.Generator(device="cpu")
+        g.manual_seed(seed)
+        take = min(n_sample, n)
+        idx = torch.randperm(n, generator=g)[:take]
+        Xs = X[idx]
+        Dmat = chunked_cdist(dist_fn, Xs, Xs, out_device=Xs.device)
+        assert isinstance(Dmat, torch.Tensor)
+        Dmat = Dmat.clone()
+        Dmat.fill_diagonal_(float("inf"))
+        nn1 = Dmat.min(dim=1).values
+        if take < n:
+            intrinsic_dim = _intrinsic_dim_levina_bickel(X, dist_fn, seed=seed)
+            subsample_correction = float((take / n) ** (1.0 / max(intrinsic_dim, 1.0)))
+            log.info(
+                "epsilon from a %d/%d subsample; rescaling by (n_sub/N)^(1/m)=%.4f "
+                "with Levina-Bickel m=%.2f so epsilon does not drift with N",
+                take,
+                n,
+                subsample_correction,
+                intrinsic_dim,
+            )
+
+    eps = float(torch.quantile(nn1, quantile).item()) * subsample_correction
     frac_exact_zero = float((nn1 == 0).float().mean().item())
     deciles = [float(torch.quantile(nn1, q).item()) for q in [i / 10 for i in range(1, 10)]]
     used_fallback = False
@@ -156,15 +266,26 @@ def estimate_epsilon(
             )
     if frac_exact_zero > 0.5:
         log.warning(
-            "frac_exact_zero=%.3f > 0.5: more than half the subsample are exact "
-            "duplicates — check the data pipeline",
+            "frac_exact_zero=%.3f > 0.5: more than half the %s 1-NN distances are "
+            "exact duplicates — check the data pipeline",
             frac_exact_zero,
+            scope,
         )
+    log.info(
+        "epsilon = %.6g (%s 1-NN quantile=%.3f over %d value(s))",
+        eps,
+        scope,
+        quantile,
+        int(nn1.numel()),
+    )
     return eps, {
         "frac_exact_zero": frac_exact_zero,
         "nn1_deciles": deciles,
         "epsilon": eps,
         "used_positive_median_fallback": used_fallback,
+        "scope": scope,
+        "subsample_correction": subsample_correction,
+        "intrinsic_dim": intrinsic_dim,
     }
 
 
@@ -197,6 +318,120 @@ def _epsilon_net_bucket(
             reps.append(i)
             member_of[i] = len(reps) - 1
     return reps, member_of
+
+
+def _halo_merge(
+    X: torch.Tensor,
+    reps: Representatives,
+    assign_topc: torch.Tensor,
+    dist_fn: DistanceFn,
+    epsilon: float,
+) -> Tuple[Representatives, dict]:
+    """Merge ε-close representatives that landed in different landmark buckets.
+
+    The greedy net runs inside top-1 buckets, so a near-duplicate pair straddling
+    a Voronoi boundary survives as two cells — and that boundary is exactly where
+    the conditioning code switches, so those are the duplicates most worth
+    collapsing.
+
+    Candidate pairs are read off the **pre-merge** representative set and then
+    collapsed by union-find, so the result is the set of connected components of
+    the "within ε and in different buckets" graph. That makes the outcome
+    independent of visit order; a chain A-B-C collapses to one cell rather than
+    to whichever pair was seen first. Roots are the lowest representative index,
+    so the labelling is deterministic.
+
+    Returns the rebuilt ``Representatives`` and a diagnostics dict.
+    """
+    R = int(reps.rep_idx.shape[0])
+    info = {"halo_pairs": 0, "halo_merged": 0, "R_before": R}
+    if R < 2 or epsilon <= 0.0:
+        return reps, info
+
+    rep_idx = reps.rep_idx
+    X_rep = X[rep_idx]
+    rep_top1 = assign_topc[rep_idx][:, 0]
+    # Group representatives by every bucket they are shortlisted for; two reps
+    # can only be compared if they share one, which is what makes this cheap.
+    shortlist: Dict[int, List[int]] = {}
+    topc_rep = assign_topc[rep_idx]
+    for r in range(R):
+        for b in topc_rep[r].tolist():
+            b = int(b)
+            if b >= 0:
+                shortlist.setdefault(b, []).append(r)
+
+    parent = list(range(R))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        # Lowest index wins so the labelling does not depend on visit order.
+        if rb < ra:
+            ra, rb = rb, ra
+        parent[rb] = ra
+
+    n_pairs = 0
+    for members in shortlist.values():
+        if len(members) < 2:
+            continue
+        idx_t = torch.as_tensor(sorted(members), dtype=torch.int64)
+        D = dist_fn(X_rep[idx_t], X_rep[idx_t])
+        close = (D <= epsilon).nonzero(as_tuple=False)
+        for a_pos, b_pos in close.tolist():
+            if a_pos >= b_pos:
+                continue
+            ra, rb = int(idx_t[a_pos]), int(idx_t[b_pos])
+            # Same-bucket pairs are already handled by the greedy net.
+            if int(rep_top1[ra]) == int(rep_top1[rb]):
+                continue
+            n_pairs += 1
+            union(ra, rb)
+
+    roots = [find(r) for r in range(R)]
+    uniq = sorted(set(roots))
+    if len(uniq) == R:
+        info["halo_pairs"] = n_pairs
+        info["R_after"] = R
+        return reps, info
+
+    remap = {old: new for new, old in enumerate(uniq)}
+    new_of_old = torch.as_tensor([remap[roots[r]] for r in range(R)], dtype=torch.int64)
+    R_new = len(uniq)
+
+    member_of = new_of_old[reps.member_of]
+    rep_idx_new = rep_idx[torch.as_tensor(uniq, dtype=torch.int64)]
+    order = torch.argsort(member_of, stable=True)
+    counts = torch.bincount(member_of, minlength=R_new)
+    offsets = torch.zeros(R_new + 1, dtype=torch.int64)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+
+    info.update(
+        {
+            "halo_pairs": n_pairs,
+            "halo_merged": R - R_new,
+            "R_after": R_new,
+        }
+    )
+    get_logger().info(
+        "halo pass: %d cross-bucket pair(s) within epsilon merged %d representative(s) "
+        "(R %d -> %d)",
+        n_pairs,
+        R - R_new,
+        R,
+        R_new,
+    )
+    return (
+        Representatives(rep_idx_new, member_of, counts.float(), offsets, order),
+        info,
+    )
 
 
 def build_representatives(
@@ -358,7 +593,7 @@ def knn_representatives(
     mode: str = "auto",
     landmarks: Optional[torch.Tensor] = None,
     assign_topc: Optional[torch.Tensor] = None,
-    c_search: int = 8,
+    c_search: int = C_SEARCH,
     metric: Optional[MetricSpec] = None,
     extra_assign_topc: Optional[Sequence[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
@@ -858,15 +1093,14 @@ def build_graph(
     metric: MetricSpec,
     n_neighbors: int = 15,
     n_landmarks: int = 256,
-    c_buckets: int = 8,
+    c_buckets: int = C_BUCKETS,
     epsilon: Optional[float] = None,
     dedup: bool = True,
     local_connectivity: int = 1,
-    beta_multiplicity: float = 0.5,
-    hub_correction: bool = False,
-    lambda_backbone: float = 0.01,
+    beta_multiplicity: float = BETA_MULTIPLICITY,
+    lambda_backbone: float = LAMBDA_BACKBONE,
     knn_mode: str = "auto",
-    c_search: int = 8,
+    c_search: int = C_SEARCH,
     seed: int = 0,
     extra_ivf_anchors: Optional[
         Sequence[Tuple[Any, DistanceFn, torch.Tensor]]
@@ -923,13 +1157,16 @@ def build_graph(
         stats.epsilon = 0.0
         log.info("dedup=False: skipping ε-net (R == N)")
     elif epsilon is None:
-        eps, diag = estimate_epsilon(X, dist_fn, seed=seed)
+        eps, diag = estimate_epsilon(X, dist_fn, seed=seed, metric=metric)
         stats.epsilon = eps
         stats.frac_exact_zero = diag["frac_exact_zero"]
         stats.nn1_deciles = diag["nn1_deciles"]
         stats.extra["used_positive_median_fallback"] = diag.get(
             "used_positive_median_fallback", False
         )
+        stats.extra["epsilon_scope"] = diag.get("scope")
+        stats.extra["epsilon_subsample_correction"] = diag.get("subsample_correction")
+        stats.extra["epsilon_intrinsic_dim"] = diag.get("intrinsic_dim")
     else:
         eps = float(epsilon)
         stats.epsilon = eps
@@ -977,8 +1214,10 @@ def build_graph(
         assign_top1, assign_topc = assign_buckets(X, M, dist_fn, c=c_buckets)
     L = M.shape[0]
 
-    # 4.3 representatives
+    # 4.3 representatives (+ halo pass across Voronoi boundaries)
     reps = build_representatives(X, assign_top1, dist_fn, eps, L, seed=seed)
+    reps, halo_info = _halo_merge(X, reps, assign_topc, dist_fn, eps)
+    stats.extra.update(halo_info)
     stats.n_reps = int(reps.rep_idx.shape[0])
     stats.compression_ratio = float(X.shape[0]) / max(stats.n_reps, 1)
     X_rep = X[reps.rep_idx]
@@ -1066,16 +1305,7 @@ def build_graph(
     stats.in_degree_deciles = [float(np.quantile(deg, q)) for q in [i / 10 for i in range(1, 10)]]
     log.info("in-degree deciles: %s", [f"{v:.4f}" for v in stats.in_degree_deciles])
 
-    # 4.8 hub correction
-    if hub_correction:
-        deg = np.asarray(P_sym.sum(axis=1)).ravel()
-        P_sym = P_sym.tocoo()
-        P_sym.data = P_sym.data / np.sqrt(deg[P_sym.row] * deg[P_sym.col] + 1e-12)
-        P_sym = P_sym.tocsr()
-        if P_sym.data.size:
-            P_sym.data /= P_sym.data.max()
-
-    # 4.9 backbone
+    # 4.8 backbone
     n_comp, _ = connected_components(P_sym, directed=False)
     stats.n_components_before_backbone = int(n_comp)
     log.info("connected components before backbone: %d", n_comp)
@@ -1111,12 +1341,63 @@ def build_graph(
     return graph, M, assign_top1, assign_topc
 
 
+def _squash_coarse_weights(wsum: torch.Tensor, mode: str = "rational_q99") -> torch.Tensor:
+    """Map heavy-tailed aggregated crossing weights into a membership in (0, 1).
+
+    Summed crossing weights are heavy-tailed: one wide bridge can be orders of
+    magnitude stronger than a thin one.
+
+    ``"rational_q99"`` (default)
+        ``w / (w + q99)``. Strictly monotone and unsaturating, so the strongest
+        coarse edges — the long-range structure a ``(1, 2, 8)`` pyramid exists
+        to exploit — keep their ordering, while the *selectivity* of the old
+        clamp is preserved: anchoring at the 0.99 quantile keeps typical coarse
+        edges weak and only the strong bridges near the ceiling.
+
+    ``"rational"``
+        ``w / (w + q50)``, anchored at the median. Also monotone, but it lifts
+        the mean membership by ~6x and makes coarse attraction diffuse rather
+        than selective. Measurably worse density correspondence on clustered
+        data; kept for ablation.
+
+    ``"quantile_clamp"`` (previous behaviour, kept for ablation)
+        ``min(w / q99, 1)``. Everything above the 0.99 quantile is flattened to
+        a common weight of exactly 1, discarding the ranking among the very
+        edges the pyramid is for.
+
+    The modes differ in *magnitude* as well as shape, so
+    ``pyramid_level_weights`` does not transfer between them; ``rational_q99``
+    is the one that is magnitude-comparable to ``quantile_clamp``.
+    """
+    if wsum.numel() == 0:
+        return wsum.to(torch.float32)
+
+    def _q(p: float) -> float:
+        v = float(torch.quantile(wsum, p)) if wsum.numel() > 1 else float(wsum.max())
+        if v > 0:
+            return v
+        pos = wsum[wsum > 0]
+        return float(pos.median()) if pos.numel() else 1.0
+
+    if mode == "quantile_clamp":
+        scale = _q(0.99)
+        return torch.clamp(wsum / max(scale, 1e-12), max=1.0).to(torch.float32)
+    if mode == "rational":
+        anchor = _q(0.5)
+    elif mode == "rational_q99":
+        anchor = _q(0.99)
+    else:
+        raise ValueError(f"unknown pyramid_squash={mode!r}")
+    return (wsum / (wsum + max(anchor, 1e-12))).to(torch.float32)
+
+
 def _coarsen_graph(
     graph_l: Graph,
     X: torch.Tensor,
     dist_fn: DistanceFn,
     target_reps: int,
     seed: int = 0,
+    squash: str = "rational_q99",
 ) -> Optional[Graph]:
     """Coarsen a fuzzy graph by Galerkin edge contraction (multiscale pyramid).
 
@@ -1176,17 +1457,7 @@ def _coarsen_graph(
     lo_u = torch.div(uniq, Rc, rounding_mode="floor").to(torch.int64)
     hi_u = (uniq % Rc).to(torch.int64)
     edges_c = torch.stack([lo_u, hi_u], dim=1)
-    # Aggregated (summed) crossing weights are heavy-tailed: one wide bridge can
-    # be orders of magnitude stronger than a thin one. Dividing by the global max
-    # would squash the bulk toward 0, so most long-range edges would barely
-    # attract. Normalize by a high quantile and clamp to 1 so typical coarse
-    # edges keep a meaningful membership while the strongest still saturate.
-    if wsum.numel() > 0:
-        scale = float(torch.quantile(wsum, 0.99)) if wsum.numel() > 1 else float(wsum.max())
-        scale = scale if scale > 0 else float(wsum.max())
-        weights_c = torch.clamp(wsum / max(scale, 1e-12), max=1.0).to(torch.float32)
-    else:
-        weights_c = wsum.to(torch.float32)
+    weights_c = _squash_coarse_weights(wsum, mode=squash)
 
     # diagnostics: connectivity + degree (unweighted degree = 2E/R; weighted
     # degree is the sum of memberships and is expected to be < 1 per node)
@@ -1348,9 +1619,10 @@ def build_graph_pyramid(
     X: torch.Tensor,
     metric: MetricSpec,
     pyramid_scales: int = 3,
-    pyramid_rep_ratio: float = 4.0,
+    pyramid_rep_ratio: float = PYRAMID_REP_RATIO,
     pyramid_min_reps: int = 256,
     pyramid_coarse_backbone: float = 1.0,
+    pyramid_squash: str = "rational_q99",
     **build_graph_kwargs: Any,
 ) -> Tuple[List[Graph], torch.Tensor, torch.Tensor, torch.Tensor]:
     """Multi-scale graph pyramid: fine graph + Galerkin-coarsened coarse levels.
@@ -1386,7 +1658,9 @@ def build_graph_pyramid(
         if target >= int(prev.reps.rep_idx.shape[0]):
             log.info("pyramid: stopping at level %d (target %d >= prev R)", level, target)
             break
-        g = _coarsen_graph(prev, X, dist_fn, target, seed=seed + level)
+        g = _coarsen_graph(
+            prev, X, dist_fn, target, seed=seed + level, squash=pyramid_squash
+        )
         if g is None:
             log.info("pyramid: coarsening returned None at level %d; stopping", level)
             break

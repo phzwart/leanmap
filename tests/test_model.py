@@ -24,7 +24,6 @@ def _tiny_model(D=8, L=4, d_out=2, pca_skip=True, pca_center=True):
         depth=2,
         L=L,
         hyper_width=16,
-        spectral_norm_flag=False,
         pca_skip=pca_skip,
         pca_weight=w,
     )
@@ -78,6 +77,52 @@ def test_embed_far_ood_finite():
     assert torch.isfinite(z).all()
 
 
+def test_scalar_gamma_changes_output():
+    """A per-layer scalar gamma must be visible in the forward pass.
+
+    LayerNorm is exactly scale-invariant, so under the old modulate-then-norm
+    ordering a scalar gamma with beta=0 was a no-op and the GAIN role could
+    never do anything. Modulating after the norm is what makes it real.
+    """
+    model, X = _tiny_model(pca_skip=False)
+    enc = model.encoder
+    B, x = 16, X[:16]
+    beta = torch.zeros(B, enc.depth, enc.width)
+    z1 = enc(x, gamma=torch.ones(B, enc.depth, 1).expand(B, enc.depth, enc.width), beta=beta)
+    z2 = enc(x, gamma=torch.full((B, enc.depth, 1), 3.0).expand(B, enc.depth, enc.width), beta=beta)
+    assert not torch.allclose(z1, z2, atol=1e-6)
+
+
+def test_film_applied_after_layernorm():
+    """Pin the ordering: h = gelu(gamma * LN(Wh) + beta)."""
+    model, X = _tiny_model(pca_skip=False)
+    enc = model.encoder
+    B, x = 4, X[:4]
+    gamma = 1.0 + 0.5 * torch.randn(B, enc.depth, enc.width)
+    beta = 0.3 * torch.randn(B, enc.depth, enc.width)
+    z = enc(x, gamma=gamma, beta=beta)
+
+    h = (x - enc.x_mean) / enc.x_std
+    for k, (lin, norm) in enumerate(zip(enc.backbone, enc.norms)):
+        h = torch.nn.functional.gelu(gamma[:, k, :] * norm(lin(h)) + beta[:, k, :])
+    assert torch.allclose(z, enc.head(h), atol=1e-6)
+
+
+def test_hidden_taps_are_post_film():
+    """negative_space hooks the taps; they must carry gamma/beta."""
+    model, X = _tiny_model(pca_skip=False)
+    enc = model.encoder
+    captured = {}
+    handle = enc.taps[0].register_forward_hook(lambda _m, _i, out: captured.__setitem__(0, out))
+    B, x = 4, X[:4]
+    gamma = torch.full((B, enc.depth, enc.width), 2.0)
+    beta = torch.full((B, enc.depth, enc.width), 0.5)
+    enc(x, gamma=gamma, beta=beta)
+    handle.remove()
+    expected = 2.0 * enc.norms[0](enc.backbone[0]((x - enc.x_mean) / enc.x_std)) + 0.5
+    assert torch.allclose(captured[0], expected, atol=1e-6)
+
+
 def test_gradient_wrt_input():
     model, X = _tiny_model()
     x = X[:8].clone().requires_grad_(True)
@@ -86,3 +131,83 @@ def test_gradient_wrt_input():
     assert x.grad is not None
     assert torch.isfinite(x.grad).all()
     assert x.grad.abs().sum() > 0
+
+
+# ---------------------------------------------------------------------------
+# AdamW parameter groups for the PCA skip
+# ---------------------------------------------------------------------------
+
+
+def _pg_model_and_cfg(pca_skip=True, mult=1.0):
+    from leanmap.config import PLANEConfig
+    from leanmap.distance import EuclideanDistance
+    from leanmap.landmarks import LandmarkAffinity, fps_init
+    from leanmap.model import PLANE
+
+    torch.manual_seed(0)
+    X = torch.randn(200, 6)
+    M = fps_init(X, EuclideanDistance(), L=8, seed=0)
+    aff = LandmarkAffinity(M, EuclideanDistance(), probe_differentiable=False)
+    enc = FiLMEncoder(6, 2, width=16, depth=2, L=8, hyper_width=8, pca_skip=pca_skip)
+    cfg = PLANEConfig(pca_skip=pca_skip, pca_lr_mult=mult, lr=1e-3)
+    return PLANE(aff, enc), cfg
+
+
+def test_default_multiplier_keeps_a_single_flat_group():
+    from leanmap.train import _param_groups
+
+    model, cfg = _pg_model_and_cfg(mult=1.0)
+    groups = _param_groups(model, cfg)
+    assert len(groups) == 1
+    assert len(groups[0]["params"]) == len(list(model.parameters()))
+
+
+def test_multiplier_splits_head_and_hypers_from_the_skip():
+    from leanmap.train import _param_groups
+
+    model, cfg = _pg_model_and_cfg(mult=15.0)
+    groups = _param_groups(model, cfg)
+    assert len(groups) == 2
+    slow, fast = groups
+    assert fast["lr"] == 15.0 * slow["lr"]
+    slow_ids = {id(p) for p in slow["params"]}
+    # The PCA skip and backbone stay slow; the residual head runs fast.
+    assert id(model.encoder.pca.weight) in slow_ids
+    assert id(model.encoder.backbone[0].weight) in slow_ids
+    assert id(model.encoder.head.weight) not in slow_ids
+    # Every parameter lands in exactly one group.
+    n = len(slow["params"]) + len(fast["params"])
+    assert n == len([p for p in model.parameters() if p.requires_grad])
+
+
+def test_multiplier_is_ignored_without_the_skip():
+    """With pca_skip=False there is no skip to hold back."""
+    from leanmap.train import _param_groups
+
+    model, cfg = _pg_model_and_cfg(pca_skip=False, mult=15.0)
+    assert len(_param_groups(model, cfg)) == 1
+
+
+def test_group_lr_ratio_survives_the_schedule():
+    """Warmup + cosine must scale groups proportionally, not flatten them."""
+    from torch.optim import AdamW
+    from torch.optim.lr_scheduler import (
+        CosineAnnealingLR,
+        LinearLR,
+        SequentialLR,
+    )
+
+    from leanmap.train import _param_groups
+
+    model, cfg = _pg_model_and_cfg(mult=10.0)
+    opt = AdamW(_param_groups(model, cfg), lr=cfg.lr)
+    sched = SequentialLR(
+        opt,
+        [LinearLR(opt, start_factor=0.01, total_iters=10), CosineAnnealingLR(opt, T_max=90)],
+        milestones=[10],
+    )
+    for _ in range(60):
+        opt.step()
+        sched.step()
+        lrs = [g["lr"] for g in opt.param_groups]
+        assert abs(lrs[1] / max(lrs[0], 1e-18) - 10.0) < 1e-6

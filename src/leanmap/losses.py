@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.optimize import curve_fit
-from scipy.stats import rankdata
 
-from .config import AlignmentSpec
 from .utils import get_logger
 
 
@@ -171,122 +169,6 @@ def ordinal_triplet_loss(
     return (t1 + t2).mean(), scale_state
 
 
-def _pearson(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    x = x - x.mean()
-    y = y - y.mean()
-    return (x * y).sum() / (x.norm() * y.norm()).clamp_min(1e-12)
-
-
-def prepare_alignment_targets(
-    alignments: Sequence[AlignmentSpec],
-    whiten_multi_axis: bool = True,
-) -> List[AlignmentSpec]:
-    """Rank-transform / residualise axial specs. Returns updated specs with tensors."""
-    log = get_logger()
-    axial = [s for s in alignments if s.kind == "axial"]
-    regional = [s for s in alignments if s.kind == "regional"]
-    prepared: List[AlignmentSpec] = []
-
-    mats = []
-    for spec in axial:
-        vals = np.asarray(spec.values, dtype=np.float64).ravel()
-        mats.append(vals)
-
-    residuals = []
-    if axial:
-        if whiten_multi_axis and len(mats) > 1:
-            for i, v in enumerate(mats):
-                if i == 0:
-                    residuals.append(v.copy())
-                    continue
-                # OLS residual against previous specs
-                A = np.column_stack(mats[:i] + [np.ones_like(v)])
-                coef, _, _, _ = np.linalg.lstsq(A, v, rcond=None)
-                resid = v - A @ coef
-                residuals.append(resid)
-        else:
-            if not whiten_multi_axis and len(mats) > 1:
-                corr = np.corrcoef(mats[0], mats[1])[0, 1]
-                log.warning(
-                    "whiten_multi_axis=False with %d axial specs (corr=%.3f): "
-                    "risk of geometric distortion from correlated constraints",
-                    len(mats),
-                    corr,
-                )
-            residuals = [v.copy() for v in mats]
-
-        for spec, resid in zip(axial, residuals):
-            ranks = rankdata(resid, method="average").astype(np.float64)
-            ranks = (ranks - ranks.mean()) / (ranks.std() + 1e-12)
-            prepared.append(
-                AlignmentSpec(
-                    axis=spec.axis,
-                    values=torch.as_tensor(ranks, dtype=torch.float32),
-                    kind="axial",
-                    weight=spec.weight,
-                    sign=spec.sign,
-                )
-            )
-    prepared.extend(regional)
-    return prepared
-
-
-def axial_alignment_loss(
-    z: torch.Tensor,
-    r_batch: torch.Tensor,
-    axis: int,
-    sign: int = 1,
-) -> torch.Tensor:
-    """``1 - sign * pearson(z[:, axis], r_batch)``.
-
-    Parameters
-    ----------
-    z : (B, d) float32
-    r_batch : (B,) float32
-    axis : int
-    sign : +1 | -1
-
-    Returns
-    -------
-    scalar
-    """
-    if z.shape[0] < 2:
-        return z.sum() * 0.0
-    proj = z[:, axis]
-    return (1.0 - sign * _pearson(proj, r_batch)).float()
-
-
-def regional_alignment_loss(
-    z: torch.Tensor,
-    labels: torch.Tensor,
-    targets: Dict[int, torch.Tensor],
-) -> torch.Tensor:
-    """Centroid pull toward regional targets (never per-point).
-
-    Parameters
-    ----------
-    z : (B, d)
-    labels : (B,)
-    targets : dict[label -> (d,)]
-
-    Returns
-    -------
-    scalar
-    """
-    loss = z.sum() * 0.0
-    total = 0
-    for g, tgt in targets.items():
-        mask = labels == g
-        n = int(mask.sum().item())
-        if n == 0:
-            continue
-        centroid = z[mask].mean(dim=0)
-        loss = loss + n * ((centroid - tgt.to(z.device)) ** 2).sum()
-        total += n
-    if total == 0:
-        return loss
-    return (loss / total).float()
-
 
 def landmark_regularisation(
     a: torch.Tensor,
@@ -309,11 +191,6 @@ def landmark_regularisation(
     mean_a = a.mean(dim=0).clamp_min(1e-12)
     ent = -(mean_a * mean_a.log()).sum()
     return (quant - eta * ent).float()
-
-
-def reconstruction_loss(x_hat: torch.Tensor, x_norm: torch.Tensor) -> torch.Tensor:
-    """MSE reconstruction on normalised inputs. Returns scalar."""
-    return F.mse_loss(x_hat, x_norm)
 
 
 def local_isometry_loss(
@@ -541,109 +418,6 @@ def procrustes_anchor_loss(
         t = z.mean(dim=0) - scale * (target.to(z.device, z.dtype).mean(dim=0) @ R)
     aligned = scale * (target.to(device=z.device, dtype=z.dtype) @ R) + t
     return ((z - aligned) ** 2).mean().float()
-
-
-def lipschitz_penalty(
-    model: torch.nn.Module,
-    x: torch.Tensor,
-) -> torch.Tensor:
-    """Gradient penalty on a random convex mixture: ``(||dz/dx||_F - 1)^2_+``.
-
-    Parameters
-    ----------
-    model : PLANE-like module with ``forward -> (z, a, Dm)``
-    x : (B, D)
-
-    Returns
-    -------
-    scalar
-    """
-    if x.shape[0] < 2:
-        return x.sum() * 0.0
-    perm = torch.randperm(x.shape[0], device=x.device)
-    alpha = torch.rand(x.shape[0], 1, device=x.device, dtype=x.dtype)
-    mix = alpha * x + (1 - alpha) * x[perm]
-    mix = mix.detach().requires_grad_(True)
-    z, _, _ = model(mix)
-    # sum over embedding dims to get vector-Jacobian via grad
-    grads = []
-    for j in range(z.shape[1]):
-        g = torch.autograd.grad(
-            z[:, j].sum(), mix, create_graph=True, retain_graph=True
-        )[0]
-        grads.append((g ** 2).sum(dim=1))
-    fro = torch.stack(grads, dim=1).sum(dim=1).sqrt()
-    return (fro - 1.0).clamp_min(0.0).pow(2).mean()
-
-
-def sigreg_loss(
-    z: torch.Tensor,
-    n_slices: int = 256,
-    n_points: int = 17,
-    t_max: float = 5.0,
-    target_std: float = 1.0,
-    center: bool = True,
-    generator: Optional[torch.Generator] = None,
-) -> torch.Tensor:
-    """Sketched Isotropic Gaussian Regularization (SIGReg; LeJEPA, 2025).
-
-    Anti-collapse regularizer. Pushes the embedding distribution toward an
-    isotropic Gaussian ``N(0, target_std^2 I)`` by (i) projecting ``z`` onto
-    ``n_slices`` random unit directions and (ii) scoring each 1-D projection
-    against ``N(0, 1)`` with the Epps–Pulley statistic — a weighted L2 distance
-    between the empirical characteristic function (ECF) and the standard-normal
-    CF ``exp(-t^2/2)``, evaluated by trapezoid quadrature on ``[-t_max, t_max]``.
-
-    Unlike :func:`lipschitz_penalty` (a one-sided *upper* bound on the Jacobian
-    that only fights expansion), SIGReg targets a *unit-variance, full-rank*
-    distribution, so it structurally forbids both scale contraction and
-    dimensional collapse. It needs only first-order autograd (no double
-    backward), so it is MPS-safe.
-
-    Parameters
-    ----------
-    z : (B, D) embedding batch
-    n_slices : number of random projection directions ``|A|``
-    n_points : quadrature points on ``[-t_max, t_max]``
-    t_max : half-width of the integration domain
-    target_std : std of the target isotropic Gaussian (match the geometry scale)
-    center : subtract the batch mean before scoring (constrain shape+scale, not
-        absolute position — the geometry loss is translation-invariant)
-    generator : optional RNG for reproducible slice directions
-
-    Returns
-    -------
-    scalar : mean Epps–Pulley statistic over slices
-    """
-    if z.shape[0] < 2:
-        return z.sum() * 0.0
-    B, D = z.shape
-    zc = z - z.mean(dim=0, keepdim=True) if center else z
-    zc = zc / target_std
-
-    # random unit directions (B,D) -> (D, M)
-    A = torch.randn(D, n_slices, device=z.device, dtype=z.dtype, generator=generator)
-    A = A / A.norm(dim=0, keepdim=True).clamp_min(1e-12)
-    proj = zc @ A  # (B, M): each column is a 1-D projection ~ N(0,1) at optimum
-
-    # quadrature grid + trapezoid weights, with a Gaussian window w(t)=exp(-t^2/2)
-    t = torch.linspace(-t_max, t_max, n_points, device=z.device, dtype=z.dtype)
-    dt = (2.0 * t_max) / (n_points - 1)
-    w_trap = torch.full_like(t, dt)
-    w_trap[0] = w_trap[-1] = 0.5 * dt
-    window = torch.exp(-0.5 * t * t)
-    w = w_trap * window  # (P,)
-
-    # ECF of each slice at each grid point: phi(t) = mean_n exp(i t proj_n)
-    # phase: (M, P, B)
-    phase = proj.t().unsqueeze(1) * t.view(1, -1, 1)  # (M, P, B)
-    re = torch.cos(phase).mean(dim=2)  # (M, P)
-    im = torch.sin(phase).mean(dim=2)  # (M, P)
-    target = torch.exp(-0.5 * t * t).view(1, -1)  # standard-normal CF (real)
-
-    integrand = (re - target).pow(2) + im.pow(2)  # (M, P)
-    stat = (integrand * w.view(1, -1)).sum(dim=1)  # (M,)
-    return stat.mean()
 
 
 def alignment_ramp(

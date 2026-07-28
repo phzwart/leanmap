@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
-from .config import AlignmentSpec
 from .conformal import ConformalCalibrator, geometry_consistency_score
 from .distance import DistanceFn, chunked_cdist
 from .model import PLANE
@@ -62,8 +61,18 @@ def shepard_pairs_ambient(
     Z: np.ndarray | torch.Tensor,
     n_pairs: int = 32768,
     seed: int = 0,
+    dist_fn: Optional[Callable] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Sample ambient Euclidean vs embedding Euclidean distances (Shepard).
+    """Sample ambient vs embedding distances (Shepard).
+
+    Parameters
+    ----------
+    dist_fn : callable, optional
+        Ambient distance, called row-block-wise as ``dist_fn(A, B) -> (n, m)``.
+        Defaults to Euclidean. Pass the metric the map was *trained* under;
+        scoring an L1-trained map with an L2 ruler measures transfer across
+        metrics, not fidelity. The embedding side stays Euclidean because the
+        low-dimensional kernel is.
 
     Returns
     -------
@@ -82,9 +91,26 @@ def shepard_pairs_ambient(
     while np.any(same):
         j[same] = rng.integers(0, n, size=int(same.sum()))
         same = i == j
-    d_orig = np.linalg.norm(Xnp[i] - Xnp[j], axis=1)
+    if dist_fn is None:
+        d_orig = np.linalg.norm(Xnp[i] - Xnp[j], axis=1)
+    else:
+        A = torch.as_tensor(Xnp[i], dtype=torch.float32)
+        B = torch.as_tensor(Xnp[j], dtype=torch.float32)
+        d_orig = _pairwise_rowwise(dist_fn, A, B)
     d_embed = np.linalg.norm(Znp[i] - Znp[j], axis=1)
     return d_orig, d_embed
+
+
+def _pairwise_rowwise(dist_fn: Callable, A: torch.Tensor, B: torch.Tensor) -> np.ndarray:
+    """d(A[k], B[k]) for each k, via the diagonal of blocked (n, m) calls."""
+    out = np.empty(A.shape[0], dtype=np.float64)
+    block = 1024
+    with torch.no_grad():
+        for s in range(0, A.shape[0], block):
+            e = min(s + block, A.shape[0])
+            D = dist_fn(A[s:e], B[s:e])
+            out[s:e] = torch.diagonal(D).detach().cpu().numpy().astype(np.float64)
+    return out
 
 
 def shepard_pairs_geodesic(
@@ -375,23 +401,185 @@ def knn_recall_out_of_sample(
     return float(np.mean(overlaps))
 
 
-def alignment_report(
-    Z: np.ndarray | torch.Tensor,
-    alignments: Sequence[AlignmentSpec],
-) -> dict:
-    """Per-axis achieved Spearman (Pearson on ranks)."""
-    from scipy.stats import spearmanr
+def _procrustes_fit(
+    A: torch.Tensor, B: torch.Tensor, eps: float = 1e-12
+) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """Similarity transform (rotation, translation, uniform scale) taking A to B.
 
-    Z = ensure_2d_float32(Z)
-    out = {}
-    for i, spec in enumerate(alignments):
-        if spec.kind != "axial" or spec.values is None:
-            continue
-        vals = np.asarray(spec.values, dtype=np.float64).ravel()
-        proj = Z[:, spec.axis]
-        corr, _ = spearmanr(proj, vals)
-        out[f"axis_{spec.axis}_spearman"] = float(corr) * float(spec.sign)
-    return out
+    Returns ``(R, t, s)`` such that ``s * A @ R + t`` best matches ``B``.
+    """
+    Ac = A - A.mean(dim=0, keepdim=True)
+    Bc = B - B.mean(dim=0, keepdim=True)
+    M = Ac.transpose(0, 1) @ Bc
+    U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+    R = U @ Vh
+    if torch.det(R) < 0:
+        U = U.clone()
+        U[:, -1] = -U[:, -1]
+        R = U @ Vh
+        S = S.clone()
+        S[-1] = -S[-1]
+    denom = float((Ac * Ac).sum().clamp_min(eps))
+    s = float(S.sum() / denom)
+    t = B.mean(dim=0) - s * (A.mean(dim=0) @ R)
+    return R, t, s
+
+
+def procrustes_disagreement(
+    Z_a: np.ndarray | torch.Tensor,
+    Z_b: np.ndarray | torch.Tensor,
+    anchor_idx: Sequence[int],
+    eval_idx: Sequence[int],
+) -> Dict[str, float]:
+    """Median coordinate disagreement between two maps of the same points.
+
+    The similarity transform is fitted on ``anchor_idx`` and scored on
+    ``eval_idx``. Fitting and scoring on the same points understates
+    disagreement, because the alignment absorbs part of what is being measured.
+
+    Disagreement is reported relative to the spread of the reference map, so it
+    does not inherit the arbitrary overall scale of an embedding.
+
+    Parameters
+    ----------
+    Z_a, Z_b : (N, d)
+        Two embeddings of the *same* rows, in the same order.
+    anchor_idx : indices used to fit the alignment
+    eval_idx : disjoint indices used to score it
+
+    Returns
+    -------
+    dict with ``median``, ``p90``, and ``scale`` (the fitted similarity scale)
+    """
+    A = torch.as_tensor(ensure_2d_float32(Z_a))
+    B = torch.as_tensor(ensure_2d_float32(Z_b))
+    if A.shape != B.shape:
+        raise ValueError(f"embeddings must match in shape; got {A.shape} vs {B.shape}")
+    a_idx = torch.as_tensor(list(anchor_idx), dtype=torch.int64)
+    e_idx = torch.as_tensor(list(eval_idx), dtype=torch.int64)
+    if a_idx.numel() < 3 or e_idx.numel() < 1:
+        return {"median": float("nan"), "p90": float("nan"), "scale": float("nan")}
+
+    R, t, s = _procrustes_fit(A[a_idx], B[a_idx])
+    aligned = s * (A[e_idx] @ R) + t
+    resid = (aligned - B[e_idx]).norm(dim=1)
+    # Normalise by the reference spread so the number is scale-free.
+    ref = B[e_idx] - B[e_idx].mean(dim=0, keepdim=True)
+    spread = float(ref.norm(dim=1).median().clamp_min(1e-12))
+    return {
+        "median": float(resid.median()) / spread,
+        "p90": float(torch.quantile(resid, 0.9)) / spread,
+        "scale": s,
+    }
+
+
+def neighborhood_rank_agreement(
+    Z_a: np.ndarray | torch.Tensor,
+    Z_b: np.ndarray | torch.Tensor,
+    k: int = 15,
+    n_sample: int = 1000,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Do two independently fitted maps agree on *who is near whom*?
+
+    Reports Spearman correlation between neighbour ranks and the Jaccard
+    overlap of the top-``k`` neighbour sets, both on a shared probe sample.
+
+    This is the primary persistence number. Procrustes disagreement cannot
+    repair genuine topological ambiguity — which arm of a branching structure
+    lands on which side is not a rigid motion — so a large coordinate
+    disagreement combined with high rank agreement is a gauge artefact, not
+    instability. Read the two together.
+    """
+    from .distance import EuclideanDistance
+
+    A = torch.as_tensor(ensure_2d_float32(Z_a))
+    B = torch.as_tensor(ensure_2d_float32(Z_b))
+    if A.shape[0] != B.shape[0]:
+        raise ValueError("embeddings must cover the same rows")
+    n = A.shape[0]
+    k = int(min(k, n - 1))
+    if n < 3 or k < 1:
+        return {"spearman": float("nan"), "jaccard": float("nan"), "n_probe": 0}
+
+    g = torch.Generator().manual_seed(seed)
+    take = min(n_sample, n)
+    probe = torch.randperm(n, generator=g)[:take]
+
+    euclid = EuclideanDistance()
+    dA = euclid(A[probe], A)
+    dB = euclid(B[probe], B)
+    # Exclude self so a trivially shared zero does not inflate agreement.
+    ar = torch.arange(take)
+    dA[ar, probe] = float("inf")
+    dB[ar, probe] = float("inf")
+
+    rank_rho = []
+    jac = []
+    for i in range(take):
+        ra = torch.argsort(torch.argsort(dA[i])).double()
+        rb = torch.argsort(torch.argsort(dB[i])).double()
+        ra = ra - ra.mean()
+        rb = rb - rb.mean()
+        denom = float((ra.norm() * rb.norm()).clamp_min(1e-12))
+        rank_rho.append(float((ra @ rb) / denom))
+        sa = set(torch.topk(dA[i], k, largest=False).indices.tolist())
+        sb = set(torch.topk(dB[i], k, largest=False).indices.tolist())
+        jac.append(len(sa & sb) / float(len(sa | sb)))
+    return {
+        "spearman": float(np.mean(rank_rho)),
+        "jaccard": float(np.mean(jac)),
+        "n_probe": int(take),
+    }
+
+
+def persistence_summary(
+    embeddings: Sequence[np.ndarray | torch.Tensor],
+    k: int = 15,
+    anchor_frac: float = 0.5,
+    n_sample: int = 1000,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Aggregate pairwise persistence over >= 2 refits of the same points.
+
+    ``embeddings`` must be maps of an identical, identically-ordered probe set —
+    produced by refitting at different seeds, or on different training
+    subsamples and then embedding a common holdout.
+
+    Returns the mean over all unordered pairs of
+    :func:`procrustes_disagreement` and :func:`neighborhood_rank_agreement`,
+    plus the worst pair, which is what a reproducibility claim has to survive.
+    """
+    Zs = [torch.as_tensor(ensure_2d_float32(Z)) for Z in embeddings]
+    if len(Zs) < 2:
+        raise ValueError("persistence needs at least two embeddings")
+    n = Zs[0].shape[0]
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n, generator=g)
+    n_anchor = max(3, int(anchor_frac * n))
+    anchor_idx = perm[:n_anchor].tolist()
+    eval_idx = perm[n_anchor:].tolist() or anchor_idx
+
+    coord, rho, jac = [], [], []
+    for i in range(len(Zs)):
+        for j in range(i + 1, len(Zs)):
+            p = procrustes_disagreement(Zs[i], Zs[j], anchor_idx, eval_idx)
+            r = neighborhood_rank_agreement(
+                Zs[i], Zs[j], k=k, n_sample=n_sample, seed=seed
+            )
+            coord.append(p["median"])
+            rho.append(r["spearman"])
+            jac.append(r["jaccard"])
+    return {
+        "n_maps": len(Zs),
+        "n_pairs": len(coord),
+        "coord_disagreement_median": float(np.mean(coord)),
+        "coord_disagreement_worst": float(np.max(coord)),
+        "rank_spearman_mean": float(np.mean(rho)),
+        "rank_spearman_worst": float(np.min(rho)),
+        f"rank_jaccard_{k}_mean": float(np.mean(jac)),
+        f"rank_jaccard_{k}_worst": float(np.min(jac)),
+    }
 
 
 def benchmark_inference(

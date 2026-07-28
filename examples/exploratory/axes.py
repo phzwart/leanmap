@@ -192,44 +192,6 @@ def frame_weight_runs() -> List[RunSpec]:
     return runs
 
 
-def geo_frontload_runs() -> List[RunSpec]:
-    """Front-loaded geodesic: λ_geo=1 from t=0, linear to 0 by 25%, then off.
-
-    Compared against constant λ_geo=0.5 (default delayed ramp-up) and constant
-    λ_geo=1.0 with the usual delayed ramp-up.
-    """
-    return [
-        _run(
-            "geo_schedule",
-            "frontload_1_to_0_by_0.25",
-            lambda_geo=1.0,
-            geo_ramp=(0.0, 0.25),
-            geo_ramp_down=True,
-        ),
-        _run(
-            "geo_schedule",
-            "const_0.5_ramp_up",
-            lambda_geo=0.5,
-            geo_ramp=(0.2, 0.45),
-            geo_ramp_down=False,
-        ),
-        _run(
-            "geo_schedule",
-            "const_1.0_ramp_up",
-            lambda_geo=1.0,
-            geo_ramp=(0.2, 0.45),
-            geo_ramp_down=False,
-        ),
-        _run(
-            "geo_schedule",
-            "const_1.0_from_start",
-            lambda_geo=1.0,
-            geo_ramp=(0.0, 0.0),
-            geo_ramp_down=False,
-        ),
-    ]
-
-
 # Corrected baseline for matching UMAP. Differences from BASELINE that matter:
 #
 # - ``pyramid_level_weights`` is a 3-TUPLE. Only 3 levels are built at N in the
@@ -625,10 +587,218 @@ def packing_runs() -> List[RunSpec]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Canonical paper sweep — recommended config + the four ladders that carry
+# real signal. Same arms on every dataset; on iris the pyramid ladder is a
+# no-op (pyramid_min_reps=256 > N) and should be skipped via --only.
+# ---------------------------------------------------------------------------
+RECOMMENDED: Dict[str, Any] = {
+    **DIGITS_MATCHED,
+    "min_dist": 0.5,
+    "pyramid_level_weights": (1.0, 2.0, 8.0),
+    "lambda_frame": 0.0,
+    "frame_ramp": (0.0, 0.0),
+    "frame_tangent": True,
+}
+
+
+def _crun(axis: str, level: str, **overlay: Any) -> RunSpec:
+    ov = dict(RECOMMENDED)
+    ov.update(overlay)
+    return RunSpec(run_id=_rid(axis, level), axis=axis, level=level, overlay=ov)
+
+
+def canonical_runs() -> List[RunSpec]:
+    """Recommended configuration plus min_dist / geo / frame / weights ladders."""
+    runs: List[RunSpec] = [
+        _crun("recommended", "default"),
+    ]
+    for md in (0.1, 0.2, 0.3, 0.5, 0.8):
+        runs.append(_crun("min_dist", str(md), min_dist=md))
+    for g in (0.0, 0.15, 0.5, 1.0):
+        runs.append(_crun("lambda_geo", str(g), lambda_geo=g))
+    # Frame: delayed ramp is the fold-back recipe; one early arm for contrast.
+    for w in (0.0, 0.25, 0.5, 1.0):
+        runs.append(
+            _crun(
+                "lambda_frame",
+                f"{w}_delayed",
+                lambda_frame=w,
+                frame_ramp=(0.5, 0.75),
+                frame_tangent=True,
+            )
+        )
+    runs.append(
+        _crun(
+            "lambda_frame",
+            "0.5_early",
+            lambda_frame=0.5,
+            frame_ramp=(0.0, 0.0),
+            frame_tangent=True,
+        )
+    )
+    for label, weights in (
+        ("flat", (1.0, 1.0, 1.0)),
+        ("ramp", (1.0, 2.0, 8.0)),
+        ("steep", (1.0, 4.0, 16.0)),
+        ("frontload", (8.0, 1.0, 1.0)),
+    ):
+        runs.append(_crun("weights", label, pyramid_level_weights=weights))
+    runs.append(
+        _crun(
+            "weights",
+            "off",
+            pyramid_scales=0,
+            pyramid_level_weights=None,
+            pyramid_coarse_backbone=0.0,
+        )
+    )
+    return runs
+
+
+# Iris small-N recipe: pyramid is inert (min_reps=256 > 150), landmarks << N.
+# calibrate.py at target-perp 8: L=64 gives coverage 2.36 (under the cover<=3
+# target); L=32 is 4.86. Width/depth shrunk because N=150 memorizes easily.
+IRIS_RECOMMENDED: Dict[str, Any] = {
+    **RECOMMENDED,
+    "n_landmarks": 64,
+    "n_neighbors": 10,
+    "pyramid_scales": 0,
+    "pyramid_level_weights": None,
+    "pyramid_coarse_backbone": 0.0,
+    "lambda_geo": 0.5,
+    "epochs": 240,
+    "width": 128,
+    "depth": 2,
+}
+
+
+def iris_canonical_runs() -> List[RunSpec]:
+    """Canonical ladders under the iris small-N recipe (no pyramid arms)."""
+
+    def _irun(axis: str, level: str, **overlay: Any) -> RunSpec:
+        ov = dict(IRIS_RECOMMENDED)
+        ov.update(overlay)
+        return RunSpec(run_id=_rid(axis, level), axis=axis, level=level, overlay=ov)
+
+    runs: List[RunSpec] = [_irun("recommended", "default")]
+    for md in (0.1, 0.2, 0.3, 0.5, 0.8):
+        runs.append(_irun("min_dist", str(md), min_dist=md))
+    for g in (0.0, 0.15, 0.5, 1.0):
+        runs.append(_irun("lambda_geo", str(g), lambda_geo=g))
+    for w in (0.0, 0.25, 0.5, 1.0):
+        runs.append(
+            _irun(
+                "lambda_frame",
+                f"{w}_delayed",
+                lambda_frame=w,
+                frame_ramp=(0.5, 0.75),
+            )
+        )
+    return runs
+
+
+def iris_pyramid_weights_runs() -> List[RunSpec]:
+    """Didactic iris panel: force multi-level pyramid so weight schedules show.
+
+    Production iris sets ``pyramid_scales=0`` because default
+    ``pyramid_min_reps=256`` never coarsens at N=150. Lowering ``min_reps`` to
+    16 builds ~3 levels at train N≈120 so flat / ramp / steep / frontload are
+    distinguishable. Not the small-N recipe — use only for the separate
+    weights figure.
+    """
+
+    def _irun(level: str, **overlay: Any) -> RunSpec:
+        ov = dict(IRIS_RECOMMENDED)
+        ov.update(
+            pyramid_scales=3,
+            pyramid_min_reps=16,
+            pyramid_coarse_backbone=1.0,
+            pyramid_level_weights=(1.0, 2.0, 8.0),
+        )
+        ov.update(overlay)
+        return RunSpec(
+            run_id=_rid("weights", level), axis="weights", level=level, overlay=ov
+        )
+
+    return [
+        _irun(
+            "off",
+            pyramid_scales=0,
+            pyramid_level_weights=None,
+            pyramid_coarse_backbone=0.0,
+        ),
+        _irun("flat", pyramid_level_weights=(1.0, 1.0, 1.0)),
+        _irun("ramp", pyramid_level_weights=(1.0, 2.0, 8.0)),
+        _irun("steep", pyramid_level_weights=(1.0, 4.0, 16.0)),
+        _irun("frontload", pyramid_level_weights=(8.0, 1.0, 1.0)),
+    ]
+
+
+# Swiss-roll frame stress test under the recommended base with geo=0.5
+# (fold-back manifolds want the global pull).
+def swiss_roll_frame_runs() -> List[RunSpec]:
+    def _srun(level: str, **overlay: Any) -> RunSpec:
+        ov = dict(RECOMMENDED)
+        ov.update(lambda_geo=0.5)
+        ov.update(overlay)
+        return RunSpec(
+            run_id=_rid("frame", level), axis="frame", level=level, overlay=ov
+        )
+
+    return [
+        _srun("0", lambda_frame=0.0, frame_ramp=(0.0, 0.0)),
+        _srun("0.25_delayed", lambda_frame=0.25, frame_ramp=(0.5, 0.75)),
+        _srun("0.5_delayed", lambda_frame=0.5, frame_ramp=(0.5, 0.75)),
+        _srun("1.0_delayed", lambda_frame=1.0, frame_ramp=(0.5, 0.75)),
+        _srun("0.5_early", lambda_frame=0.5, frame_ramp=(0.0, 0.0)),
+    ]
+
+
+def digits_geo_frame_runs() -> List[RunSpec]:
+    """Clustered-data stress: geo=0.5 + frame=0.5 static vs geo-only / recommended.
+
+    Docs say leave frame off on digits; this checks the cost of the swiss-roll
+    recipe transferred literally (static ramps = on from epoch 0).
+    """
+
+    def _drun(level: str, **overlay: Any) -> RunSpec:
+        ov = dict(RECOMMENDED)
+        ov.update(overlay)
+        return RunSpec(
+            run_id=_rid("gf", level), axis="gf", level=level, overlay=ov
+        )
+
+    return [
+        _drun("recommended"),  # geo=0.15, frame=0
+        _drun("geo0.5", lambda_geo=0.5, lambda_frame=0.0, frame_ramp=(0.0, 0.0)),
+        _drun(
+            "geo0.5_frame0.5_static",
+            lambda_geo=0.5,
+            geo_ramp=(0.0, 0.0),
+            lambda_frame=0.5,
+            frame_ramp=(0.0, 0.0),
+            frame_tangent=True,
+        ),
+        _drun(
+            "geo0.5_frame0.5_delayed",
+            lambda_geo=0.5,
+            geo_ramp=(0.0, 0.0),
+            lambda_frame=0.5,
+            frame_ramp=(0.5, 0.75),
+            frame_tangent=True,
+        ),
+    ]
+
+
 SWEEPS = {
+    "canonical": canonical_runs,
+    "iris_canonical": iris_canonical_runs,
+    "iris_pyramid_weights": iris_pyramid_weights_runs,
+    "swiss_roll_frame": swiss_roll_frame_runs,
+    "digits_geo_frame": digits_geo_frame_runs,
     "phase1": phase1_runs,
     "frame_weight": frame_weight_runs,
-    "geo_frontload": geo_frontload_runs,
     "umap_match": umap_match_runs,
     "weights": weights_runs,
     "epochs": epochs_runs,
