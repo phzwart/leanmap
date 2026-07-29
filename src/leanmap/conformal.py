@@ -24,8 +24,16 @@ harmless because it cannot change ranks, the second is handled by the split.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import (
+    Callable,
+    Dict,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +41,13 @@ import torch.nn.functional as F
 from .distance import EuclideanDistance
 from .model import PLANE
 from .utils import get_logger
+
+# Nonconformity scorers: (model, x, **ctx) -> (B,) higher ⇒ more nonconforming.
+NonconformityFn = Callable[..., torch.Tensor]
+ScoreSpec = Union[str, NonconformityFn]
+
+# Mondrian taxonomy used by :class:`MondrianCalibrator` by default.
+MONDRIAN_GROUPS: Tuple[str, ...] = ("digit", "gauss", "shuffle")
 
 
 def geometry_consistency_score(
@@ -500,3 +515,571 @@ class ConformalCalibrator:
             "n_batch": int(s_b.numel()),
             "median_shift": float(s_b.median().item() - s_c.median().item()),
         }
+
+
+# ---------------------------------------------------------------------------
+# Pluggable nonconformity scores + Mondrian (category-conditional) calibration
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def affinity_entropy_score(
+    model: PLANE,
+    x: torch.Tensor,
+    **_ctx,
+) -> torch.Tensor:
+    """Primary affinity entropy ``H(a) = -∑ a_ℓ log a_ℓ`` (higher ⇒ flatter)."""
+    _z, a, _Dm = model(x)
+    return -(a.clamp_min(1e-12) * a.clamp_min(1e-12).log()).sum(dim=1)
+
+
+@torch.no_grad()
+def cover_score(model: PLANE, x: torch.Tensor, **_ctx) -> torch.Tensor:
+    """Ambient landmark cover ``min_ℓ ‖x - M_ℓ‖``."""
+    _z, _a, Dm = model(x)
+    return Dm.min(dim=1).values
+
+
+@torch.no_grad()
+def soft_cover_score(
+    model: PLANE,
+    x: torch.Tensor,
+    *,
+    tau_embed: float = 1.0,
+    **_ctx,
+) -> torch.Tensor:
+    """Softmin landmark cover ``-τ logsumexp(-Dm / τ)``."""
+    _z, _a, Dm = model(x)
+    tau = max(float(tau_embed), 1e-6)
+    return -tau * torch.logsumexp(-Dm / tau, dim=1)
+
+
+@torch.no_grad()
+def affinity_max_neg_score(model: PLANE, x: torch.Tensor, **_ctx) -> torch.Tensor:
+    """``-max a_ℓ``: low peak affinity ⇒ more nonconforming."""
+    _z, a, _Dm = model(x)
+    return -a.max(dim=1).values
+
+
+@torch.no_grad()
+def emb_cover_score(
+    model: PLANE,
+    x: torch.Tensor,
+    *,
+    z_M: Optional[torch.Tensor] = None,
+    **_ctx,
+) -> torch.Tensor:
+    """Embedding-space cover ``min_ℓ ‖z - z(M_ℓ)‖``."""
+    z, _a, _Dm = model(x)
+    if z_M is None:
+        z_M = model._primary_anchor_embeddings(z.device)
+    return EuclideanDistance()(z, z_M.to(z.device)).min(dim=1).values
+
+
+@torch.no_grad()
+def cover_plus_entropy_score(
+    model: PLANE,
+    x: torch.Tensor,
+    *,
+    cover_scale: float = 1.0,
+    ent_scale: float = 1.0,
+    **_ctx,
+) -> torch.Tensor:
+    """``cover / cover_scale + H(a) / ent_scale`` (scales from digit calib)."""
+    _z, a, Dm = model(x)
+    cover = Dm.min(dim=1).values
+    ent = -(a.clamp_min(1e-12) * a.clamp_min(1e-12).log()).sum(dim=1)
+    return cover / max(float(cover_scale), 1e-8) + ent / max(float(ent_scale), 1e-8)
+
+
+NONCONFORMITY_SCORES: Dict[str, NonconformityFn] = {
+    "affinity_entropy": affinity_entropy_score,
+    "a_ent": affinity_entropy_score,
+    "cover": cover_score,
+    "dm_min": cover_score,
+    "soft_cover": soft_cover_score,
+    "a_max_neg": affinity_max_neg_score,
+    "emb_cover": emb_cover_score,
+    "dm_min+a_ent": cover_plus_entropy_score,
+}
+
+
+def list_nonconformity_scores() -> Tuple[str, ...]:
+    """Registered nonconformity score names (canonical first)."""
+    # Dedup aliases while keeping a stable preferred order.
+    preferred = (
+        "affinity_entropy",
+        "cover",
+        "soft_cover",
+        "a_max_neg",
+        "emb_cover",
+        "dm_min+a_ent",
+        "lda",  # CoverEntropyLDA instance — see that class
+    )
+    return preferred
+
+
+def resolve_nonconformity(score: ScoreSpec) -> Tuple[str, NonconformityFn]:
+    """Return ``(name, fn)`` for a registry key or callable."""
+    if isinstance(score, CoverEntropyLDA):
+        return "lda", score
+    if callable(score) and not isinstance(score, str):
+        name = getattr(score, "__name__", "custom")
+        return str(name), score
+    key = str(score)
+    if key == "lda":
+        raise ValueError(
+            "score='lda' needs a fitted CoverEntropyLDA instance, e.g. "
+            "MondrianCalibrator(score=CoverEntropyLDA().fit(model, X_in, X_ood))"
+        )
+    if key not in NONCONFORMITY_SCORES:
+        known = ", ".join(list_nonconformity_scores())
+        raise ValueError(f"unknown nonconformity score {key!r}; choose from: {known}")
+    return key, NONCONFORMITY_SCORES[key]
+
+
+@torch.no_grad()
+def cover_entropy_features(
+    model: PLANE,
+    x: torch.Tensor,
+    batch_size: int = 1024,
+) -> torch.Tensor:
+    """``(N, 2)`` features ``[min_ℓ ‖x−M_ℓ‖, H(a)]`` on CPU."""
+    model.eval()
+    device = next(model.parameters()).device
+    outs = []
+    for s in range(0, x.shape[0], batch_size):
+        e = min(x.shape[0], s + batch_size)
+        xb = x[s:e].to(device)
+        _z, a, Dm = model(xb)
+        cover = Dm.min(dim=1).values
+        ent = -(a.clamp_min(1e-12) * a.clamp_min(1e-12).log()).sum(dim=1)
+        outs.append(torch.stack([cover, ent], dim=1).cpu())
+    return torch.cat(outs, dim=0)
+
+
+@dataclass
+class CoverEntropyLDA:
+    """Fisher LDA on ``(cover, affinity_entropy)`` → signed-distance nonconformity.
+
+    Fit on in-support points vs an OOD pool (gauss, shuffle, or both). The score
+    is the signed distance to the separating hyperplane in feature space,
+    oriented so **higher ⇒ more OOD**. Pass a fitted instance as
+    ``MondrianCalibrator(score=lda)``.
+
+    Attributes
+    ----------
+    weight : (2,) unit normal of the hyperplane in ``(cover, H)`` space
+    bias : plane offset; score = ``phi · weight + bias``
+    """
+
+    weight: Optional[torch.Tensor] = None
+    bias: float = 0.0
+    batch_size: int = 1024
+
+    @torch.no_grad()
+    def fit(
+        self,
+        model: PLANE,
+        X_in: torch.Tensor,
+        X_ood: torch.Tensor,
+    ) -> "CoverEntropyLDA":
+        """Fit binary Fisher LDA: ``X_in`` (digit) vs ``X_ood`` (noise)."""
+        import numpy as np
+
+        Phi0 = cover_entropy_features(model, X_in.float(), self.batch_size).numpy()
+        Phi1 = cover_entropy_features(model, X_ood.float(), self.batch_size).numpy()
+        mu0, mu1 = Phi0.mean(0), Phi1.mean(0)
+        n0, n1 = max(len(Phi0) - 1, 1), max(len(Phi1) - 1, 1)
+        Sw = n0 * np.cov(Phi0.T) + n1 * np.cov(Phi1.T)
+        Sw = Sw + 1e-6 * np.eye(2)
+        w = np.linalg.solve(Sw, mu1 - mu0)
+        w = w / (np.linalg.norm(w) + 1e-12)
+        mid = 0.5 * (mu0 + mu1)
+        bias = -float(mid @ w)
+        # Orient: OOD mean must score higher than in-support mean.
+        if float(mu1 @ w + bias) < float(mu0 @ w + bias):
+            w = -w
+            bias = -bias
+        self.weight = torch.as_tensor(w, dtype=torch.float32)
+        self.bias = bias
+        return self
+
+    def __call__(self, model: PLANE, x: torch.Tensor, **_ctx) -> torch.Tensor:
+        if self.weight is None:
+            raise RuntimeError("CoverEntropyLDA.fit has not been called")
+        phi = cover_entropy_features(model, x, self.batch_size)  # (B, 2) CPU
+        s = phi @ self.weight + float(self.bias)
+        return s.to(dtype=torch.float32)
+
+    def hyperplane(self) -> Tuple[torch.Tensor, float]:
+        """Return ``(weight, bias)`` for plotting ``w·phi + b = 0``."""
+        if self.weight is None:
+            raise RuntimeError("CoverEntropyLDA.fit has not been called")
+        return self.weight.detach().clone(), float(self.bias)
+
+    def state_dict(self) -> dict:
+        if self.weight is None:
+            raise RuntimeError("CoverEntropyLDA.fit has not been called")
+        return {
+            "weight": self.weight.cpu(),
+            "bias": float(self.bias),
+            "batch_size": int(self.batch_size),
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping) -> "CoverEntropyLDA":
+        obj = cls(batch_size=int(state.get("batch_size", 1024)))
+        obj.weight = torch.as_tensor(state["weight"], dtype=torch.float32)
+        obj.bias = float(state["bias"])
+        return obj
+
+
+def conformal_threshold(s_calib: torch.Tensor, alpha: float) -> float:
+    """One-sided conformal threshold: reject when ``score > q`` at level ``alpha``.
+
+    With sorted calibration scores ``s_(1) ≤ … ≤ s_(n)``,
+    ``q = s_(k)`` for ``k = ⌈(n+1)(1-α)⌉``. If ``k > n``, no finite threshold
+    can guarantee the level (returns ``+inf``).
+    """
+    if not (0.0 < float(alpha) < 1.0):
+        raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+    s = torch.sort(s_calib.detach().float().reshape(-1)).values
+    n = int(s.numel())
+    if n == 0:
+        raise ValueError("empty calibration scores")
+    k = int(torch.ceil(torch.tensor((n + 1) * (1.0 - float(alpha)))).item())
+    if k > n:
+        return float("inf")
+    return float(s[k - 1].item())
+
+
+def make_mondrian_groups(
+    X_digit: torch.Tensor,
+    *,
+    n_gauss: Optional[int] = None,
+    n_shuffle: Optional[int] = None,
+    seed: int = 0,
+    digit_key: str = "digit",
+) -> Dict[str, torch.Tensor]:
+    """Build the default Mondrian taxonomy from a digit calibration pool.
+
+    ``gauss``
+        i.i.d. Gaussian with the same per-feature mean/std as ``X_digit``.
+    ``shuffle``
+        pixel-permuted copies of random digit rows (exact intensity multiset).
+    """
+    X = X_digit.detach().float()
+    n, D = X.shape
+    n_g = int(n if n_gauss is None else n_gauss)
+    n_s = int(n if n_shuffle is None else n_shuffle)
+    g = torch.Generator(device="cpu").manual_seed(int(seed))
+    mu = X.mean(dim=0)
+    sig = X.std(dim=0).clamp_min(1e-8)
+    gauss = mu + sig * torch.randn(n_g, D, generator=g)
+    parents = torch.randint(0, n, (n_s,), generator=g)
+    shuffle = X[parents].clone()
+    for i in range(n_s):
+        shuffle[i] = shuffle[i][torch.randperm(D, generator=g)]
+    return {
+        digit_key: X.cpu(),
+        "gauss": gauss.cpu(),
+        "shuffle": shuffle.cpu(),
+    }
+
+
+@dataclass
+class MondrianCalibrator:
+    """Mondrian (category-conditional) conformal thresholds / p-values.
+
+    Calibrate separately on each group of a taxonomy — by default
+    ``digit``, ``gauss`` (μ/σ-matched noise), and ``shuffle`` (pixel-permuted
+    digits). A test point then gets one p-value **per group**; the prediction
+    set at level ``α`` is ``{g : p_g > α}``.
+
+    The nonconformity score defaults to affinity entropy (best unsupervised
+    separator in the digits hunt); pass ``score=`` to choose another registered
+    name or a custom ``(model, x, **ctx) -> (B,)`` callable.
+
+    Parameters
+    ----------
+    score : str | callable
+        Nonconformity function. Registered names from
+        :func:`list_nonconformity_scores`; default ``"affinity_entropy"``.
+    batch_size : int
+        Forward-pass batching for scoring.
+    """
+
+    score: ScoreSpec = "affinity_entropy"
+    batch_size: int = 1024
+    # Filled by fit:
+    score_name: str = ""
+    s_calib: Dict[str, torch.Tensor] = field(default_factory=dict)
+    weight_hash: Optional[str] = None
+    tau_embed: Optional[float] = None
+    cover_scale: float = 1.0
+    ent_scale: float = 1.0
+    _score_fn: Optional[NonconformityFn] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        name, fn = resolve_nonconformity(self.score)
+        self.score_name = name
+        self._score_fn = fn
+
+    @torch.no_grad()
+    def score_points(self, model: PLANE, X: torch.Tensor) -> torch.Tensor:
+        """Score ``X`` with the configured nonconformity function → ``(N,)``."""
+        assert self._score_fn is not None
+        model.eval()
+        device = next(model.parameters()).device
+        outs = []
+        ctx = {
+            "tau_embed": float(self.tau_embed) if self.tau_embed is not None else 1.0,
+            "cover_scale": self.cover_scale,
+            "ent_scale": self.ent_scale,
+            "z_M": None,
+        }
+        z_M = None
+        if self.score_name in ("emb_cover",):
+            z_M = model._primary_anchor_embeddings(device)
+            ctx["z_M"] = z_M
+        for s in range(0, X.shape[0], self.batch_size):
+            e = min(X.shape[0], s + self.batch_size)
+            xb = X[s:e].to(device)
+            outs.append(self._score_fn(model, xb, **ctx).detach().cpu())
+        return torch.cat(outs, dim=0)
+
+    @torch.no_grad()
+    def fit(
+        self,
+        model: PLANE,
+        groups: Mapping[str, torch.Tensor],
+        *,
+        digit_key: str = "digit",
+    ) -> "MondrianCalibrator":
+        """Calibrate on a mapping ``{group_name: X_group}``.
+
+        Use :func:`make_mondrian_groups` for the default digit/gauss/shuffle
+        taxonomy. ``digit_key`` selects which group supplies the monotone
+        scale stats for composite scores (e.g. ``dm_min+a_ent``).
+        """
+        if not groups:
+            raise ValueError("groups must be a non-empty mapping")
+        model.eval()
+        device = next(model.parameters()).device
+
+        # Embedding temperature from the digit (or first) group — monotone.
+        key0 = digit_key if digit_key in groups else next(iter(groups))
+        X0 = groups[key0].float()
+        z_M = model._primary_anchor_embeddings(device)
+        dists = []
+        for s in range(0, X0.shape[0], self.batch_size):
+            e = min(X0.shape[0], s + self.batch_size)
+            z, _, _ = model(X0[s:e].to(device))
+            dists.append(EuclideanDistance()(z, z_M).reshape(-1).cpu())
+        self.tau_embed = float(torch.cat(dists).median().item())
+
+        # Composite-score scales from the digit group (rank-free within group
+        # once fixed; estimated before any other group is scored).
+        if self.score_name in ("dm_min+a_ent",) and key0 in groups:
+            raw_cover = []
+            raw_ent = []
+            for s in range(0, X0.shape[0], self.batch_size):
+                e = min(X0.shape[0], s + self.batch_size)
+                xb = X0[s:e].to(device)
+                _z, a, Dm = model(xb)
+                raw_cover.append(Dm.min(dim=1).values.cpu())
+                raw_ent.append(
+                    -(a.clamp_min(1e-12) * a.clamp_min(1e-12).log()).sum(1).cpu()
+                )
+            c = torch.cat(raw_cover)
+            h = torch.cat(raw_ent)
+            self.cover_scale = float(c.median().clamp_min(1e-8).item())
+            self.ent_scale = float(h.median().clamp_min(1e-8).item())
+
+        self.s_calib = {}
+        log = get_logger()
+        for name, Xg in groups.items():
+            Xg = Xg.detach().float()
+            if Xg.ndim != 2:
+                raise ValueError(f"group {name!r} must be (n, D), got {tuple(Xg.shape)}")
+            s = self.score_points(model, Xg)
+            self.s_calib[str(name)] = torch.sort(s).values
+            n = int(s.numel())
+            if n < 50:
+                log.warning(
+                    "Mondrian group %r has n_calib=%d; alphas below 1/(n+1)=%.4f "
+                    "are unreachable",
+                    name,
+                    n,
+                    1.0 / (n + 1),
+                )
+        self.weight_hash = model_weight_hash(model)
+        return self
+
+    def fit_from_digits(
+        self,
+        model: PLANE,
+        X_digit: torch.Tensor,
+        *,
+        n_gauss: Optional[int] = None,
+        n_shuffle: Optional[int] = None,
+        seed: int = 0,
+    ) -> "MondrianCalibrator":
+        """Convenience: build default noise groups from digits, then :meth:`fit`."""
+        groups = make_mondrian_groups(
+            X_digit, n_gauss=n_gauss, n_shuffle=n_shuffle, seed=seed
+        )
+        return self.fit(model, groups)
+
+    def group_names(self) -> Tuple[str, ...]:
+        return tuple(self.s_calib.keys())
+
+    def _check(self, model: Optional[PLANE] = None) -> None:
+        if not self.s_calib:
+            raise RuntimeError("MondrianCalibrator.fit has not been called")
+        if model is not None:
+            if self.weight_hash is None:
+                raise RuntimeError("MondrianCalibrator.fit has not been called")
+            h = model_weight_hash(model)
+            if h != self.weight_hash:
+                raise RuntimeError(
+                    "model weights do not match calibration hash — recalibrate"
+                )
+
+    def p_value(
+        self,
+        scores: torch.Tensor,
+        group: str,
+        model: Optional[PLANE] = None,
+        *,
+        sided: str = "upper",
+    ) -> torch.Tensor:
+        """Category-conditional p-value under Mondrian group ``group``.
+
+        ``sided="upper"`` (default)
+            ``p = (1 + #{s_calib ≥ s}) / (n+1)``. Small ``p`` ⇒ score is in the
+            upper tail of that group (classical OOD / "more nonconforming").
+            Use with :meth:`threshold` / :meth:`levels`.
+
+        ``sided="two"``
+            Two-sided rank p-value
+            ``p = min(1, 2 · min(p_lo, p_hi))``. Prefer this for
+            :meth:`prediction_set` when groups sit at different score levels
+            (digits vs noise): a typical digit is *not* in the upper tail of
+            the gauss pool, but it is also not typical *of* gauss.
+        """
+        self._check(model)
+        if group not in self.s_calib:
+            raise KeyError(f"unknown group {group!r}; have {list(self.s_calib)}")
+        if sided not in ("upper", "two"):
+            raise ValueError("sided must be 'upper' or 'two'")
+        s_c = self.s_calib[group]
+        n = s_c.numel()
+        s = scores.detach().cpu().float()
+        # right=False → index of first s_c >= s; #{s_c >= s} = n - idx
+        idx_lo = torch.searchsorted(s_c, s, right=False)
+        idx_hi = torch.searchsorted(s_c, s, right=True)
+        count_ge = n - idx_lo
+        count_le = idx_hi
+        p_hi = (1 + count_ge.float()) / (n + 1)
+        if sided == "upper":
+            return p_hi.to(scores.device)
+        p_lo = (1 + count_le.float()) / (n + 1)
+        p = torch.minimum(p_lo, p_hi).mul(2).clamp_max(1.0)
+        return p.to(scores.device)
+
+    def p_values(
+        self,
+        scores: torch.Tensor,
+        model: Optional[PLANE] = None,
+        *,
+        sided: str = "upper",
+    ) -> Dict[str, torch.Tensor]:
+        """p-value under every calibrated Mondrian group."""
+        return {
+            g: self.p_value(scores, g, model=model, sided=sided) for g in self.s_calib
+        }
+
+    def threshold(self, group: str, alpha: float = 0.05) -> float:
+        """Upper-tailed conformal score threshold for ``group`` at level ``alpha``.
+
+        Reject "looks like ``group`` under an upper-tailed score" when
+        ``score > threshold``. This is the Mondrian *level* used for OOD
+        gating within a category.
+        """
+        self._check()
+        if group not in self.s_calib:
+            raise KeyError(f"unknown group {group!r}; have {list(self.s_calib)}")
+        return conformal_threshold(self.s_calib[group], alpha)
+
+    def levels(
+        self,
+        alphas: Sequence[float] = (0.01, 0.05, 0.1),
+    ) -> Dict[str, Dict[float, float]]:
+        """``{group: {alpha: threshold}}`` — Mondrian calibration levels."""
+        self._check()
+        return {
+            g: {float(a): self.threshold(g, float(a)) for a in alphas}
+            for g in self.s_calib
+        }
+
+    def prediction_set(
+        self,
+        scores: torch.Tensor,
+        alpha: float = 0.05,
+        model: Optional[PLANE] = None,
+        *,
+        sided: str = "two",
+    ) -> list:
+        """Per-point Mondrian prediction sets ``{g : p_g > α}``.
+
+        Defaults to two-sided p-values so categories at different score
+        levels (digit vs noise) separate. Pass ``sided="upper"`` for
+        classical upper-tailed OOD sets.
+
+        Returns a list of length ``B``; each entry is a tuple of accepted
+        group names (empty ⇒ rejected by every calibrated category).
+        """
+        pv = self.p_values(scores, model=model, sided=sided)
+        groups = list(pv.keys())
+        B = int(scores.reshape(-1).numel())
+        out = []
+        for i in range(B):
+            accepted = tuple(g for g in groups if float(pv[g][i]) > float(alpha))
+            out.append(accepted)
+        return out
+
+    def state_dict(self) -> dict:
+        """CPU tensors + metadata for ``torch.save``."""
+        out = {
+            "score_name": self.score_name,
+            "s_calib": {g: s.cpu() for g, s in self.s_calib.items()},
+            "weight_hash": self.weight_hash,
+            "tau_embed": self.tau_embed,
+            "cover_scale": self.cover_scale,
+            "ent_scale": self.ent_scale,
+            "batch_size": self.batch_size,
+        }
+        if isinstance(self._score_fn, CoverEntropyLDA):
+            out["lda"] = self._score_fn.state_dict()
+        return out
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping) -> "MondrianCalibrator":
+        """Restore a calibrator saved by :meth:`state_dict`."""
+        score_name = str(state["score_name"])
+        if score_name == "lda" or "lda" in state:
+            score: ScoreSpec = CoverEntropyLDA.from_state_dict(state["lda"])
+        else:
+            score = score_name
+        cal = cls(score=score, batch_size=int(state.get("batch_size", 1024)))
+        cal.s_calib = {
+            str(g): torch.as_tensor(s).float().cpu()
+            for g, s in dict(state["s_calib"]).items()
+        }
+        cal.weight_hash = state.get("weight_hash")
+        cal.tau_embed = state.get("tau_embed")
+        cal.cover_scale = float(state.get("cover_scale", 1.0))
+        cal.ent_scale = float(state.get("ent_scale", 1.0))
+        return cal

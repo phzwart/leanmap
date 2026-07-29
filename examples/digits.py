@@ -21,6 +21,7 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default=None)
+    ap.add_argument("--min-dist", type=float, default=None, dest="min_dist")
     args = ap.parse_args()
 
     data = load_digits()
@@ -38,9 +39,15 @@ def main() -> None:
         keep = np.concatenate(keep)
         X, y = X[keep], y[keep]
 
+    kw = {}
+    if args.min_dist is not None:
+        kw["min_dist"] = args.min_dist
     result, Z, _ = fit_embed(
-        X, epochs=args.epochs, seed=args.seed, device=args.device
+        X, epochs=args.epochs, seed=args.seed, device=args.device, **kw
     )
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    model_path = OUT_DIR / "digits.pt"
+    result.save(str(model_path))
     out = save_scatter(
         Z,
         y,
@@ -50,9 +57,13 @@ def main() -> None:
         colorbar_label="digit",
     )
     print(f"N={len(X)} d={X.shape[1]} -> embedding {Z.shape}")
-    print(f"pyramid_scales={result.config.pyramid_scales} "
-          f"level_weights={result.config.pyramid_level_weights} "
-          f"coarse_backbone={result.config.pyramid_coarse_backbone}")
+    print(f"min_dist={result.config.min_dist}")
+    print(
+        f"pyramid_scales={result.config.pyramid_scales} "
+        f"level_weights={result.config.pyramid_level_weights} "
+        f"coarse_backbone={result.config.pyramid_coarse_backbone}"
+    )
+    print(f"saved {model_path}")
     print(f"saved {out}")
 
 

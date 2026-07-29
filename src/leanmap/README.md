@@ -226,5 +226,53 @@ which is why they are fit on the training split instead.
 projection onto the nearest centre only when the radii are equal, and a farther
 landmark with a generous radius can be the cheaper move.
 
-Retraining or updating landmarks invalidates calibration; `p_value` raises if
-the model weight hash no longer matches.
+### Mondrian levels (digit / gauss / shuffle)
+
+For category-conditional thresholds, use `MondrianCalibrator` (or
+`leanmap mondrian` on the CLI). By default it scores with **affinity entropy**
+and calibrates three groups — real digits, μ/σ-matched Gaussian noise, and
+pixel-shuffled digits — so you get a threshold (and p-value) per group:
+
+```bash
+leanmap mondrian --list-scores
+leanmap mondrian model.pt calib.npy -o mondrian.pt \
+  --score affinity_entropy --alphas 0.01,0.05,0.1
+leanmap mondrian model.pt --load mondrian.pt \
+  --eval test.npy --eval-out eval.npz --alpha 0.05
+```
+
+```python
+from leanmap import MondrianCalibrator, list_nonconformity_scores
+
+cal = MondrianCalibrator()                        # score="affinity_entropy"
+# cal = MondrianCalibrator(score="cover")         # or soft_cover, dm_min+a_ent, …
+cal.fit_from_digits(model, X_calib)
+levels = cal.levels(alphas=(0.01, 0.05, 0.1))      # {group: {α: threshold}}
+s = cal.score_points(model, X_test)
+p = cal.p_values(s)                               # upper-tailed (OOD)
+sets = cal.prediction_set(s, alpha=0.05)          # two-sided {g : p_g > α}
+```
+
+`list_nonconformity_scores()` lists built-in score names; pass a callable for a
+custom nonconformity function. Persist with `cal.state_dict()` /
+`MondrianCalibrator.from_state_dict`.
+
+**LDA on (cover, entropy).** Fit a Fisher hyperplane on in-support vs OOD
+features and use signed distance as the score (higher ⇒ more OOD):
+
+```python
+from leanmap import CoverEntropyLDA, MondrianCalibrator, make_mondrian_groups
+
+g = make_mondrian_groups(X_train, seed=0)
+lda = CoverEntropyLDA().fit(
+    model, g["digit"], torch.cat([g["gauss"], g["shuffle"]], 0)
+)
+cal = MondrianCalibrator(score=lda)
+cal.fit_from_digits(model, X_calib)
+```
+
+**Notes.** `levels` / `threshold` are upper-tailed (reject group *g* when
+`score > q_g(α)`). `prediction_set` defaults to two-sided p-values so a typical
+digit is not accepted as gauss/shuffle merely because its entropy is *below*
+those pools. Retraining or updating landmarks invalidates calibration;
+`p_value` raises if the model weight hash no longer matches.

@@ -83,13 +83,51 @@ leanmap transform model.pt data.npy -o embedding.npy
 leanmap info model.pt
 ```
 
+### Mondrian conformal levels
+
+Category-conditional thresholds for **digit / gauss / shuffle** (default
+nonconformity: affinity entropy):
+
+```bash
+# list built-in scores
+leanmap mondrian --list-scores
+
+# fit levels from a held-out digit pool; print thresholds; save calibrator
+leanmap mondrian model.pt calib.npy -o mondrian.pt \
+  --score affinity_entropy --alphas 0.01,0.05,0.1
+
+# reuse a saved calibrator and score new points
+leanmap mondrian model.pt --load mondrian.pt \
+  --eval test.npy --eval-out mondrian_eval.npz --alpha 0.05
+```
+
+`calib.npy` is treated as the digit group; Gaussian (μ/σ-matched) and
+pixel-shuffled pools are synthesized automatically. Override the score with
+`--score cover` (landmark cover), `soft_cover`, `dm_min+a_ent`, etc.
+
+Python API: `MondrianCalibrator` in [`src/leanmap/README.md`](src/leanmap/README.md).
+
+## Publication record (embeddings + OOD)
+
+Start here for a complete, reproducible path (parameters, figures, tables,
+frozen models):
+
+**[`publication/GUIDE.md`](publication/GUIDE.md)** · index [`publication/README.md`](publication/README.md)
+
+```bash
+bash publication/reproduce.sh          # refresh tables / copy artefacts
+bash publication/reproduce.sh --fit    # also retrain digits_clean.pt
+```
+
 ## Docs & tests
 
 | doc | content |
 |-----|---------|
+| [`publication/GUIDE.md`](publication/GUIDE.md) | **User guide + publication artefacts** |
 | [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) | Every public knob, defaults, measured ranges |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Paper evidence on four datasets |
-| [`docs/METRICS.md`](docs/METRICS.md) | Battery, nulls, traps |
+| [`docs/METRICS.md`](docs/METRICS.md) | Battery, nulls, traps, Mondrian OOD notes |
+| [`docs/math/leanmap.tex`](docs/math/leanmap.tex) | Mathematics (cover, Mondrian categories, LDA) |
 | [`src/leanmap/README.md`](src/leanmap/README.md) | Design notes (conditioning, pyramid, conformal) |
 | `pytest` under `tests/` | |
 

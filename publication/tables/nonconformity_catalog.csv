@@ -1,0 +1,5 @@
+score,definition,needs_fit,role
+cover,min_l ||x-M_l||,no,ambient landmark support
+affinity_entropy,H(a)=-sum a_l log a_l,no,default Mondrian nonconformity
+lda,"signed distance to Fisher LDA on (cover, H)",yes (CoverEntropyLDA),recommended digit-vs-noise score
+dm_min+a_ent,cover/med + H/med,scales from digit calib,simple composite

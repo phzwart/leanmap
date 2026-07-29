@@ -1,0 +1,15 @@
+# Optional Z-space trash basin (shuffle + Gaussian). Not recommended for
+# maximizing digit-vs-noise conformal TPR — see tables/ood_detection.md.
+# Primary neighbour graph remains real digits only.
+
+fit:
+  script: examples/digits_ood_basin.py
+  command: >
+    python examples/digits_ood_basin.py --device cuda --ood shuffle,gauss
+    --epochs 80 --seed 0 --min-dist 0.1
+    --frac-dec 0.5 --frac-gauss 0.5
+    --lambda-basin 1.0 --lambda-stay 0.5 --aux-steps 30
+  artefact: examples/out/digits_ood_basin_dual.pt
+
+role: park synthetic junk at a learned embedding anchor; improves visible
+  separation of noise *types* in Z; weakens ambient cover detection of Gaussian noise.

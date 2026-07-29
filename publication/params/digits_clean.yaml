@@ -1,0 +1,69 @@
+# Canonical digits recipe: interpretable 2-D embedding + conformal OOD.
+# Dataset: sklearn.datasets.load_digits  (N=1797, D=64, 8×8 pixels)
+# Reproduce: bash publication/reproduce.sh
+
+dataset:
+  name: sklearn_digits
+  N: 1797
+  D: 64
+  seed: 0
+
+fit:
+  script: examples/digits.py
+  command: python examples/digits.py --device cuda --min-dist 0.1 --epochs 80 --seed 0
+  # Or equivalently via PLANEConfig.for_scale(N) with overrides below.
+  config:
+    d_out: 2
+    width: 384
+    depth: 3
+    n_landmarks: 128
+    n_neighbors: 15
+    local_connectivity: 1
+    epochs: 80
+    lr: 0.02
+    min_dist: 0.1          # tighter class packing than for_scale default 0.5
+    pca_skip: false
+    lambda_geo: 0.15
+    lambda_lm: 0.1
+    lambda_frame: 0.0
+    lambda_density: 1.0
+    pyramid_scales: 3
+    pyramid_level_weights: [1.0, 2.0, 8.0]
+    pyramid_coarse_backbone: 1.0
+    n_negatives: 5
+    learn_landmarks: true
+    learn_tau: true
+    tau_scale: 1.0
+    calib_max: 200
+    dist_fn: l2
+  artefact: publication/artefacts/models/digits_clean.pt
+
+splits:
+  # Used for LDA fit + Mondrian calib / eval in publication tables
+  n_train: 800
+  n_calib: 200
+  n_test: 400
+  seed: 0
+
+ood_pools:
+  gauss: per-feature N(mu, sigma) matched to source rows
+  shuffle: pixel permutation of source rows
+  n_ood_eval: 400
+  seed_train_ood: 0
+  seed_calib_ood: 1
+  seed_eval_ood: 9
+
+mondrian:
+  default_score: affinity_entropy
+  recommended_score: lda          # CoverEntropyLDA on (cover, H)
+  alphas: [0.01, 0.05, 0.1]
+  alpha_eval: 0.05
+  artefacts:
+    affinity_entropy: publication/artefacts/models/mondrian_affinity_entropy.pt
+    lda: publication/artefacts/models/mondrian_lda_clean.pt
+
+notes:
+  - Cover score from embed() is ambient min landmark distance; use for simple OOD.
+  - Affinity entropy / LDA are preferred for μ/σ-matched Gaussian noise.
+  - Dual trash-basin training is optional for Z-space junk parking; it does not
+    improve digit-vs-noise conformal detection (see tables/ood_detection.md).

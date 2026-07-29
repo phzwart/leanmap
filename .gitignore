@@ -43,6 +43,11 @@ htmlcov/
 *.npz
 !**/fixtures/**
 
+# Publication record: keep frozen models and figure atlas under version control
+!publication/artefacts/**/*.pt
+!publication/artefacts/**/*.png
+!publication/artefacts/**/*.npz
+
 # Local research only (not part of the release package)
 legacy/
 train.log

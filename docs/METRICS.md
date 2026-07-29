@@ -132,11 +132,27 @@ paired bootstrap CIs.
 
 ## OOD / conformal
 
-Primary score is landmark **cover** `min_ℓ ||x − M_ℓ||`. Conformal p-values are
-calibrated on a held-out split of real data. Scope limits:
+**Pooled cover (default artefact).** Training saves a single conformal calibrator
+on landmark **cover** `min_ℓ ||x − M_ℓ||` (held-out real points). Scope limits:
 
 1. The test is on the cover distribution. A shift that leaves cover unchanged
    (sliding along the manifold near a landmark) is invisible.
 2. It answers "near the landmark support?", not "have I seen this exact point?".
 
 Map distance is a weak detector in 2-D; ambient cover is the capability column.
+
+**Mondrian levels (digit / gauss / shuffle).** For category-conditional
+thresholds use `MondrianCalibrator` or the CLI. Default nonconformity is
+**affinity entropy** `H(a)` (better than cover alone on μ/σ-matched Gaussian
+noise in the digits hunt); `--score cover` restores landmark cover.
+
+```bash
+leanmap mondrian model.pt calib.npy -o mondrian.pt --score affinity_entropy
+leanmap mondrian --list-scores
+```
+
+Groups: real calib rows (`digit`), μ/σ-matched Gaussian (`gauss`), pixel-shuffled
+copies (`shuffle`). `levels` gives upper-tailed thresholds per group at each α;
+`prediction_set` uses two-sided p-values so categories at different score levels
+separate. See [`src/leanmap/README.md`](../src/leanmap/README.md#mondrian-levels-digit--gauss--shuffle)
+Publication guide and frozen artefacts: [`publication/GUIDE.md`](../publication/GUIDE.md).

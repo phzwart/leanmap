@@ -297,3 +297,91 @@ def test_cover_score_routes_through_the_support():
     cal = ConformalCalibrator(support=sup)
     cal.fit(model, X[:200])
     assert torch.allclose(cal.cover_score(model, X[200:]), sup.score(X[200:]))
+
+
+# ---------------------------------------------------------------------------
+# Mondrian calibration (digit / gauss / shuffle)
+# ---------------------------------------------------------------------------
+
+
+def test_mondrian_default_score_is_affinity_entropy():
+    from leanmap.conformal import MondrianCalibrator, list_nonconformity_scores
+
+    assert "affinity_entropy" in list_nonconformity_scores()
+    cal = MondrianCalibrator()
+    assert cal.score_name == "affinity_entropy"
+
+
+def test_mondrian_levels_and_pvalues():
+    from leanmap.conformal import MondrianCalibrator, make_mondrian_groups
+
+    model, X = _model(n=500, D=6, L=12)
+    groups = make_mondrian_groups(X[:200], n_gauss=200, n_shuffle=200, seed=0)
+    cal = MondrianCalibrator(score="affinity_entropy")
+    cal.fit(model, groups)
+    levels = cal.levels(alphas=(0.05, 0.1))
+    assert set(levels) == {"digit", "gauss", "shuffle"}
+    for g in levels:
+        # smaller α ⇒ more extreme (higher) threshold for upper-tailed scores
+        assert levels[g][0.05] >= levels[g][0.1]
+
+    # Fresh digit holdout is exchangeable with the digit calibration pool.
+    s_hold = cal.score_points(model, X[200:350])
+    p_hold = cal.p_value(s_hold, "digit", model=model)
+    assert abs(float((p_hold <= 0.1).float().mean()) - 0.1) < 0.08
+
+    # Self-consistency: gauss calib scores against the gauss group.
+    s_g = cal.s_calib["gauss"]
+    p_g = cal.p_value(s_g, "gauss")
+    assert float((p_g > 0.05).float().mean()) > 0.85
+
+
+def test_mondrian_score_choice_and_roundtrip():
+    from leanmap.conformal import MondrianCalibrator
+
+    model, X = _model(n=300, D=6, L=8)
+    cal = MondrianCalibrator(score="cover")
+    cal.fit_from_digits(model, X[:120], n_gauss=120, n_shuffle=120, seed=1)
+    assert cal.score_name in ("cover", "dm_min")
+    state = cal.state_dict()
+    cal2 = MondrianCalibrator.from_state_dict(state)
+    assert cal2.group_names() == cal.group_names()
+    s = cal.score_points(model, X[120:160])
+    p1 = cal.p_value(s, "digit", model=model)
+    p2 = cal2.p_value(s, "digit", model=model)
+    assert torch.allclose(p1, p2)
+
+
+def test_mondrian_prediction_set():
+    from leanmap.conformal import MondrianCalibrator
+
+    model, X = _model(n=400, D=6, L=10)
+    cal = MondrianCalibrator()
+    cal.fit_from_digits(model, X[:150], seed=2)
+    s = cal.score_points(model, X[150:160])
+    sets = cal.prediction_set(s, alpha=0.05, model=model)
+    assert len(sets) == 10
+    assert all(isinstance(t, tuple) for t in sets)
+
+
+def test_cover_entropy_lda_nonconformity():
+    from leanmap.conformal import CoverEntropyLDA, MondrianCalibrator, make_mondrian_groups
+
+    model, X = _model(n=400, D=6, L=10)
+    groups = make_mondrian_groups(X[:150], n_gauss=150, n_shuffle=150, seed=0)
+    X_ood = torch.cat([groups["gauss"], groups["shuffle"]], 0)
+    lda = CoverEntropyLDA().fit(model, groups["digit"], X_ood)
+    w, _b = lda.hyperplane()
+    assert w.shape == (2,)
+    assert abs(float(w.norm()) - 1.0) < 1e-4
+    # Orientation is defined on the fit pools themselves.
+    s_in = lda(model, groups["digit"])
+    s_ood = lda(model, X_ood)
+    assert float(s_ood.mean()) > float(s_in.mean())
+    cal = MondrianCalibrator(score=lda)
+    cal.fit(model, {k: groups[k][:80] for k in groups})
+    state = cal.state_dict()
+    cal2 = MondrianCalibrator.from_state_dict(state)
+    assert cal2.score_name == "lda"
+    s = cal.score_points(model, X[200:220])
+    assert torch.allclose(s, cal2.score_points(model, X[200:220]), atol=1e-5)

@@ -28,10 +28,18 @@ from .conditioning import (
 )
 from .config import PLANEConfig
 from .conformal import (
+    MONDRIAN_GROUPS,
+    NONCONFORMITY_SCORES,
     ConformalCalibrator,
+    CoverEntropyLDA,
     LandmarkSupport,
+    MondrianCalibrator,
     bh_reject,
+    conformal_threshold,
+    cover_entropy_features,
     geometry_consistency_score,
+    list_nonconformity_scores,
+    make_mondrian_groups,
 )
 from .distance import (
     CallableDistance,
@@ -166,7 +174,15 @@ __all__ = [
     "fit_pca_weight",
     "ConformalCalibrator",
     "LandmarkSupport",
+    "MondrianCalibrator",
+    "CoverEntropyLDA",
+    "MONDRIAN_GROUPS",
+    "NONCONFORMITY_SCORES",
     "geometry_consistency_score",
+    "cover_entropy_features",
+    "conformal_threshold",
+    "list_nonconformity_scores",
+    "make_mondrian_groups",
     "bh_reject",
     "fit_negative_space",
     "calibrate_novelty",
