@@ -35,7 +35,7 @@ from metrics_run import compute_metrics, write_json  # noqa: E402
 
 from _demo import fit_embed, save_density, save_scatter, save_shepard  # noqa: E402
 
-DEFAULT_PARQUET = Path.home() / "Projects/SASDBD/data/catalog/pr_profiles.parquet"
+DEFAULT_PARQUET = Path.home() / "Desktop" / "pr_profiles.parquet"
 DEFAULT_OUT = _ROOT / "runs" / "sasbdb_pr"
 META_COLS = ("sasbdb_code", "dmax", "rg_pr", "rg_guinier", "length_unit")
 
@@ -277,20 +277,27 @@ class LiveRecorder:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--parquet", type=Path, default=DEFAULT_PARQUET)
-    ap.add_argument("--column", default="pr", choices=("pr", "pr_norm"))
+    ap.add_argument("--column", default="pr_norm", choices=("pr", "pr_norm"))
     ap.add_argument(
         "--normalize",
         default="unit-sum",
         choices=("unit-sum", "unit-max", "unit-l2", "raw"),
     )
-    # With unit-sum profiles each row is a probability vector over relative-r
-    # bins, so L1 is total-variation distance (up to a factor 2) -- the natural
-    # metric on distributions, and unlike L2 it does not let a single tall bin
-    # dominate the comparison.
+    # pr_norm rows are discrete distributions on equal-width relative-r bins;
+    # 1-D Wasserstein-1 (CDF L1) is the natural transport metric on that line.
+    # L1 remains available as total-variation (up to a factor 2).
     ap.add_argument(
         "--metric",
-        default="l1",
-        choices=("l1", "l2", "jensenshannon", "cosine", "correlation", "braycurtis"),
+        default="wasserstein1d",
+        choices=(
+            "wasserstein1d",
+            "l1",
+            "l2",
+            "jensenshannon",
+            "cosine",
+            "correlation",
+            "braycurtis",
+        ),
     )
     # P(r) profiles sit in a narrow shell: the default temperature (mean distance
     # to the 32 nearest landmarks) leaves the softmax near-uniform, perplexity
@@ -320,6 +327,8 @@ def main() -> None:
     # i.e. N / n_landmarks points, so sweeping this moves the residual's
     # correlation length if the experts are the cause and leaves it alone if not.
     ap.add_argument("--n-landmarks", type=int, default=None)
+    ap.add_argument("--min-dist", type=float, default=None, dest="min_dist")
+    ap.add_argument("--lambda-geo", type=float, default=None, dest="lambda_geo")
     ap.add_argument("--n", type=int, default=0, help="random subsample size (0 = all)")
     ap.add_argument("--epochs", type=int, default=240)
     ap.add_argument("--seed", type=int, default=0)
@@ -420,6 +429,8 @@ def main() -> None:
         callbacks=[recorder] if recorder else None,
         lambda_density=args.lambda_density,
         d_out=args.d_out,
+        min_dist=args.min_dist,
+        lambda_geo=args.lambda_geo,
         **({} if args.n_landmarks is None else {"n_landmarks": args.n_landmarks}),
     )
 

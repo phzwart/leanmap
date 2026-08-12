@@ -23,6 +23,7 @@ REGISTRY = [
     "canberra",
     "braycurtis",
     "jensenshannon",
+    "wasserstein1d",
 ]
 
 
@@ -114,6 +115,22 @@ def test_correlation_matches_scipy():
     for i in range(A.shape[0]):
         for j in range(B.shape[0]):
             ref[i, j] = scipy_corr(A[i], B[j])
+    assert np.allclose(d, ref, atol=1e-5)
+
+
+def test_wasserstein1d_matches_scipy():
+    from scipy.stats import wasserstein_distance
+
+    rng = np.random.default_rng(1)
+    A = rng.random((12, 16), dtype=np.float32)
+    B = rng.random((9, 16), dtype=np.float32)
+    pos = np.arange(A.shape[1], dtype=np.float64)
+    spec = get_metric("wasserstein1d")
+    d = spec.fn(torch.from_numpy(A), torch.from_numpy(B)).numpy()
+    ref = np.empty_like(d)
+    for i in range(A.shape[0]):
+        for j in range(B.shape[0]):
+            ref[i, j] = wasserstein_distance(pos, pos, A[i], B[j])
     assert np.allclose(d, ref, atol=1e-5)
 
 

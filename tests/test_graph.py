@@ -678,3 +678,122 @@ def test_default_squash_is_q99():
     from leanmap.config import PLANEConfig
 
     assert PLANEConfig().pyramid_squash == "rational_q99"
+
+
+def _brute_l2_knn(X: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact L2 kNN excluding self, matching leanmap's DistanceFn convention."""
+    D = EuclideanDistance()(X, X)
+    D = D.clone()
+    D.fill_diagonal_(float("inf"))
+    dist, idx = torch.topk(D, k=k, dim=1, largest=False)
+    return idx.to(torch.int64), dist.to(torch.float32)
+
+
+def test_precomputed_knn_injected_into_graph():
+    torch.manual_seed(0)
+    X = torch.randn(40, 4)
+    k = 5
+    knn_idx, knn_dist = _brute_l2_knn(X, k)
+    metric = wrap_metric("l2", X=X, n_neighbors=k, seed=0)
+    graph, *_ = build_graph(
+        X,
+        metric,
+        n_neighbors=k,
+        n_landmarks=8,
+        dedup=False,
+        seed=0,
+        knn_mode="brute",
+        precomputed_knn=(knn_idx, knn_dist),
+    )
+    assert graph.stats.knn_mode == "precomputed"
+    assert graph.stats.knn_recall is None
+    assert torch.equal(graph.knn_idx, knn_idx.cpu())
+    # Fuzzy edges exist and cover the supplied neighborhood width.
+    assert graph.edges.shape[0] > 0
+    assert graph.knn_idx.shape == (X.shape[0], k)
+
+
+def test_precomputed_knn_requires_dedup_false():
+    torch.manual_seed(0)
+    X = torch.randn(20, 3)
+    knn_idx, knn_dist = _brute_l2_knn(X, 3)
+    metric = wrap_metric("l2", X=X, n_neighbors=3, seed=0)
+    with pytest.raises(ValueError, match="dedup=False"):
+        build_graph(
+            X,
+            metric,
+            n_neighbors=3,
+            n_landmarks=4,
+            dedup=True,
+            seed=0,
+            precomputed_knn=(knn_idx, knn_dist),
+        )
+
+
+def test_precomputed_knn_rejects_bad_shapes_self_and_oob():
+    from leanmap.graph import validate_precomputed_knn
+
+    n, k = 10, 3
+    idx = torch.randint(0, n, (n, k))
+    dist = torch.rand(n, k)
+    # force a self-neighbor
+    idx = idx.clone()
+    idx[0, 0] = 0
+    with pytest.raises(ValueError, match="self-neighbors"):
+        validate_precomputed_knn(idx, dist, n)
+
+    idx2 = torch.randint(0, n, (n, k))
+    idx2[1, 0] = n  # OOB
+    with pytest.raises(ValueError, match=r"\[0,"):
+        validate_precomputed_knn(idx2, torch.rand(n, k), n)
+
+    with pytest.raises(ValueError, match="shape mismatch"):
+        validate_precomputed_knn(torch.zeros(n, k, dtype=torch.long), torch.rand(n, k + 1), n)
+
+    with pytest.raises(ValueError, match="rows"):
+        validate_precomputed_knn(torch.zeros(n - 1, k, dtype=torch.long), torch.rand(n - 1, k), n)
+
+
+def test_fit_precomputed_knn_requires_x_calib():
+    from leanmap import PLANEConfig, fit
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(60, 4)).astype(np.float32)
+    Xt = torch.as_tensor(X)
+    knn_idx, knn_dist = _brute_l2_knn(Xt, 5)
+    cfg = PLANEConfig.for_scale(len(X))
+    cfg.epochs = 1
+    cfg.dedup = False
+    cfg.n_landmarks = 8
+    cfg.width, cfg.depth = 32, 2
+    cfg.batch_edges = 128
+    cfg.device = "cpu"
+    with pytest.raises(ValueError, match="X_calib"):
+        fit(X, "l2", config=cfg, precomputed_knn=(knn_idx, knn_dist))
+
+
+def test_fit_precomputed_knn_end_to_end():
+    from leanmap import PLANEConfig, fit
+
+    rng = np.random.default_rng(1)
+    X_all = rng.normal(size=(80, 4)).astype(np.float32)
+    X_train, X_cal = X_all[:60], X_all[60:]
+    Xt = torch.as_tensor(X_train)
+    knn_idx, knn_dist = _brute_l2_knn(Xt, 5)
+    cfg = PLANEConfig.for_scale(len(X_train))
+    cfg.epochs = 2
+    cfg.dedup = False
+    cfg.n_landmarks = 8
+    cfg.width, cfg.depth = 32, 2
+    cfg.batch_edges = 128
+    cfg.n_neighbors = 5
+    cfg.device = "cpu"
+    result = fit(
+        X_train,
+        "l2",
+        config=cfg,
+        X_calib=X_cal,
+        precomputed_knn=(knn_idx, knn_dist),
+    )
+    Z, _ = result.model.embed(Xt, return_score=False)
+    assert Z.shape == (60, 2)

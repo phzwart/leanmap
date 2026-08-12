@@ -380,6 +380,7 @@ def fit(
     factors: Optional[Sequence[ConditioningFactor]] = None,
     encoder_view: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     init_state_dict: Optional[dict] = None,
+    precomputed_knn: Optional[Tuple[Any, Any]] = None,
 ) -> PLANEResult:
     """Fit PLANE. Calibration split is taken from raw ``X`` before the graph.
 
@@ -394,6 +395,14 @@ def fit(
         Maps ambient ``x`` → backbone features. Use when ambient packs multiple
         vectors per item (e.g. metric features + conditioning view) and only a
         slice should enter the FiLM encoder.
+    precomputed_knn : (knn_idx, knn_dist), optional
+        Caller-supplied kNN over the **training** matrix (same rows as ``X``
+        when ``X_calib`` is given, or as the train split otherwise). Shapes
+        ``(N_train, k)`` int64 / float32. Edge distances may use a different
+        metric than ``dist_fn`` (landmarks / ε-net still use ``dist_fn``).
+        Requires ``config.dedup=False``. When set, pass ``X_calib`` explicitly
+        so calib is not carved out of ``X`` — the caller owns the train-row
+        indexing of the supplied graph.
     """
     from .conditioning import identity_view
     from .landmarks import assign_buckets, init_anchors
@@ -406,6 +415,19 @@ def fit(
     device = resolve_device(config.device)
     X_all = torch.as_tensor(ensure_2d_float32(X), dtype=torch.float32)
     enc_view = encoder_view if encoder_view is not None else (lambda t: t)
+
+    if precomputed_knn is not None:
+        if config.dedup:
+            raise ValueError(
+                "precomputed_knn requires config.dedup=False so neighbor indices "
+                "align with ambient training rows"
+            )
+        if X_calib is None:
+            raise ValueError(
+                "precomputed_knn requires an explicit calibration matrix "
+                "(X_calib=...); calib must not be carved out of X because the "
+                "caller owns the train-row indexing of the supplied graph"
+            )
 
     # 2. Split calibration first
     N = X_all.shape[0]
@@ -520,6 +542,7 @@ def fit(
         fps_geodesic=config.landmark_geodesic,
         fps_geodesic_k=LANDMARK_GEODESIC_K,
         fps_poisson=config.landmark_poisson,
+        precomputed_knn=precomputed_knn,
     )
     graph = graphs[0]  # finest graph: reps/negatives/knn_idx/stats live here
 

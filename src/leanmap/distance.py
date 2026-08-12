@@ -150,6 +150,38 @@ def _jensenshannon(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _unit_mass(X: torch.Tensor) -> torch.Tensor:
+    """Non-negative L1-normalised rows; all-zero → uniform (so ``d(a,a)==0``)."""
+    eps = 1e-12
+    Xn = X.clamp_min(0.0)
+    total = Xn.sum(dim=1, keepdim=True)
+    D = Xn.shape[1]
+    return torch.where(
+        total > eps, Xn / total.clamp_min(eps), torch.full_like(Xn, 1.0 / D)
+    )
+
+
+def _wasserstein1d(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """1-D Wasserstein-1 between rows as histograms on a uniform bin grid.
+
+    After unit-mass normalisation, ``W₁(p,q) = Σ_{k=0}^{D-2} |F_p(k) − F_q(k)|``
+    with bin centres at ``0, 1, …, D−1`` (unit spacing). This is the closed form
+    for discrete measures on the line, and matches ``scipy.stats.wasserstein_distance``
+    on the same support. Natural for equal-width P(r) / density profiles.
+    """
+    A_n = _unit_mass(A)
+    B_n = _unit_mass(B)
+    # Drop the final CDF entry (always 1); spacing between consecutive bins is 1.
+    Fa = A_n.cumsum(dim=1)[:, :-1]
+    Fb = B_n.cumsum(dim=1)[:, :-1]
+    n, d = Fa.shape
+    m = Fb.shape[0]
+    out = torch.empty(n, m, dtype=torch.float32, device=A.device)
+    for s, e in chunk_ranges(m, max(1, 65536 // max(d, 1))):
+        out[:, s:e] = (Fa.unsqueeze(1) - Fb[s:e].unsqueeze(0)).abs().sum(dim=-1)
+    return out
+
+
 def _correlation(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """``1 − pearson(x, y)`` per pair (scipy.spatial.distance.correlation)."""
     # float64 for self-distance numerical zeros under float32 pearson.
@@ -189,6 +221,7 @@ BUILTIN_FNS: dict[str, DistanceFn] = {
     "canberra": CallableDistance(_canberra),
     "braycurtis": CallableDistance(_braycurtis),
     "jensenshannon": CallableDistance(_jensenshannon),
+    "wasserstein1d": CallableDistance(_wasserstein1d),
 }
 
 

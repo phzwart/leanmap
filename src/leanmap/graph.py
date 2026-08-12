@@ -97,6 +97,74 @@ class Graph:
     stats: GraphStats
 
 
+PrecomputedKNN = Tuple[torch.Tensor, torch.Tensor]  # (knn_idx, knn_dist) or see validate
+
+
+def validate_precomputed_knn(
+    knn_idx: torch.Tensor,
+    knn_dist: torch.Tensor,
+    n: int,
+    *,
+    n_neighbors: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Validate a caller-supplied kNN and optionally truncate to ``n_neighbors``.
+
+    Parameters
+    ----------
+    knn_idx : (N, k) int64
+        Neighbor indices into the same row space as the training matrix.
+    knn_dist : (N, k) float
+        Non-negative finite edge distances (any metric; need not match ambient).
+    n : int
+        Expected number of rows (``R`` when ``dedup=False``).
+    n_neighbors : int, optional
+        If set and ``k > n_neighbors``, truncate columns to ``n_neighbors``.
+        If ``k < n_neighbors``, the supplied ``k`` is kept.
+
+    Returns
+    -------
+    knn_idx, knn_dist, k
+        Contiguous tensors on CPU (float32 distances, int64 indices) and width.
+    """
+    if not isinstance(knn_idx, torch.Tensor):
+        knn_idx = torch.as_tensor(knn_idx)
+    if not isinstance(knn_dist, torch.Tensor):
+        knn_dist = torch.as_tensor(knn_dist)
+    if knn_idx.ndim != 2 or knn_dist.ndim != 2:
+        raise ValueError(
+            f"precomputed_knn requires 2-D (N, k) tensors; got idx={tuple(knn_idx.shape)} "
+            f"dist={tuple(knn_dist.shape)}"
+        )
+    if knn_idx.shape != knn_dist.shape:
+        raise ValueError(
+            f"precomputed_knn idx/dist shape mismatch: {tuple(knn_idx.shape)} vs "
+            f"{tuple(knn_dist.shape)}"
+        )
+    if knn_idx.shape[0] != n:
+        raise ValueError(
+            f"precomputed_knn has {knn_idx.shape[0]} rows but training matrix has {n}"
+        )
+    k = int(knn_idx.shape[1])
+    if k < 1:
+        raise ValueError("precomputed_knn must have k >= 1 neighbors")
+    if n_neighbors is not None and k > int(n_neighbors):
+        k = int(n_neighbors)
+        knn_idx = knn_idx[:, :k]
+        knn_dist = knn_dist[:, :k]
+    knn_idx = knn_idx.detach().to(dtype=torch.int64, device="cpu").contiguous()
+    knn_dist = knn_dist.detach().to(dtype=torch.float32, device="cpu").contiguous()
+    if not torch.isfinite(knn_dist).all():
+        raise ValueError("precomputed_knn distances must be finite")
+    if (knn_dist < 0).any():
+        raise ValueError("precomputed_knn distances must be non-negative")
+    if (knn_idx < 0).any() or (knn_idx >= n).any():
+        raise ValueError(f"precomputed_knn indices must lie in [0, {n})")
+    rows = torch.arange(n, dtype=torch.int64).unsqueeze(1).expand_as(knn_idx)
+    if (knn_idx == rows).any():
+        raise ValueError("precomputed_knn must not include self-neighbors")
+    return knn_idx, knn_dist, k
+
+
 def _intrinsic_dim_levina_bickel(
     X: torch.Tensor, dist_fn: DistanceFn, k: int = 10, seed: int = 0
 ) -> float:
@@ -1110,6 +1178,7 @@ def build_graph(
     fps_geodesic: bool = False,
     fps_geodesic_k: Optional[int] = None,
     fps_poisson: bool = False,
+    precomputed_knn: Optional[Tuple[Any, Any]] = None,
 ) -> Tuple[Graph, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Full graph pipeline on the training split.
 
@@ -1117,11 +1186,13 @@ def build_graph(
     ----------
     X : (N, D) float32
     metric : MetricSpec
-        Should already have ``natural_scale`` fitted. Used for edge distances,
-        ε-net radii, and (by default) landmark FPS.
+        Should already have ``natural_scale`` fitted. Used for landmark FPS,
+        ε-net radii, and (when ``precomputed_knn`` is None) kNN edge distances.
     dedup : bool
         If True (default), collapse near-duplicates with an ε-net before kNN.
         If False, force ``epsilon=0`` and keep ``R == N``.
+        Must be False when ``precomputed_knn`` is supplied (indices refer to
+        ambient rows).
     extra_ivf_anchors : sequence of (view_fn, view_metric, M_f), optional
         Additional factor anchors for joint IVF shortlists (union of per-factor
         top-c buckets).
@@ -1132,6 +1203,11 @@ def build_graph(
         ``metric``.
     fps_view_metric : DistanceFn, optional
         Metric on ``fps_view`` outputs (default: Euclidean).
+    precomputed_knn : (knn_idx, knn_dist) or None
+        Optional caller-supplied kNN. ``knn_idx`` / ``knn_dist`` are ``(N, k)``
+        into the same row space as ``X``. Edge distances may use a different
+        metric than ``metric`` (e.g. EMD-rescored edges with an L1 ambient
+        metric for landmarks). Requires ``dedup=False``.
 
     Returns
     -------
@@ -1143,6 +1219,12 @@ def build_graph(
     log = get_logger()
     dist_fn: DistanceFn = metric  # MetricSpec.__call__ applies natural_scale
     stats = GraphStats(dedup=bool(dedup))
+
+    if precomputed_knn is not None and dedup:
+        raise ValueError(
+            "precomputed_knn requires dedup=False so neighbor indices align with "
+            "ambient rows (R == N)"
+        )
 
     if not metric.is_true_metric:
         log.info(
@@ -1253,20 +1335,43 @@ def build_graph(
     if mode == "auto" and ivf_view_assign is not None:
         mode = "ivf"
 
-    # 4.4 kNN — exact distances via scoring metric; IVF shortlist via landmark tree
-    knn_dist, knn_idx, knn_info = knn_representatives(
-        X_rep,
-        dist_fn,
-        k=n_neighbors,
-        mode=mode,
-        landmarks=landmarks_for_ivf,
-        assign_topc=rep_topc,
-        c_search=c_search,
-        metric=metric,
-        extra_assign_topc=extra_assign_topc,
-    )
-    stats.knn_mode = knn_info.get("mode", knn_mode)
-    stats.knn_recall = knn_info.get("recall")
+    # 4.4 kNN — caller-supplied, or exact distances via scoring metric
+    if precomputed_knn is not None:
+        raw_idx, raw_dist = precomputed_knn
+        R = int(X_rep.shape[0])
+        if R != int(X.shape[0]):
+            raise ValueError(
+                "precomputed_knn requires R == N (dedup=False); got "
+                f"R={R}, N={int(X.shape[0])}"
+            )
+        knn_idx, knn_dist, k_eff = validate_precomputed_knn(
+            raw_idx, raw_dist, R, n_neighbors=n_neighbors
+        )
+        knn_idx = knn_idx.to(device=X.device)
+        knn_dist = knn_dist.to(device=X.device)
+        if k_eff != int(n_neighbors):
+            log.info(
+                "precomputed_knn: using k=%d (config n_neighbors=%d)",
+                k_eff,
+                int(n_neighbors),
+            )
+        stats.knn_mode = "precomputed"
+        stats.knn_recall = None
+        stats.extra["precomputed_k"] = int(k_eff)
+    else:
+        knn_dist, knn_idx, knn_info = knn_representatives(
+            X_rep,
+            dist_fn,
+            k=n_neighbors,
+            mode=mode,
+            landmarks=landmarks_for_ivf,
+            assign_topc=rep_topc,
+            c_search=c_search,
+            metric=metric,
+            extra_assign_topc=extra_assign_topc,
+        )
+        stats.knn_mode = knn_info.get("mode", knn_mode)
+        stats.knn_recall = knn_info.get("recall")
 
     # 4.5 smooth
     rho, sigma, sdiag = smooth_knn(knn_dist, local_connectivity=local_connectivity)

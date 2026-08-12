@@ -86,6 +86,7 @@ from .graph import (
     build_graph_pyramid,
     smooth_knn,
     union_assign_topc,
+    validate_precomputed_knn,
 )
 from .landmarks import (
     AnchorAffinity,
@@ -167,6 +168,7 @@ __all__ = [
     "Representatives",
     "build_graph",
     "build_graph_pyramid",
+    "validate_precomputed_knn",
     "smooth_knn",
     "union_assign_topc",
     "FiLMEncoder",

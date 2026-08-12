@@ -7,6 +7,13 @@ Toy demos and the exploratory paper harness.
 | `s_curve.py` | Standalone S-curve fit / plot |
 | `swiss_roll.py` | Standalone swiss-roll fit / plot |
 | `digits.py` | Standalone 8×8 digits fit / plot |
+| `digits_emd.py` | Digits with L1-tree → torchemd EMD-rescored kNN |
+| `cellcycle_emd.py` | CellCycle merged subset → zarr + L1 (or EMD) kNN + leanmap |
+| `cellcycle_explorer.py` | Dash explorer: latent scatter + cell image inspection |
+| `cellcycle_lejepa.py` | Cheap LeJEPA on Ch3/4/6 → features → leanmap |
+| `cellcycle_celldino.py` | Frozen Cell-DINO (CP ViT-S/8; 3→5ch zero-pad) → leanmap |
+| `pistachio_ftir.py` | FTIR spectra (cosine) → leanmap with per-epoch frames |
+| `pistachio_ftir_explorer.py` | Dash explorer: latent / spatial / spectrum (+ UMAP) |
 | `digits_mondrian.py` | Mondrian levels (digit / gauss / shuffle) on digits |
 | `digits_ood_basin.py` | Digits + OOD basin (shuffle / gauss junk parks) |
 | `exploratory/` | Paper battery: feeds, sweeps, metrics, EMD, conformal |
@@ -20,6 +27,7 @@ Paper documentation lives under [`docs/`](../docs/):
 - [METRICS.md](../docs/METRICS.md) — how to read the battery (incl. Mondrian OOD)
 
 Digits OOD / Mondrian / LDA notes: [DIGITS_OOD.md](DIGITS_OOD.md).  
+CellCycle G1/S/G2 embedding + mitotic novelty: [CELLCYCLE_NOVELTY.md](CELLCYCLE_NOVELTY.md).  
 **Publication record (guide, params, figures, tables):** [`../publication/`](../publication/).
 
 ```bash

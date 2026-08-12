@@ -86,6 +86,24 @@ result.save("plane.pt")
 
 Use `"l1"`, `"cosine"`, a `CompositeMetric`, or any batched `DistanceFn`.
 
+### Precomputed kNN (edge metric ≠ ambient metric)
+
+Supply a caller-built neighbor graph when edge distances come from a metric that
+is too expensive for all-pairs landmark work (e.g. EMD-rescored L1 candidates):
+
+```python
+result = fit(
+    X_train,
+    dist_fn="l1",                          # landmarks / ε-net / assignment
+    config=cfg,                            # requires dedup=False
+    X_calib=X_cal,                         # required — caller owns train rows
+    precomputed_knn=(knn_idx, knn_dist),   # (N, k) int64 / float32
+)
+```
+
+`knn_idx` / `knn_dist` index the same rows as `X_train`. Fuzzy-graph edges use
+`knn_dist`; landmarks still use `dist_fn`. See `examples/digits_emd.py`.
+
 ## Config presets (`PLANEConfig.for_scale`)
 
 | | `N ≤ 5k` | `5k < N ≤ 2e5` | `N > 2e5` |

@@ -199,6 +199,15 @@ def get_metric(
             True,
             True,
         ),
+        # W1 on a 1-D histogram grid = L1 between CDFs (unit bin spacing).
+        "wasserstein1d": MetricSpec(
+            "wasserstein1d",
+            BUILTIN_FNS["wasserstein1d"],
+            None,
+            False,
+            True,
+            True,
+        ),
     }
     if name not in table:
         raise KeyError(f"Unknown metric {name!r}. Known: {sorted(table)}")
