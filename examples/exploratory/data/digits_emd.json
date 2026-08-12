@@ -1,6 +1,6 @@
 {
   "name": "digits",
-  "X": "/Users/phzwart/Projects/leanmap/examples/exploratory/data/digits_X.npy",
+  "X": "digits_X.npy",
   "image_shape": [
     8,
     8
@@ -9,7 +9,7 @@
   "n_probes": 224,
   "probe_mass": 313.0,
   "probe_seed": 0,
-  "emd": "/Users/phzwart/Projects/leanmap/examples/exploratory/data/digits_emd.npy",
+  "emd": "digits_emd.npy",
   "gate": {
     "n_points": 1797,
     "n_pairs": 200000,

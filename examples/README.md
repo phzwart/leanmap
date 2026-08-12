@@ -1,6 +1,6 @@
 # Examples
 
-Toy demos and the exploratory paper harness.
+Toy demos, research gallery, and the paper-battery harness.
 
 | script | role |
 |--------|------|
@@ -16,9 +16,11 @@ Toy demos and the exploratory paper harness.
 | `pistachio_ftir_explorer.py` | Dash explorer: latent / spatial / spectrum (+ UMAP) |
 | `digits_mondrian.py` | Mondrian levels (digit / gauss / shuffle) on digits |
 | `digits_ood_basin.py` | Digits + OOD basin (shuffle / gauss junk parks) |
-| `exploratory/` | Paper battery: feeds, sweeps, metrics, EMD, conformal |
-| `negative_space.py` | Frozen distance-to-support probe (post-hoc) |
 | `reusability.py` | Out-of-sample reuse demo |
+| `negative_space.py` | Frozen distance-to-support probe (post-hoc) |
+| `negative_space_field.py` / `negative_space_novelty.py` | Negative-space calibration demos |
+| [`research/`](research/) | Curated research gallery (SAXS P(r), digits density, novelty) |
+| [`exploratory/`](exploratory/) | Paper battery: feeds, sweeps, metrics, EMD |
 
 Paper documentation lives under [`docs/`](../docs/):
 
@@ -55,4 +57,5 @@ leanmap mondrian out/digits.pt out/digits_calib.npy -o out/mondrian.pt \
   --score affinity_entropy --alphas 0.01,0.05,0.1
 ```
 
-See [`exploratory/README.md`](exploratory/README.md) for the harness contract.
+See [`exploratory/README.md`](exploratory/README.md) for the harness contract and
+[`research/README.md`](research/README.md) for the research demos.

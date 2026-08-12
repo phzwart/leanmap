@@ -33,6 +33,7 @@ htmlcov/
 .vscode/
 *.swp
 .DS_Store
+Thumbs.db
 
 # Model / embedding artifacts
 *.mmap
@@ -42,6 +43,10 @@ htmlcov/
 *.svg
 *.npz
 !**/fixtures/**
+# Curated release figures (whitelist)
+!docs/figures/
+!docs/figures/**
+!docs/figures/**/*.png
 
 # Publication record: keep frozen models and figure atlas under version control
 !publication/artefacts/**/*.pt
@@ -56,13 +61,14 @@ train.log
 examples/out/
 examples/**/__pycache__/
 
-# Live exploratory run output: deliberately un-ignored so the artifacts stay
-# visible in the editor while a run streams. Scratch space -- do not commit.
-!runs/
-!runs/**
+# Scratch / live runs (never commit)
+runs/
+*.pid
+*.log
 
 # PDB datasets (outside paper scope; large / regenerable)
 examples/data/pdb_*
+examples/data/
 
 # LaTeX build products (regenerable from the .tex)
 docs/**/*.aux

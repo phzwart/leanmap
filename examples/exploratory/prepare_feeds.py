@@ -9,9 +9,6 @@ Writes arrays for:
 - 8×8 digits (``digits_X.npy``, ``digits_y.npy``; full set is 1797 points)
 - Iris (``iris_X.npy``, ``iris_y.npy``; N=150)
 
-``swiss_cone`` is still written for legacy harness runs but is outside the
-paper documentation set.
-
 Usage::
 
     python examples/exploratory/prepare_feeds.py
@@ -63,20 +60,6 @@ def prepare_swiss_roll(out: Path, n: int, seed: int, noise: float, bins: int) ->
     _write(out / "swiss_roll_X.npy", X.astype(np.float32))
     _write(out / "swiss_roll_t.npy", t)
     _write(out / "swiss_roll_tbin.npy", quantile_bins(t, bins))
-
-
-def prepare_swiss_cone(out: Path, n: int, seed: int, noise: float) -> None:
-    """Legacy feed (flared cone with hole); not part of the paper set."""
-    from swiss_cone import make_swiss_cone
-
-    X, t = make_swiss_cone(
-        n_samples=n,
-        noise=noise,
-        hole=True,
-        random_state=seed,
-    )
-    _write(out / "swiss_cone_X.npy", X.astype(np.float32))
-    _write(out / "swiss_cone_t.npy", np.asarray(t, dtype=np.float64))
 
 
 def prepare_digits(out: Path, n: int | None, seed: int) -> None:
@@ -138,11 +121,6 @@ def main(argv=None) -> int:
         default=8,
         help="quantile bins for continuous manifold parameters",
     )
-    ap.add_argument(
-        "--legacy-swiss-cone",
-        action="store_true",
-        help="also write the retired swiss_cone feed",
-    )
     args = ap.parse_args(argv)
 
     out = args.out
@@ -152,8 +130,6 @@ def main(argv=None) -> int:
     prepare_swiss_roll(out, args.n, args.seed, args.noise, args.bins)
     prepare_digits(out, args.digits_n, args.seed)
     prepare_iris(out)
-    if args.legacy_swiss_cone:
-        prepare_swiss_cone(out, args.n, args.seed, args.noise)
     print("done")
     return 0
 

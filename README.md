@@ -24,11 +24,15 @@ Z_new, score_new = model.embed(torch.as_tensor(X_new))
 ## Install
 
 ```bash
-pip install -e ".[cpu]"      # + faiss-cpu (recommended for fit at scale)
-pip install -e ".[dev,cpu]"  # + pytest, scikit-learn
+pip install leanmap           # PyPI
+pip install "leanmap[cpu]"    # + faiss-cpu (recommended for fit at scale)
+
+# from a checkout
+pip install -e ".[cpu]"
+pip install -e ".[dev,cpu]"   # + pytest, scikit-learn
 ```
 
-Core deps: `numpy`, `scipy`, `torch`, `tqdm`. FAISS is optional for small
+Core deps: `numpy`, `scipy`, `torch`, `tqdm`, `pot`. FAISS is optional for small
 brute-force fits (`knn_mode="brute"`) but recommended via the `cpu` extra.
 
 ## Recommended configuration
@@ -57,6 +61,13 @@ Derive landmarks and temperatures from the data:
 ```bash
 python examples/exploratory/calibrate.py --X data.npy --target-perp 8
 ```
+
+## Research demos
+
+Curated gallery under [`examples/research/`](examples/research/): SASBDB P(r)
+embeddings, digits density preservation, and positives-only conformal novelty.
+
+![SASBDB P(r) coloured by Rg/Dmax](docs/figures/research/sasbdb_pr_rg_over_dmax.png)
 
 ## Reproduce the paper battery
 
@@ -128,9 +139,15 @@ bash publication/reproduce.sh --fit    # also retrain digits_clean.pt
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Paper evidence on four datasets |
 | [`docs/METRICS.md`](docs/METRICS.md) | Battery, nulls, traps, Mondrian OOD notes |
 | [`docs/math/leanmap.tex`](docs/math/leanmap.tex) | Mathematics (cover, Mondrian categories, LDA) |
+| [`examples/research/`](examples/research/) | SAXS P(r), digits density, novelty demos |
 | [`src/leanmap/README.md`](src/leanmap/README.md) | Design notes (conditioning, pyramid, conformal) |
+| [`CHANGELOG.md`](CHANGELOG.md) | Release notes |
 | `pytest` under `tests/` | |
+
+## Citation
+
+See [`CITATION.cff`](CITATION.cff). A preprint DOI will be added when available.
 
 ## License
 
-MIT
+MIT — Copyright (c) 2026 Peter Zwart

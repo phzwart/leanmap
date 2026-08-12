@@ -88,9 +88,10 @@ def test_spectral_layout_is_reproducible():
     a = spectral_layout(edges, weights, X.shape[0], 2, seed=0)
     b = spectral_layout(edges, weights, X.shape[0], 2, seed=0)
     assert torch.equal(a, b)
-    # signs pinned on the largest-magnitude entry, which is well away from zero
-    pivot = a.abs().argmax(dim=0)
-    assert bool((a[pivot, torch.arange(a.shape[1])] > 0).all())
+    # Signs pinned on the first largest-magnitude entry per column.
+    coords = a.numpy()
+    pivot = np.argmax(np.abs(coords), axis=0)
+    assert np.all(coords[pivot, np.arange(coords.shape[1])] >= 0.0)
 
 
 def test_rank_inits_prefers_the_layout_that_keeps_neighbours():

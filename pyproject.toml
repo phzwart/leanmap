@@ -9,7 +9,7 @@ description = "leanmap (LEarn ANother MAPping): parametric landmark-conditioned 
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "leanmap contributors" }]
+authors = [{ name = "Peter Zwart" }]
 keywords = [
     "leanmap",
     "parametric",
@@ -55,6 +55,8 @@ leanmap = "leanmap._cli:main"
 [project.urls]
 Homepage = "https://github.com/phzwart/leanmap"
 Repository = "https://github.com/phzwart/leanmap"
+Issues = "https://github.com/phzwart/leanmap/issues"
+Changelog = "https://github.com/phzwart/leanmap/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -122,7 +122,13 @@ def spectral_layout(
     pivot = np.argmax(np.abs(coords), axis=0)
     flip = np.where(coords[pivot, np.arange(coords.shape[1])] < 0, -1.0, 1.0)
     coords = coords * flip[None, :]
-    return torch.as_tensor(np.ascontiguousarray(coords), dtype=torch.float32)
+    # Cast before the final pin: float32 can reorder near-ties on |max|, and the
+    # torch tensor is what callers (and tests) see.
+    coords = np.ascontiguousarray(coords, dtype=np.float32)
+    pivot = np.argmax(np.abs(coords), axis=0)
+    flip = np.where(coords[pivot, np.arange(coords.shape[1])] < 0, -1.0, 1.0)
+    coords = coords * flip[None, :]
+    return torch.as_tensor(coords, dtype=torch.float32)
 
 
 def _knn_indices(Z: torch.Tensor, k: int):

@@ -62,13 +62,24 @@ optional `uniformity_trace.*`, `Z_probe.npy`.
 
 Aggregates: `summary.csv`, `atlas.png`, `ingest.json`.
 
+## Scripts in this directory
+
+| script | role |
+|--------|------|
+| `prepare_feeds.py` | Write paper feeds to `data/` |
+| `calibrate.py` | Landmark / temperature calibration |
+| `reference.py` | UMAP / PCA reference bar |
+| `master.py` | Sweep driver |
+| `bench_inference.py` | OOS latency vs UMAP / PCA |
+| `make_emd.py` | Digits EMD reference geometry |
+| `axes.py`, `ingest.py`, `metrics_run.py`, `nulls.py`, `splits.py`, `monitor.py`, `make_atlas.py`, `quantile_bins.py` | Harness internals |
+
+Research demos (SAXS P(r), density, novelty) live under
+[`../research/`](../research/).
+
 ## Further reading
 
 - User guide: [`docs/CONFIGURATION.md`](../../docs/CONFIGURATION.md)
 - Results: [`docs/RESULTS.md`](../../docs/RESULTS.md)
 - Metrics: [`docs/METRICS.md`](../../docs/METRICS.md)
 - Design notes: [`src/leanmap/README.md`](../../src/leanmap/README.md)
-
-Helper scripts (`make_emd.py`, `emd_bench.py`, `plot_conformal.py`,
-`manifold_repair.py`, `bench_inference.py`, …) support the digits EMD / OOD /
-inference sections of the results doc.

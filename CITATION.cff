@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use leanmap, please cite it as below."
+type: software
+title: "leanmap: parametric landmark-conditioned neighbour embedding"
+version: 0.2.0
+date-released: "2026-08-12"
+license: MIT
+repository-code: "https://github.com/phzwart/leanmap"
+url: "https://github.com/phzwart/leanmap"
+authors:
+  - family-names: Zwart
+    given-names: Peter
+    # orcid: # add when available
+abstract: >
+  leanmap (LEarn ANother MAPping) is a parametric landmark-conditioned
+  neighbour embedding with a cohesive multi-scale graph pyramid. After
+  training, inference is a single network forward pass and returns an
+  embedding plus a conformal cover score.
+keywords:
+  - dimensionality reduction
+  - neighbour embedding
+  - parametric UMAP
+  - conformal prediction
+  - SAXS
