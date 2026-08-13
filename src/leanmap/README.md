@@ -54,6 +54,157 @@ so modulating before the norm would make `GAIN` a literal no-op and leave
 
 Helper: `scale_quotient_factorization()` builds direction + log-magnitude factors.
 
+## Class order as a gauge fix (`d_out - 1` directions)
+
+`AXIS` orders the map by a scalar *computable from `x`*. A **class label** is not
+computable from `x` — that is what you want the map to help you infer — so it
+cannot be a conditioning factor at all: every factor's `view` is evaluated on
+every forward pass including inference (`affinities_forward` → `view_batch`), so a
+label-reading view would demand the answer as input.
+
+Labels instead enter as a **gauge fix**. The unsupervised objective determines
+shape but not orientation — `fuzzy_cross_entropy` sees only distances,
+`local_rigidity_loss` is rotation/reflection-invariant — so rotation and
+reflection are free parameters the data never constrains, and refits spend them
+arbitrarily. A user ordering of the classes is the natural thing to spend them on.
+
+```python
+from leanmap import PLANEConfig, fit, ordinal_class_axis
+
+cfg = PLANEConfig.for_scale(len(X))
+cfg.lambda_class = 1.0                      # 0 = off (default)
+ax = ordinal_class_axis(n_classes=5, axis=0, order=[2, 0, 1, 4, 3])
+res = fit(X, dist_fn="l2", config=cfg, class_labels=y, class_axes=[ax])
+```
+
+At most **`d_out - 1`** axes may *name a coordinate* (`validate_class_axes` raises,
+it does not warn): the remainder must stay free, or the labels have stopped
+choosing among equivalent layouts and started dictating the layout, and the map
+can no longer disagree with them. Inference needs no label.
+
+| property | how |
+|---|---|
+| order only | hinge on the *sign* of the gap; spacing and position stay the graph's business |
+| zero force once satisfied | `relu`, not a pull — ordered pairs contribute exactly no gradient |
+| scale free | margin is a fraction of the coordinate's own running spread |
+| free axes untouched | `dL/dz` is exactly zero off the constrained coordinates |
+| labels out of the graph | metric, kNN, ε-net and memberships are unchanged — no leakage into what "neighbour" means |
+
+Only the *order* of `rank` is read, so equal ranks express a partial order
+("don't order these two"). This differs deliberately from `ordinal_triplet_loss`,
+whose `logsigmoid` never reaches zero: that is a ranking objective meant to keep
+pressing, this is a gauge fix that should stop.
+
+### Two orderings: pin the primary, let the secondary pick its own direction
+
+Only one ordering is usually worth an axis. For a second, coarser factor — a
+parity, a treatment arm, a broad stage — you generally have no basis for claiming
+*which way* the map should lay it out, and claiming one anyway is friction you get
+nothing for. `axis=None` asks only that the groups come apart along **some**
+direction, recomputed each step and oriented low-to-high, so neither the direction
+nor the sign is constrained:
+
+```python
+from leanmap import grouped_class_axis, ordinal_class_axis
+
+digit  = ordinal_class_axis(10, axis=0, name="digit")            # pinned: z0 orders 0..9
+parity = grouped_class_axis([[0,2,4,6,8], [1,3,5,7,9]],          # tied ranks within a group
+                            axis=None, name="parity", weight=0.3)  # weight scales lambda_class
+res = fit(X, dist_fn="l2", config=cfg, class_labels=y, class_axes=[digit, parity])
+```
+
+Because the chosen direction is zeroed on the pinned coordinates, a
+free-direction term **provably cannot move a pinned axis** — `dL/dz` is exactly
+zero there however hard it is weighted — so a secondary factor is safe to add to
+a primary ordering you care about. Pinned axes are capped at `d_out - 1`;
+free-direction axes are counted separately and the total is capped at `d_out`,
+with a warning (not a refusal) when they fill it, since asking for a separation
+with a free sign is strictly weaker than naming a coordinate.
+
+On digits, `z0` ordering the value and parity on a free direction (20 epochs,
+`lambda_class=16`, `margin=0.30`, early ramp; run-to-run spread ≈0.03):
+
+| arm | digit adjacent | asked | parity | 5-NN |
+|---|---|---|---|---|
+| digit only | 0.95 | — | 0.62 | 0.95 |
+| + parity free direction, `weight=0.3` | 0.95 | 1.00 | **1.00** | 0.97 |
+| + parity free direction, `weight=0.3`, `d_out=3` | 0.91 | 1.00 | 1.00 | 0.97 |
+| + parity pinned to `z1` | *refused by the ceiling* | | | |
+| arbitrary 5/5 split | 0.96 | **1.00** | 0.82 | 0.98 |
+
+Parity is *not* there incidentally (0.62 without the term), the digit ordering
+does not suffer, and 5-NN accuracy holds — a second ordering can be close to free
+when the features support it. In `d_out=3` the fit picks a direction inside the
+free plane (`[0, −0.20, 0.98]`) rather than a coordinate.
+
+The last row is the warning: an **arbitrary** 5/5 split of the digits also
+separates essentially perfectly. A high score means the term worked, not that the
+grouping means anything — so the claim worth making is always relative to a
+baseline that never requested it. (Its 0.82 on *true* parity is mostly overlap:
+that draw shares four of five members with the even digits.)
+See `examples/digits_two_orderings.py`.
+
+Two further caveats specific to free-direction axes:
+
+- **Chance is above 0.5**, because the direction is fitted on the points it
+  scores: ~0.53 at `n=600, d_out=2`, ~0.54 at `d_out=3`, ~0.515 by `n=3000`. A
+  pinned axis lands on 0.500 exactly. Get the null from a shuffled refit.
+- **More weight is not more ordering.** Unlike the pinned case, the direction
+  co-adapts with the layout, and a heavy secondary term drags the map around while
+  its direction estimate is still forming. Start at `weight ≤ 0.5`.
+
+The direction is smoothed across steps (`DIRECTION_MOMENTUM`), which is load
+bearing rather than cosmetic: before the groups separate the per-step estimate is
+noise, its sign flips between steps, successive pushes cancel, and an unsmoothed
+term sits at chance indefinitely (0.59 vs 0.90 on the same synthetic fit).
+
+### Reading the result
+
+`class_axis_report` returns `order_<name>` (pairwise ordering accuracy over
+ordered class pairs, chance `0.5`) and `order_adjacent_<name>` (the same
+restricted to consecutive classes). **Read the adjacent one.** Well-separated
+classes order themselves incidentally once they separate at all, so the overall
+mean is optimistic about whether the *sequence* was reproduced; `order=0.95` with
+`order_adjacent=0.55` means grouped classes in essentially unresolved order.
+
+An unsatisfiable ordering does **not** degrade gracefully. On digits with
+shuffled labels at `lambda_class=1`, ordering stays at chance (0.541) while 5-NN
+accuracy collapses 0.945 → 0.377 and the constrained axis shrinks from ~6 units
+to ~0.5: contradictory pulls average toward the centre and flatten the coordinate.
+Hence the warning below `order_adjacent ≈ 0.6` — raising `lambda_class` there
+distorts the layout instead of fixing it. Always report the **shuffled-label
+null** at the same `lambda_class`; if it also orders, the term is fitting any
+labels it is handed. See `examples/digits_class_axis.py`.
+
+### Inference readout
+
+```python
+from leanmap import ClassAxisReadout, ClassRegionConformal
+
+readout = ClassAxisReadout.from_model(res.model, res.X_train, res.class_labels_train, ax)
+cal = ClassRegionConformal(readout).fit(res.model, res.X_calib, y_calib)
+
+pos = readout.position(Z)              # continuous place on the ordering
+sets = cal.prediction_set(Z, 0.05)     # () = novel, (a,) = confident, (a, b) = ambiguous
+```
+
+`position` is the point of the exercise: it places a sample *on the user's
+sequence*, interpolating between the class positions training settled into, so a
+sample between two classes reads as between them instead of being forced to one
+side. `ClassRegionConformal` is one conformal test per class on distance to that
+class's region — it cannot go through `MondrianCalibrator`, which applies a single
+score across all groups, and the shipped `cover` / `affinity_entropy` scores are
+support-based and would separate nothing between class regions of one manifold.
+
+Needs ~50+ calibration points **per class** (it warns below that) and, with an
+explicit `X_calib`, the caller owns the calibration labels.
+
+**These class regions do not detect ambient outliers.** The encoder maps every
+input somewhere and LayerNorm discards most of an extreme input's scale, so an
+absurd ambient point lands *inside* the occupied map: `(1e4, 1e4)` on a 2-D toy
+embeds to `(0.52, -1.90)`. That is landmark cover's question, not this one — run
+both.
+
 ### `retention_f`
 
 Per-factor fraction of (near, mid, far) triplets — proposed by ranking that

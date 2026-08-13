@@ -70,11 +70,25 @@ class CosineDistance:
 
 
 class ManhattanDistance:
-    """``‖x−y‖₁``."""
+    """``‖x−y‖₁``.
+
+    ``torch.cdist(..., p=1)`` materialises an ``(n, m, D)`` workspace, which
+    blows up for landmark batches (e.g. 10k × 1024 × 4096). Chunk over A.
+    """
+
+    _max_workspace = 64 * 1024 * 1024  # bytes
 
     def __call__(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         """A: (n, D). B: (m, D). Returns: (n, m) float32."""
-        return torch.cdist(A, B, p=1)
+        n, d = A.shape
+        m = int(B.shape[0])
+        n_chunk = max(1, min(n, self._max_workspace // max(m * d * 4, 1)))
+        if n_chunk >= n:
+            return torch.cdist(A, B, p=1)
+        parts = [
+            torch.cdist(A[s:e], B, p=1) for s, e in chunk_ranges(n, n_chunk)
+        ]
+        return torch.cat(parts, dim=0)
 
 
 class CallableDistance:

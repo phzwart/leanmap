@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -1790,3 +1791,150 @@ def build_graph_pyramid(
         )
     log.info("pyramid built: %d level(s)", len(graphs))
     return graphs, M, assign_top1, assign_topc
+
+
+GRAPH_PYRAMID_VERSION = 1
+
+
+def _cpu_tensor(t: torch.Tensor) -> torch.Tensor:
+    return t.detach().cpu().contiguous()
+
+
+def tensor_fingerprint(X: torch.Tensor) -> Dict[str, Any]:
+    """Cheap identity check so a cached graph cannot be reused on the wrong X."""
+    x = X.detach().cpu().reshape(-1)
+    n = int(x.numel())
+    return {
+        "shape": [int(s) for s in X.shape],
+        "mean": float(X.mean().cpu()),
+        "head": x[:8].tolist() if n else [],
+        "tail": x[-8:].tolist() if n else [],
+    }
+
+
+def check_tensor_fingerprint(
+    X: torch.Tensor, fingerprint: Dict[str, Any], *, what: str = "X_train"
+) -> None:
+    got = tensor_fingerprint(X)
+    want_shape = list(fingerprint["shape"])
+    if got["shape"] != want_shape:
+        raise ValueError(f"{what} shape {got['shape']} != cached {want_shape}")
+    atol = 1e-4 * (1.0 + abs(float(fingerprint["mean"])))
+    if abs(got["mean"] - float(fingerprint["mean"])) > atol:
+        raise ValueError(
+            f"{what} mean {got['mean']:.6g} != cached {fingerprint['mean']:.6g}; "
+            "rebuild the graph"
+        )
+    for key in ("head", "tail"):
+        a = [float(v) for v in got[key]]
+        b = [float(v) for v in fingerprint[key]]
+        if len(a) != len(b) or any(abs(x - y) > 1e-5 for x, y in zip(a, b)):
+            raise ValueError(f"{what} {key} does not match the cached graph; rebuild")
+
+
+def graph_to_state(graph: Graph) -> Dict[str, Any]:
+    reps = graph.reps
+    return {
+        "edges": _cpu_tensor(graph.edges),
+        "weights": _cpu_tensor(graph.weights),
+        "knn_idx": _cpu_tensor(graph.knn_idx),
+        "reps": {
+            "rep_idx": _cpu_tensor(reps.rep_idx),
+            "member_of": _cpu_tensor(reps.member_of),
+            "weight": _cpu_tensor(reps.weight),
+            "offsets": _cpu_tensor(reps.offsets),
+            "values": _cpu_tensor(reps.values),
+        },
+        "stats": asdict(graph.stats),
+    }
+
+
+def graph_from_state(state: Dict[str, Any]) -> Graph:
+    allowed = {f.name for f in fields(GraphStats)}
+    stats_raw = dict(state["stats"])
+    stats = GraphStats(**{k: v for k, v in stats_raw.items() if k in allowed})
+    reps_raw = state["reps"]
+    reps = Representatives(
+        rep_idx=torch.as_tensor(reps_raw["rep_idx"]),
+        member_of=torch.as_tensor(reps_raw["member_of"]),
+        weight=torch.as_tensor(reps_raw["weight"]),
+        offsets=torch.as_tensor(reps_raw["offsets"]),
+        values=torch.as_tensor(reps_raw["values"]),
+    )
+    return Graph(
+        edges=torch.as_tensor(state["edges"]),
+        weights=torch.as_tensor(state["weights"]),
+        reps=reps,
+        knn_idx=torch.as_tensor(state["knn_idx"]),
+        stats=stats,
+    )
+
+
+def save_graph_pyramid(
+    path: Union[str, Path],
+    *,
+    graphs: Sequence[Graph],
+    M: torch.Tensor,
+    assign_top1: torch.Tensor,
+    assign_topc: torch.Tensor,
+    train_idx: torch.Tensor,
+    calib_idx: torch.Tensor,
+    fingerprint: Dict[str, Any],
+    metric_name: str,
+    n_all: int,
+    n_neighbors: int,
+    epsilon: float,
+    seed: int,
+    dedup: bool,
+) -> Path:
+    """Write the training graph pyramid plus the split it was built on."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": GRAPH_PYRAMID_VERSION,
+        "metric_name": str(metric_name),
+        "n_all": int(n_all),
+        "n_landmarks": int(M.shape[0]),
+        "n_neighbors": int(n_neighbors),
+        "epsilon": float(epsilon),
+        "seed": int(seed),
+        "dedup": bool(dedup),
+        "fingerprint": fingerprint,
+        "train_idx": _cpu_tensor(torch.as_tensor(train_idx)),
+        "calib_idx": _cpu_tensor(torch.as_tensor(calib_idx)),
+        "graphs": [graph_to_state(g) for g in graphs],
+        "M": _cpu_tensor(M),
+        "assign_top1": _cpu_tensor(assign_top1),
+        "assign_topc": _cpu_tensor(assign_topc),
+    }
+    torch.save(payload, path)
+    log = get_logger()
+    log.info(
+        "saved graph pyramid %s (%d level(s), R=%d, L=%d)",
+        path,
+        len(graphs),
+        int(graphs[0].reps.rep_idx.shape[0]) if graphs else 0,
+        int(M.shape[0]),
+    )
+    return path
+
+
+def load_graph_pyramid(path: Union[str, Path]) -> Dict[str, Any]:
+    """Load a pyramid written by :func:`save_graph_pyramid`."""
+    path = Path(path)
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    version = int(payload.get("version", 0))
+    if version != GRAPH_PYRAMID_VERSION:
+        raise ValueError(
+            f"graph cache version {version} != {GRAPH_PYRAMID_VERSION} ({path})"
+        )
+    payload["graphs"] = [graph_from_state(g) for g in payload["graphs"]]
+    payload["train_idx"] = torch.as_tensor(payload["train_idx"], dtype=torch.int64)
+    payload["calib_idx"] = torch.as_tensor(payload["calib_idx"], dtype=torch.int64)
+    payload["M"] = torch.as_tensor(payload["M"])
+    payload["assign_top1"] = torch.as_tensor(payload["assign_top1"])
+    payload["assign_topc"] = torch.as_tensor(payload["assign_topc"])
+    return payload

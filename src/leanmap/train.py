@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -22,6 +22,17 @@ from .conditioning import (
     build_factor_stack,
     default_primary_factor,
     metric_from_factors,
+)
+from .classaxis import (
+    CLASS_PAIRS_PER_STEP,
+    ORDER_CHANCE,
+    ORDER_WARN,
+    ClassAxis,
+    ClassOrderSampler,
+    class_axis_report,
+    class_direction_loss,
+    class_order_loss,
+    validate_class_axes,
 )
 from .config import (
     C_BUCKETS,
@@ -48,7 +59,15 @@ from .conformal import ConformalCalibrator, geometry_consistency_score, model_we
 from .density import density_budget, density_correlation_loss, star_log_radius
 from .distance import DistanceFn
 from .evaluate import geodesic_fidelity
-from .graph import Graph, build_graph, build_graph_pyramid
+from .graph import (
+    Graph,
+    build_graph,
+    build_graph_pyramid,
+    check_tensor_fingerprint,
+    load_graph_pyramid,
+    save_graph_pyramid,
+    tensor_fingerprint,
+)
 from .warmstart import LAYOUTS as WARM_START_LAYOUTS, spectral_layout, warm_start
 from .landmarks import AnchorAffinity, LandmarkAffinity, classical_mds, landmark_geodesic_matrix
 from .losses import (
@@ -381,6 +400,10 @@ def fit(
     encoder_view: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     init_state_dict: Optional[dict] = None,
     precomputed_knn: Optional[Tuple[Any, Any]] = None,
+    graph_path: Optional[Union[str, Path]] = None,
+    rebuild_graph: bool = False,
+    class_labels: Optional[np.ndarray | torch.Tensor] = None,
+    class_axes: Optional[Sequence[ClassAxis]] = None,
 ) -> PLANEResult:
     """Fit PLANE. Calibration split is taken from raw ``X`` before the graph.
 
@@ -403,6 +426,33 @@ def fit(
         Requires ``config.dedup=False``. When set, pass ``X_calib`` explicitly
         so calib is not carved out of ``X`` — the caller owns the train-row
         indexing of the supplied graph.
+    graph_path : path, optional
+        If the file exists and ``rebuild_graph`` is false, skip kNN / ε-net /
+        pyramid construction and reuse the cached split. After a fresh build,
+        the pyramid is written here so later runs can change lr / epochs /
+        pyramid weights without rebuilding. Metric, landmarks, neighbors,
+        seed, and row identity must match.
+    rebuild_graph : bool
+        Ignore ``graph_path`` if present and rebuild (then overwrite).
+    class_labels : (N,) int, optional
+        Integer class codes ``0..K-1``, one per row of ``X`` — the same rows and
+        the same order, *before* any calibration split. When the split is carved
+        out of ``X`` internally, the labels are carved with it; supply
+        ``X_calib`` explicitly if you need to control which rows train.
+        Requires ``class_axes`` and ``config.lambda_class > 0`` to have an
+        effect; labels alone change nothing.
+    class_axes : sequence of ClassAxis, optional
+        Which orderings of the classes the layout must respect (see
+        :mod:`leanmap.classaxis`). An axis with ``axis=j`` pins coordinate ``j``,
+        and at most ``d_out - 1`` may do so. An axis with ``axis=None`` asks only
+        that its groups be ordered along *some* direction, which the fit chooses
+        each step; that is the weaker request a secondary factor usually wants,
+        and it cannot disturb the pinned coordinates. Per-axis ``weight`` scales
+        ``lambda_class`` so a secondary factor can be applied gently.
+
+        Labels never enter the graph, the metric or the conditioning — only these
+        gauge terms — so inference needs no label and the neighbourhood target is
+        unchanged.
     """
     from .conditioning import identity_view
     from .landmarks import assign_buckets, init_anchors
@@ -429,9 +479,37 @@ def fit(
                 "caller owns the train-row indexing of the supplied graph"
             )
 
+    graph_path_p = Path(graph_path) if graph_path is not None else None
+    loaded_pyramid: Optional[dict] = None
+    if (
+        graph_path_p is not None
+        and graph_path_p.exists()
+        and not rebuild_graph
+        and precomputed_knn is None
+    ):
+        loaded_pyramid = load_graph_pyramid(graph_path_p)
+        log.info("loading graph pyramid from %s", graph_path_p)
+
     # 2. Split calibration first
     N = X_all.shape[0]
-    if X_calib is not None:
+    train_idx: Optional[torch.Tensor] = None
+    if loaded_pyramid is not None:
+        if X_calib is not None:
+            raise ValueError("cached graph_path cannot be combined with X_calib")
+        if int(loaded_pyramid["n_all"]) != int(N):
+            raise ValueError(
+                f"cached graph n_all={loaded_pyramid['n_all']} != X rows {N}; rebuild"
+            )
+        train_idx = loaded_pyramid["train_idx"].long()
+        calib_idx = loaded_pyramid["calib_idx"].long()
+        X_cal = X_all[calib_idx]
+        X_train = X_all[train_idx]
+        log.info(
+            "reusing cached train/calib split (n_train=%d n_cal=%d)",
+            int(X_train.shape[0]),
+            int(X_cal.shape[0]),
+        )
+    elif X_calib is not None:
         X_cal = torch.as_tensor(ensure_2d_float32(X_calib), dtype=torch.float32)
         X_train = X_all
         calib_idx = None
@@ -444,6 +522,33 @@ def fit(
         train_idx = perm[n_cal:]
         X_cal = X_all[calib_idx]
         X_train = X_all[train_idx]
+
+    # Labels follow the split rather than the caller's indexing: whichever rows
+    # became calibration must take their labels with them, or the gauge term
+    # would be trained against labels belonging to different points.
+    labels_train: Optional[torch.Tensor] = None
+    labels_calib: Optional[torch.Tensor] = None
+    axes_list: List[ClassAxis] = list(class_axes) if class_axes else []
+    if class_labels is not None:
+        lab_all = torch.as_tensor(np.asarray(class_labels).reshape(-1), dtype=torch.int64)
+        if lab_all.shape[0] != N:
+            raise ValueError(
+                f"class_labels has {lab_all.shape[0]} entries but X has {N} rows"
+            )
+        if int(lab_all.min()) < 0:
+            raise ValueError("class_labels must be non-negative integer codes 0..K-1")
+        if train_idx is not None:
+            labels_train = lab_all[train_idx]
+            labels_calib = lab_all[calib_idx] if calib_idx is not None else None
+        else:
+            labels_train = lab_all
+        n_classes = int(lab_all.max().item()) + 1
+        validate_class_axes(axes_list, config.d_out, n_classes)
+    elif axes_list:
+        raise ValueError(
+            "class_axes was given without class_labels; the ordering has nothing "
+            "to order"
+        )
 
     # 3. normalisation stats on encoder features of the training split
     X_enc_train = enc_view(X_train)
@@ -517,45 +622,103 @@ def fit(
         extra_ivf.append((f.view, f.metric, Mf))
 
     # 4–8 graph (multi-scale pyramid; graphs[0] is the finest / legacy graph)
-    graphs, M, assign_top1, assign_topc = build_graph_pyramid(
-        X_train,
-        metric,
-        pyramid_scales=config.pyramid_scales,
-        pyramid_rep_ratio=PYRAMID_REP_RATIO,
-        pyramid_min_reps=config.pyramid_min_reps,
-        pyramid_coarse_backbone=config.pyramid_coarse_backbone,
-        pyramid_squash=config.pyramid_squash,
-        n_neighbors=config.n_neighbors,
-        n_landmarks=n_graph_landmarks,
-        c_buckets=C_BUCKETS,
-        epsilon=config.epsilon,
-        dedup=config.dedup,
-        local_connectivity=config.local_connectivity,
-        beta_multiplicity=config.beta_multiplicity,
-        lambda_backbone=LAMBDA_BACKBONE,
-        knn_mode=config.knn_mode,
-        c_search=C_SEARCH,
-        seed=config.seed,
-        extra_ivf_anchors=extra_ivf or None,
-        fps_view=fps_view,
-        fps_view_metric=fps_view_metric,
-        fps_geodesic=config.landmark_geodesic,
-        fps_geodesic_k=LANDMARK_GEODESIC_K,
-        fps_poisson=config.landmark_poisson,
-        precomputed_knn=precomputed_knn,
-    )
+    if loaded_pyramid is not None:
+        cached_metric = loaded_pyramid.get("metric_name")
+        want_metric = _metric_name_from_dist_fn(dist_fn)
+        if cached_metric is not None and str(cached_metric) != str(want_metric):
+            raise ValueError(
+                f"cached graph metric={cached_metric!r} != {want_metric!r}; "
+                "pass rebuild_graph=True"
+            )
+        if int(loaded_pyramid["n_landmarks"]) != int(n_graph_landmarks):
+            raise ValueError(
+                f"cached graph n_landmarks={loaded_pyramid['n_landmarks']} != "
+                f"{n_graph_landmarks}; pass rebuild_graph=True"
+            )
+        if int(loaded_pyramid.get("seed", config.seed)) != int(config.seed):
+            log.warning(
+                "cached graph seed=%s but config.seed=%s; reusing cached split/landmarks",
+                loaded_pyramid.get("seed"),
+                config.seed,
+            )
+        cached_k = loaded_pyramid.get("n_neighbors")
+        if cached_k is not None and int(cached_k) != int(config.n_neighbors):
+            raise ValueError(
+                f"cached graph n_neighbors={cached_k} != {config.n_neighbors}; "
+                "pass rebuild_graph=True"
+            )
+        check_tensor_fingerprint(X_train, loaded_pyramid["fingerprint"])
+        graphs = loaded_pyramid["graphs"]
+        M = loaded_pyramid["M"]
+        assign_top1 = loaded_pyramid["assign_top1"]
+        assign_topc = loaded_pyramid["assign_topc"]
+        log.info(
+            "using cached graph pyramid: %d level(s) R=%d L=%d",
+            len(graphs),
+            int(graphs[0].reps.rep_idx.shape[0]),
+            int(M.shape[0]),
+        )
+    else:
+        graphs, M, assign_top1, assign_topc = build_graph_pyramid(
+            X_train,
+            metric,
+            pyramid_scales=config.pyramid_scales,
+            pyramid_rep_ratio=PYRAMID_REP_RATIO,
+            pyramid_min_reps=config.pyramid_min_reps,
+            pyramid_coarse_backbone=config.pyramid_coarse_backbone,
+            pyramid_squash=config.pyramid_squash,
+            n_neighbors=config.n_neighbors,
+            n_landmarks=n_graph_landmarks,
+            c_buckets=C_BUCKETS,
+            epsilon=config.epsilon,
+            dedup=config.dedup,
+            local_connectivity=config.local_connectivity,
+            beta_multiplicity=config.beta_multiplicity,
+            lambda_backbone=LAMBDA_BACKBONE,
+            knn_mode=config.knn_mode,
+            c_search=C_SEARCH,
+            seed=config.seed,
+            extra_ivf_anchors=extra_ivf or None,
+            fps_view=fps_view,
+            fps_view_metric=fps_view_metric,
+            fps_geodesic=config.landmark_geodesic,
+            fps_geodesic_k=LANDMARK_GEODESIC_K,
+            fps_poisson=config.landmark_poisson,
+            precomputed_knn=precomputed_knn,
+        )
     graph = graphs[0]  # finest graph: reps/negatives/knn_idx/stats live here
 
     if config.epsilon is None:
         # Freeze the resolved merge radius into the artefact. Re-estimating on a
         # refit would make the coarsening scale a function of how much data
         # happened to be on hand, which defeats "explored once and saved".
-        from dataclasses import replace as _replace
-
-        config = _replace(config, epsilon=float(graph.stats.epsilon))
+        config = replace(config, epsilon=float(graph.stats.epsilon))
         log.info(
             "epsilon=%.6g frozen into the saved config (pass epsilon=None to re-estimate)",
             config.epsilon,
+        )
+
+    if (
+        graph_path_p is not None
+        and loaded_pyramid is None
+        and train_idx is not None
+        and calib_idx is not None
+    ):
+        save_graph_pyramid(
+            graph_path_p,
+            graphs=graphs,
+            M=M,
+            assign_top1=assign_top1,
+            assign_topc=assign_topc,
+            train_idx=train_idx,
+            calib_idx=calib_idx,
+            fingerprint=tensor_fingerprint(X_train),
+            metric_name=_metric_name_from_dist_fn(dist_fn),
+            n_all=int(N),
+            n_neighbors=int(config.n_neighbors),
+            epsilon=float(graph.stats.epsilon),
+            seed=int(config.seed),
+            dedup=bool(config.dedup),
         )
 
     if calib_idx is not None:
@@ -850,6 +1013,48 @@ def fit(
         )
     retention_warn = retention_chance + (RETENTION_WARN - RETENTION_CHANCE)
 
+    class_on = bool(axes_list) and float(config.lambda_class) > 0.0
+    class_samplers: List[Tuple[ClassAxis, ClassOrderSampler]] = []
+    class_spread: List[Dict[str, Any]] = []
+    class_pinned: Tuple[int, ...] = tuple(
+        int(a.axis) for a in axes_list if a.is_pinned
+    )
+    if axes_list and not class_on:
+        log.warning(
+            "class_axes were supplied but lambda_class=%.3g, so the ordering is "
+            "not applied; the axes are only used for the order_* diagnostics",
+            config.lambda_class,
+        )
+    if class_on:
+        assert labels_train is not None
+        for ax in axes_list:
+            samp_c = ClassOrderSampler(
+                X_train, labels_train, ax.rank, seed=config.seed
+            )
+            class_samplers.append((ax, samp_c))
+            class_spread.append({})
+            log.info(
+                "class axis %r on %s: %d ordered class pairs, weight=%.3g x "
+                "lambda_class=%.3g ramp=%s margin=%.3g; %d of %d coordinates "
+                "unnamed",
+                ax.name,
+                f"coordinate {ax.axis}" if ax.is_pinned else "a free direction",
+                samp_c.n_pairs,
+                ax.weight,
+                config.lambda_class,
+                tuple(config.class_ramp),
+                config.class_margin,
+                config.d_out - sum(a.is_pinned for a in axes_list),
+                config.d_out,
+            )
+    # Fixed once so the order diagnostic tracks the same points every epoch and
+    # its trajectory is a statement about the layout, not about resampling.
+    class_diag_idx: Optional[torch.Tensor] = None
+    if axes_list and labels_train is not None:
+        take = min(4096, X_train.shape[0])
+        g_diag = torch.Generator().manual_seed(config.seed + 11)
+        class_diag_idx = torch.randperm(X_train.shape[0], generator=g_diag)[:take]
+
     # Warm start: fit the encoder to the coarse landmark layout before the main
     # objective sees a step, so training refines a topologically sensible map
     # instead of building one from PCA or from zero.
@@ -989,16 +1194,19 @@ def fit(
             "frame": 0.0,
             "geo": 0.0,
             "dens": 0.0,
+            "class": 0.0,
         }
         retentions = []
         gammas = []
         min_dm = []
         usage = []
+        class_active: Dict[str, List[float]] = {}
 
         t_frac = epoch / max(config.epochs - 1, 1)
         frame_ramp = alignment_ramp(t_frac, *config.frame_ramp)
         geo_ramp = alignment_ramp(t_frac, *config.geo_ramp)
         dens_ramp = alignment_ramp(t_frac, *config.density_ramp) if density_on else 0.0
+        class_ramp = alignment_ramp(t_frac, *config.class_ramp) if class_on else 0.0
         lvl_counts, epoch_steps = plan[epoch]
 
         pbar = tqdm(
@@ -1051,6 +1259,37 @@ def fit(
             retentions.append(retention)
 
             L_lm = landmark_regularisation(a_i, Dm_i, eta=ETA_BALANCE)
+
+            # Dedicated pairs rather than reusing the edge batch: the edge
+            # sampler draws neighbours, which are mostly same-class, so the
+            # cross-class pairs a global ordering needs would be both rare and
+            # biased toward whichever classes happen to touch.
+            L_class = z_i.sum() * 0.0
+            if class_samplers and class_ramp > 0:
+                class_parts = []
+                for (ax_c, samp_c), spread_c in zip(class_samplers, class_spread):
+                    x_lo, x_hi = samp_c.sample(CLASS_PAIRS_PER_STEP)
+                    z_lo, _, _ = model(x_lo.to(device))
+                    z_hi, _, _ = model(x_hi.to(device))
+                    if ax_c.is_pinned:
+                        l_ax, _, active = class_order_loss(
+                            z_lo,
+                            z_hi,
+                            ax_c.axis,
+                            spread_c,
+                            margin=float(config.class_margin),
+                        )
+                    else:
+                        l_ax, _, active, _ = class_direction_loss(
+                            z_lo,
+                            z_hi,
+                            class_pinned,
+                            spread_c,
+                            margin=float(config.class_margin),
+                        )
+                    class_parts.append(ax_c.weight * l_ax)
+                    class_active.setdefault(ax_c.name, []).append(active)
+                L_class = torch.stack(class_parts).sum()
 
             L_frame = z_i.sum() * 0.0
             if star_samp is not None and frame_ramp > 0:
@@ -1121,6 +1360,7 @@ def fit(
                 + config.lambda_frame * frame_ramp * L_frame
                 + config.lambda_geo * geo_ramp * L_geo
                 + config.lambda_density * dens_ramp * L_dens
+                + config.lambda_class * class_ramp * L_class
             )
             opt.zero_grad()
             if not torch.isfinite(loss):
@@ -1131,6 +1371,16 @@ def fit(
             opt.step()
             sched.step()
             global_step += 1
+            if callbacks:
+                for cb in callbacks:
+                    on_step = getattr(cb, "on_step", None)
+                    if on_step is not None:
+                        on_step(
+                            epoch + 1,
+                            global_step,
+                            model,
+                            {"batch_n": int(x_i.shape[0])},
+                        )
 
             totals["geom"] += float(L_geom.item())
             totals["ord"] += float(L_ord.item())
@@ -1138,6 +1388,7 @@ def fit(
             totals["frame"] += float(L_frame.item()) if torch.is_tensor(L_frame) else 0.0
             totals["geo"] += float(L_geo.item()) if torch.is_tensor(L_geo) else 0.0
             totals["dens"] += float(L_dens.item()) if torch.is_tensor(L_dens) else 0.0
+            totals["class"] += float(L_class.item()) if torch.is_tensor(L_class) else 0.0
             with torch.no_grad():
                 gammas.append(gamma.mean().item())
                 gammas.append(gamma.std().item())
@@ -1169,6 +1420,7 @@ def fit(
                     "frame": f"{totals['frame'] / steps_done:.3f}",
                     "geo": f"{totals['geo'] / steps_done:.3f}",
                     "dens": f"{totals['dens'] / steps_done:.3f}",
+                    "cls": f"{totals['class'] / steps_done:.3f}" if class_on else "—",
                     "ret": f"{float(np.mean(retentions)):.2f}" if retentions else "—",
                     "lr": f"{opt.param_groups[0]['lr']:.4g}",
                 },
@@ -1188,6 +1440,7 @@ def fit(
             "frame": totals["frame"] / nstep,
             "geo": totals["geo"] / nstep,
             "dens": totals["dens"] / nstep,
+            "class": totals["class"] / nstep,
             "retention": ret,
             "mean_gamma": g_mean,
             "std_gamma": g_std,
@@ -1196,7 +1449,7 @@ def fit(
         }
         log.info(
             "epoch %d: geom=%.4f ord=%.4f "
-            "lm=%.4f frame=%.4f geo=%.4f dens=%.4f "
+            "lm=%.4f frame=%.4f geo=%.4f dens=%.4f class=%.4f "
             "retention=%.3f (chance≈%.3f) mean(gamma)=%.3f std(gamma)=%.3f "
             "usage_ent=%.3f minDm=%.4f",
             epoch + 1,
@@ -1206,6 +1459,7 @@ def fit(
             metrics["frame"],
             metrics["geo"],
             metrics["dens"],
+            metrics["class"],
             metrics["retention"],
             retention_chance,
             metrics["mean_gamma"],
@@ -1233,6 +1487,48 @@ def fit(
                 metrics[f"mean_gamma_{fname}"] = float(np.mean([v[0] for v in vals]))
                 metrics[f"std_gamma_{fname}"] = float(np.mean([v[1] for v in vals]))
         model._g_extra = {}  # type: ignore[attr-defined]
+        for name_c, vals in class_active.items():
+            metrics[f"class_active_{name_c}"] = float(np.mean(vals)) if vals else 0.0
+        if class_diag_idx is not None and (
+            (epoch + 1) % 10 == 0 or epoch + 1 == config.epochs
+        ):
+            assert labels_train is not None
+            with torch.no_grad():
+                xb_c = X_train[class_diag_idx]
+                z_c = []
+                for s in range(0, xb_c.shape[0], 4096):
+                    zb_c, _, _ = model(xb_c[s : s + 4096].to(device))
+                    z_c.append(zb_c.cpu())
+                report = class_axis_report(
+                    torch.cat(z_c, dim=0), labels_train[class_diag_idx], axes_list
+                )
+            metrics.update(report)
+            for ax_c in axes_list:
+                adj = report.get(f"order_adjacent_{ax_c.name}", float("nan"))
+                log.info(
+                    "class axis %r on %s: ordering accuracy %.3f (adjacent "
+                    "classes %.3f, chance %.2f%s)",
+                    ax_c.name,
+                    f"coordinate {ax_c.axis}"
+                    if ax_c.is_pinned
+                    else "its best-separating direction",
+                    report.get(f"order_{ax_c.name}", float("nan")),
+                    adj,
+                    ORDER_CHANCE,
+                    "" if ax_c.is_pinned else " nominal, higher in practice",
+                )
+                if np.isfinite(adj) and adj < ORDER_WARN:
+                    log.warning(
+                        "class axis %r: adjacent-class ordering accuracy %.3f < "
+                        "%.2f (chance %.2f) — the features do not separate "
+                        "consecutive classes in the requested order, so this "
+                        "ordering is not present in the layout. Raising "
+                        "lambda_class will distort the layout rather than fix it",
+                        ax_c.name,
+                        adj,
+                        ORDER_WARN,
+                        ORDER_CHANCE,
+                    )
         if ret < retention_warn:
             log.warning(
                 "factor %r retention_f=%.3f < %.2f (chance≈%.3f) — conditioning "
@@ -1326,5 +1622,15 @@ def fit(
         result.factor_scales = dict(factor_metric.scales)
     if geo_stats:
         result.graph_stats = {**result.graph_stats, **geo_stats}
+    if axes_list:
+        # The split is internal, so the caller cannot otherwise know which rows
+        # trained and which calibrated — and building the readout on training
+        # points while calibrating on held-out ones is exactly the discipline
+        # LandmarkSupport already requires.
+        result.class_axes = list(axes_list)
+        result.class_labels_train = labels_train
+        result.class_labels_calib = labels_calib
+        result.X_train = X_train
+        result.X_calib = X_cal
 
     return result

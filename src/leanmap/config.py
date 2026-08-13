@@ -247,6 +247,36 @@ class PLANEConfig:
     # Stars per step for the density term (reuses the frame-loss sampler).
     density_centers: int = 256
 
+    # Class order as a gauge fix on at most d_out - 1 coordinates (see
+    # ``leanmap.classaxis``). The unsupervised terms fix the layout's shape but
+    # leave rotation and reflection free -- nothing in the objective prefers one
+    # orientation, so refits spend that freedom arbitrarily and "left means
+    # earlier" is not a statement anyone can make about the resulting map. This
+    # term spends it on a user ordering of the class labels instead, by hinging
+    # on the SIGN of the gap between ordered classes along one coordinate and
+    # nothing else: no target positions, no spacing, zero gradient once a pair
+    # is ordered past ``class_margin``. Labels never enter the graph, so what
+    # "neighbour" means is unchanged and the embedding stays an honest feature
+    # embedding that happens to be oriented.
+    #
+    # 0 = off. Because the term is a hinge it is self-limiting rather than a
+    # weight to balance: once the requested order holds it contributes exactly
+    # nothing, so raising it past the point where ``order_adjacent_*`` stops
+    # improving buys nothing and only sharpens the fight in the cases the
+    # features cannot support. Start at 1.0, which puts it on the same footing
+    # as the other unit-scale terms.
+    lambda_class: float = 0.0
+    # Ramp (start, end) as fractions of training, like ``geo_ramp``. A gauge fix
+    # applied to a layout that has not formed yet is choosing the orientation of
+    # noise, and it then has to be undone; the default delay matches the
+    # geodesic gauge, which is the same kind of term.
+    class_ramp: Tuple[float, float] = (0.2, 0.45)
+    # Gap an ordered pair must clear, as a fraction of the constrained
+    # coordinate's own spread, before the hinge releases. Repeated rather than
+    # imported to keep this module free of package imports, as with
+    # ``density_var_shift``; the source of truth is ``classaxis.CLASS_MARGIN``.
+    class_margin: float = 0.05
+
     # optimisation
     batch_edges: int = 4096
     epochs: int = 200
