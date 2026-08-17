@@ -135,6 +135,12 @@ in StoreConfig).
 - **ExemplarPolicy \(p_t\):** three families, tilts, coverage floors;
   `reweight=True` default (\(w/p_t\), ratio-capped). CLI:
   `--exemplar-policy {uniform,sufficient_v1}`.
+- **Landmark-basin epoch unit** (`epoch_unit=landmarks`, default for
+  `N>200k`): `steps = ceil(L × landmark_epoch_samples / batch_edges)`,
+  independent of \(E\) / δ. Optional `landmark_sample_mix∈[0,1]` reweights
+  edge mass toward equal basin coverage via
+  \(w' = w\cdot((1-m)+m\cdot\tfrac12(1/\mu_a+1/\mu_b))\).
+  Historical `epoch_unit=edges` remains the small-N / golden default.
 
 ---
 
@@ -167,12 +173,25 @@ distances (never squashed weights). Default: level 0 below
 
 ---
 
-## 9. Distributed build (hpc; contingency)
+## 9. Distributed build (contingency)
 
-`build/bunches.py` behind `leanmap[hpc]`: probe → landmark reconcile → bunch
-partition → margin halo → owned nets → kNN fill → distributed union-find →
-stitch. Activated by R/N thresholds or `--bunch-partition mpi`.  
-**10M at the R band is a single-node job**; core paths must not depend on bunches.
+`build/bunches.py` + `build/transport.py`: probe → landmark reconcile →
+mass-aware bunch partition → margin halo → owned nets → kNN fill →
+union-find stitch → fuzzy + pyramid **reduce on root**.
+
+**Transport is not the algorithm.** Multi-worker coordination uses
+`BunchTransport`:
+
+| Kind | Flag | Notes |
+|------|------|-------|
+| **FileStore (default multi-node)** | `--bunch-partition fs --stages DIR` | Shared filesystem shards; no mpi4py. Launch with `RANK`/`WORLD_SIZE` (or `--rank`/`--world-size`). |
+| torch.distributed | `--bunch-partition ddp` | Optional; same process group as training (`torchrun`). |
+| mpi4py | `--bunch-partition mpi` | Optional `leanmap[hpc]`. |
+
+**10M at the R band is a single-node job**; core paths must not depend on
+bunches. Workers see full ambient `X` (memmap OK); work is partitioned by
+landmark bunches + halo, not by cutting the feature matrix. Redis-style
+control planes are out of scope (bulk arrays stay on disk).
 
 ---
 
@@ -187,14 +206,25 @@ level, clamp hit rate, ord/lip stats, compression \(N/R\), degenerate fraction.
 ## 11. CLI (App. B)
 
 ```text
+# single-node
 leanmap-graph-build --X X.npy --out graph_store/ \
   --stages graph_stages/ --knn-mode ann \
-  --pyramid-scales 3 --epsilon ... \
-  [--bunch-partition mpi|local]
+  --pyramid-scales 3 --epsilon ...
+
+# multi-node FileStore (no MPI): shared stages dir + RANK/WORLD_SIZE
+WORLD_SIZE=4 RANK=0 leanmap-graph-build --X X.npy --out graph_store/ \
+  --stages /shared/stages --bunch-partition fs --pyramid-scales 3 ...
+# … RANK=1..3 similarly; only rank 0 writes the freeze artefact
+
+# optional
+torchrun --nproc_per_node=G leanmap-graph-build --bunch-partition ddp ...
+mpirun -np P leanmap-graph-build --bunch-partition mpi ...
 
 torchrun --nproc_per_node=G leanmap-train \
   --X X.npy --graph-path graph_store/ \
   --exemplar-policy sufficient_v1 \
+  --epoch-unit landmarks --landmark-epoch-samples 128 \
+  --landmark-sample-mix 0.75 \
   --epochs ... --lambda-path ...
 ```
 

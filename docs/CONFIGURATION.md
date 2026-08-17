@@ -56,6 +56,11 @@ CLI (App. B):
 ```bash
 leanmap-graph-build --X X.npy --out graph.pt
 leanmap-train --X X.npy --graph-path graph.pt --exemplar-policy uniform
+
+# Multi-node FileStore bunches (shared stages; no mpi4py):
+# WORLD_SIZE=4 RANK=0..3 leanmap-graph-build --X X.npy --out graph.pt \
+#   --stages /shared/stages --bunch-partition fs
+# Optional: --bunch-partition ddp (torchrun) or mpi (leanmap[hpc])
 ```
 
 ---
@@ -276,7 +281,10 @@ manifolds and flatten the weights at the same time.
 
 | field | default | measured range | effect |
 |---|---|---|---|
-| `epochs` | 200 base; **240** in `for_scale` small | 60–480 | Digits flat from ~60 on accuracy; 240 recovers geodesic when `lambda_geo=0`. |
+| `epochs` | 200 base; **240** in `for_scale` small; **50** large | 60–480 | Digits flat from ~60 on accuracy; 240 recovers geodesic when `lambda_geo=0`. |
+| `epoch_unit` | `edges` (small/mid); **`landmarks`** for `N>200k` | `edges` / `landmarks` | `landmarks`: steps ≈ `L × landmark_epoch_samples / batch_edges` (δ-independent). |
+| `landmark_epoch_samples` | 128 | 32–512 | Edge draws per landmark per epoch when `epoch_unit=landmarks`. |
+| `landmark_sample_mix` | 0 (small); **0.75** large | 0–1 | Blend toward equal landmark-basin edge coverage. |
 | `lr` | 1e-3 base; **2e-2** in `for_scale` small | 1e-3–2e-2 | Paired with `pca_skip`. |
 | `lr_after` / `lr_switch_epochs` | None / 0 | optional two-phase | Disables warmup+cosine when set. |
 | `batch_edges` | 4096 | 512–4096 | Lower on tiny N. |

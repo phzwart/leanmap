@@ -81,6 +81,12 @@ class TrainConfig:
     epochs: int = 200
     lr: float = 1e-3
     batch_edges: int = 4096
+    # \"edges\": one epoch ≈ pass over active graph edges (historical).
+    # \"landmarks\": one epoch ≈ cover of landmark basins (δ-independent).
+    epoch_unit: str = "edges"
+    landmark_epoch_samples: float = 128.0
+    # Blend edge-mass alias toward equal landmark-basin coverage (0=off, 1=full).
+    landmark_sample_mix: float = 0.0
     pca_skip: bool = True
     warm_start_steps: int = 0
     warm_start_layout: str = "auto"
@@ -370,6 +376,13 @@ class PLANEConfig:
     # optimisation
     batch_edges: int = 4096
     epochs: int = 200
+    # Epoch length unit. \"edges\" (default): steps ≈ E_active / batch_edges.
+    # \"landmarks\": steps ≈ L * landmark_epoch_samples / batch_edges so train
+    # length tracks chart cover, not δ-net size. ``for_scale(N>200k)`` opts in.
+    epoch_unit: str = "edges"
+    landmark_epoch_samples: float = 128.0
+    # Mix edge-mass alias toward equal landmark-basin coverage (0 = golden path).
+    landmark_sample_mix: float = 0.0
     # Tuned for the ``pca_skip=True`` path, where the head only has to refine an
     # already-sensible PCA layout. With ``pca_skip=False`` the head must build the
     # layout from a near-zero init and needs 5e-3..2e-2; see ``pca_skip``.
@@ -485,6 +498,9 @@ class PLANEConfig:
             coarse_first_frac=0.2,
             warm_start_steps=50,
             warm_start_layout="auto",
+            epoch_unit="landmarks",
+            landmark_epoch_samples=128.0,
+            landmark_sample_mix=0.75,
         )
 
 

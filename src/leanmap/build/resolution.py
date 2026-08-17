@@ -6,7 +6,7 @@ target band when fidelity allows; otherwise δ falls back to ε.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -299,8 +299,147 @@ def solve_delta(
     )
 
 
+def _sample_indices(n: int, n_sample: int, seed: int) -> np.ndarray:
+    take = min(int(n_sample), int(n))
+    rng = np.random.default_rng(seed)
+    return rng.choice(n, size=take, replace=False).astype(np.int64)
+
+
+def _pairwise_or_cdist(
+    X_sub: torch.Tensor,
+    dist_fn: Any,
+) -> np.ndarray:
+    """Dense pairwise distances on a subsample (float64)."""
+    from ..distance import chunked_cdist
+
+    D = chunked_cdist(dist_fn, X_sub, X_sub, out_device=X_sub.device)
+    assert isinstance(D, torch.Tensor)
+    return D.detach().cpu().numpy().astype(np.float64, copy=False)
+
+
+def crawl_epsilon(
+    X: ArrayLike,
+    dist_fn: Any,
+    *,
+    n_sample: int = 10_000,
+    epsilons: Optional[Sequence[float]] = None,
+    quantiles: Sequence[float] = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5),
+    seed: int = 0,
+    n_rows: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Browse ε → compression on a **random subsample**.
+
+    Draws ``n_sample`` rows, builds one pairwise distance matrix, then for each
+    candidate radius runs a greedy ball-cover (same cost model as
+    :func:`solve_delta`). Projected full-data ``R`` is
+    ``n_rows * (R_sub / n_sample)``.
+
+    If ``epsilons`` is omitted, candidates are 1-NN quantiles on the sample
+    (plus those quantiles × {1, 2, 4} so the crawl spans duplicate → coarse).
+
+    Returns
+    -------
+    dict
+        ``n``, ``n_sample``, ``seed``, ``nn1_quantiles``, ``rows`` (list of
+        per-ε records with ``epsilon``, ``R_sub``, ``compression_sub``,
+        ``R_proj``, ``compression_proj``), and ``recommend`` (ε whose projected
+        ``R`` is closest to the middle of ``[1e5, 1e6]``, or to ``0.5 * N`` when
+        ``N`` is smaller).
+    """
+    if isinstance(X, np.ndarray):
+        Xt = torch.as_tensor(X, dtype=torch.float32)
+    else:
+        Xt = torch.as_tensor(X, dtype=torch.float32)
+    n = int(Xt.shape[0])
+    n_full = int(n_rows) if n_rows is not None else n
+    idx = _sample_indices(n, n_sample, seed)
+    X_sub = Xt[torch.as_tensor(idx)]
+    take = int(X_sub.shape[0])
+    log = get_logger()
+    log.info("eps crawl: subsample %d / %d (seed=%d)", take, n, seed)
+    D = _pairwise_or_cdist(X_sub, dist_fn)
+    nn1 = _nn1_from_probe(D)
+    nn1_q = {float(q): float(np.quantile(nn1, q)) for q in quantiles}
+
+    if epsilons is None:
+        base = sorted({v for v in nn1_q.values() if np.isfinite(v) and v > 0})
+        cand: list[float] = []
+        for e in base:
+            for m in (1.0, 2.0, 4.0):
+                cand.append(float(e * m))
+        # Always include a few round absolute scales near known PDB recipes.
+        cand.extend([0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0])
+        eps_list = sorted({round(e, 8) for e in cand if e > 0})
+    else:
+        eps_list = [float(e) for e in epsilons]
+
+    rows: list[Dict[str, Any]] = []
+    for eps in eps_list:
+        r_sub = _greedy_ball_cover_count(D, float(eps))
+        comp_sub = float(take / max(r_sub, 1))
+        r_proj = float(n_full) * (r_sub / float(take))
+        comp_proj = float(n_full / max(r_proj, 1.0))
+        rows.append(
+            {
+                "epsilon": float(eps),
+                "R_sub": int(r_sub),
+                "n_sample": take,
+                "compression_sub": comp_sub,
+                "R_proj": r_proj,
+                "compression_proj": comp_proj,
+            }
+        )
+
+    # Recommend ε that lands projected R nearest the design band midpoint,
+    # clamped into [min(1e5, 0.3N), min(1e6, 0.9N)].
+    lo = min(1e5, 0.3 * n_full)
+    hi = min(1e6, max(lo + 1.0, 0.9 * n_full))
+    target = 0.5 * (lo + hi)
+    recommend = min(rows, key=lambda r: abs(r["R_proj"] - target)) if rows else None
+
+    return {
+        "n": n_full,
+        "n_sample": take,
+        "seed": int(seed),
+        "nn1_quantiles": nn1_q,
+        "target_R_band": (lo, hi),
+        "rows": rows,
+        "recommend": recommend,
+    }
+
+
+def format_epsilon_crawl(report: Dict[str, Any]) -> str:
+    """Pretty-print a :func:`crawl_epsilon` report."""
+    lines = [
+        f"N={report['n']}  n_sample={report['n_sample']}  seed={report['seed']}",
+        f"target R band ≈ [{report['target_R_band'][0]:.0f}, {report['target_R_band'][1]:.0f}]",
+        "1-NN quantiles on sample:",
+    ]
+    for q, v in sorted(report["nn1_quantiles"].items()):
+        lines.append(f"  q{q:g} = {v:.6g}")
+    lines.append(
+        f"{'epsilon':>10} {'R_sub':>8} {'N/R_sub':>8} {'R_proj':>10} {'N/R_proj':>8}"
+    )
+    rec_eps = report["recommend"]["epsilon"] if report.get("recommend") else None
+    for r in report["rows"]:
+        mark = " *" if rec_eps is not None and r["epsilon"] == rec_eps else ""
+        lines.append(
+            f"{r['epsilon']:10.6g} {r['R_sub']:8d} {r['compression_sub']:8.2f} "
+            f"{r['R_proj']:10.0f} {r['compression_proj']:8.2f}{mark}"
+        )
+    if report.get("recommend"):
+        r = report["recommend"]
+        lines.append(
+            f"recommend epsilon={r['epsilon']:.6g} → R_proj≈{r['R_proj']:.0f} "
+            f"(N/R≈{r['compression_proj']:.2f})"
+        )
+    return "\n".join(lines)
+
+
 __all__ = [
+    "crawl_epsilon",
     "estimate_epsilon",
+    "format_epsilon_crawl",
     "solve_delta",
     "_one_nn_all",
     "_intrinsic_dim_levina_bickel",

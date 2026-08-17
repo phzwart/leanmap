@@ -671,7 +671,7 @@ def _knn_spill_to_stages(
     batch: int = 2048,
 ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
     """Compute representative kNN in row batches and spill to Zarr stages."""
-    from . import graph_stages as stages
+    from . import stages
 
     log = get_logger()
     R = int(X_rep.shape[0])
@@ -689,10 +689,23 @@ def _knn_spill_to_stages(
         import faiss
 
         assert metric is not None and metric.l2_transform is not None
+        # Avoid OpenMP deadlocks when multiple libomp copies are linked
+        # (common on macOS with torch+faiss); train/search single-threaded.
+        try:
+            faiss.omp_set_num_threads(1)
+        except Exception:  # noqa: BLE001
+            pass
         Xt = metric.l2_transform(X_rep).detach().cpu().numpy().astype(np.float32)
         d = Xt.shape[1]
         nlist = min(int(np.sqrt(R)), max(R // 39, 1))
         nlist = max(nlist, 1)
+        log.info(
+            "knn spill ANN train: R=%d d=%d nlist=%d RSS≈%.0f MiB",
+            R,
+            d,
+            nlist,
+            rss_mb(),
+        )
         quant = faiss.IndexFlatL2(d)
         index = faiss.IndexIVFFlat(quant, d, nlist)
         index.train(Xt)
@@ -1102,6 +1115,10 @@ def _knn_ann(
     if R >= 1000:
         nlist = min(int(np.sqrt(R)), R // 10)
         nlist = max(nlist, 1)
+        try:
+            faiss.omp_set_num_threads(1)
+        except Exception:  # noqa: BLE001
+            pass
         quant = faiss.IndexFlatL2(d)
         index = faiss.IndexIVFFlat(quant, d, nlist)
         index.train(Xt)
@@ -1455,7 +1472,7 @@ def build_graph(
     stages_p = Path(stages_dir) if stages_dir is not None else None
     stages = None
     if stages_p is not None:
-        from . import graph_stages as stages
+        from . import stages
 
         if stages.read_meta(stages_p) is None or not stages.fingerprint_matches(
             stages_p, X
@@ -1676,6 +1693,7 @@ def build_graph(
 
     # 4.4 kNN — staged / caller-supplied / computed
     R = int(X_rep.shape[0])
+    log.info("kNN start: R=%d mode=%s stages=%s RSS≈%.0f MiB", R, mode, stages_p, rss_mb())
     staged_knn = stages.load_knn(stages_p) if stages is not None else None
     if precomputed_knn is not None:
         raw_idx, raw_dist = precomputed_knn
@@ -1703,9 +1721,13 @@ def build_graph(
         stats.knn_mode = "staged"
         stats.knn_recall = None
         stats.extra["precomputed_k"] = int(k_eff)
+        log.info("kNN loaded from stages")
     else:
-        use_spill = stages is not None and R > 50_000
+        # Spill whenever stages are on and R is large enough that in-RAM
+        # brute/ANN workspace is the historical OOM site (was R>50k only).
+        use_spill = stages is not None and R > 20_000
         if use_spill:
+            log.info("kNN spill path (R=%d > 20k, stages on)", R)
             knn_dist, knn_idx, knn_info = _knn_spill_to_stages(
                 X_rep,
                 dist_fn,
@@ -1737,77 +1759,24 @@ def build_graph(
                 stages.mark_knn_complete(stages_p)
         stats.knn_mode = knn_info.get("mode", knn_mode)
         stats.knn_recall = knn_info.get("recall")
-
-    # 4.5 smooth
-    rho, sigma, sdiag = smooth_knn(knn_dist, local_connectivity=local_connectivity)
-    stats.n_no_bracket = sdiag["n_no_bracket"]
-    stats.n_hit_floor = sdiag["n_hit_floor"]
-    stats.n_degenerate = sdiag["n_degenerate"]
-
-    # 4.6 memberships + fuzzy union (NOT mutual-kNN — orphans sparse regions)
-    R = X_rep.shape[0]
-    p = torch.exp(-torch.clamp(knn_dist - rho.unsqueeze(1), min=0.0) / sigma.unsqueeze(1))
-    rows = torch.arange(R, device=X.device).unsqueeze(1).expand_as(knn_idx).reshape(-1)
-    cols = knn_idx.reshape(-1)
-    vals = p.reshape(-1)
-    P = sparse.coo_matrix(
-        (
-            vals.detach().cpu().numpy().astype(np.float32),
-            (rows.cpu().numpy(), cols.cpu().numpy()),
-        ),
-        shape=(R, R),
-    ).tocsr()
-    # Fuzzy union: P + P.T - P.multiply(P.T). Do NOT use mutual-kNN (P.multiply(P.T)).
-    PT = P.T.tocsr()
-    P_sym = P + PT - P.multiply(PT)
-
-    # 4.7 multiplicity
-    w = reps.weight.cpu().numpy()
-    P_sym = P_sym.tocoo()
-    reweight = (w[P_sym.row] * w[P_sym.col]) ** beta_multiplicity
-    P_sym.data = P_sym.data * reweight
-    P_sym = P_sym.tocsr()
-    if P_sym.data.size:
-        P_sym.data /= P_sym.data.max()
-
-    # degree deciles
-    deg = np.asarray(P_sym.sum(axis=1)).ravel()
-    stats.in_degree_deciles = [float(np.quantile(deg, q)) for q in [i / 10 for i in range(1, 10)]]
-    log.info("in-degree deciles: %s", [f"{v:.4f}" for v in stats.in_degree_deciles])
-
-    # 4.8 backbone
-    n_comp, _ = connected_components(P_sym, directed=False)
-    stats.n_components_before_backbone = int(n_comp)
-    log.info("connected components before backbone: %d", n_comp)
-    bb = landmark_backbone(M, dist_fn, reps.rep_idx, X, lambda_bb=lambda_backbone)
-    # maximum merge
-    P_sym = P_sym.tocsr()
-    bb = bb.tocsr()
-    # elementwise maximum of two sparse matrices
-    diff = bb - P_sym
-    diff.data = np.maximum(diff.data, 0)
-    P_sym = P_sym + diff
-    if P_sym.data.size:
-        mx = P_sym.data.max()
-        if mx > 0:
-            P_sym.data /= mx
-
-    # 4.10 edges upper triangle
-    P_sym = P_sym.tocoo()
-    mask = P_sym.row < P_sym.col
-    edges = torch.stack(
-        [
-            torch.as_tensor(P_sym.row[mask], dtype=torch.int64),
-            torch.as_tensor(P_sym.col[mask], dtype=torch.int64),
-        ],
-        dim=1,
+        log.info(
+            "kNN done: mode=%s recall=%s RSS≈%.0f MiB",
+            stats.knn_mode,
+            stats.knn_recall,
+            rss_mb(),
+        )
+    graph = assemble_graph_from_knn(
+        X,
+        metric,
+        reps,
+        knn_idx,
+        knn_dist,
+        M,
+        stats=stats,
+        local_connectivity=local_connectivity,
+        beta_multiplicity=beta_multiplicity,
+        lambda_backbone=lambda_backbone,
     )
-    weights = torch.as_tensor(P_sym.data[mask], dtype=torch.float32)
-    # Drop zeros
-    keep = weights > 0
-    edges, weights = edges[keep], weights[keep]
-
-    graph = Graph(edges=edges, weights=weights, reps=reps, knn_idx=knn_idx.cpu(), stats=stats)
     return graph, M, assign_top1, assign_topc
 
 
@@ -2085,41 +2054,172 @@ def _add_coarse_backbone(
     return Graph(edges=edges, weights=weights, reps=graph.reps, knn_idx=graph.knn_idx, stats=stats)
 
 
-def build_graph_pyramid(
+def representatives_from_membership(
+    rep_idx: torch.Tensor,
+    member_of: torch.Tensor,
+    n: Optional[int] = None,
+) -> Representatives:
+    """Build CSR :class:`Representatives` from ``rep_idx`` and ``member_of``.
+
+    Parameters
+    ----------
+    rep_idx : (R,) int64
+        Raw row indices of representatives.
+    member_of : (N,) int64
+        Cell id in ``0..R-1`` for each raw point (``-1`` allowed only if
+        never referenced; callers should fill every row).
+    n : int, optional
+        Ambient ``N``; defaults to ``member_of.shape[0]``.
+    """
+    rep_idx = torch.as_tensor(rep_idx, dtype=torch.int64).reshape(-1)
+    member_of = torch.as_tensor(member_of, dtype=torch.int64).reshape(-1)
+    if n is None:
+        n = int(member_of.shape[0])
+    if int(member_of.shape[0]) != int(n):
+        raise ValueError(
+            f"member_of length {int(member_of.shape[0])} != n={int(n)}"
+        )
+    R = int(rep_idx.shape[0])
+    if R == 0:
+        return Representatives(
+            rep_idx=rep_idx,
+            member_of=member_of,
+            weight=torch.empty(0, dtype=torch.float32),
+            offsets=torch.zeros(1, dtype=torch.int64),
+            values=torch.empty(0, dtype=torch.int64),
+        )
+    if (member_of < 0).any() or int(member_of.max().item()) >= R:
+        raise ValueError("member_of must be in [0, R) for all rows")
+    order = torch.argsort(member_of, stable=True)
+    counts = torch.bincount(member_of, minlength=R)
+    offsets = torch.zeros(R + 1, dtype=torch.int64)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    return Representatives(
+        rep_idx=rep_idx.contiguous(),
+        member_of=member_of.contiguous(),
+        weight=counts.to(dtype=torch.float32),
+        offsets=offsets,
+        values=order.to(dtype=torch.int64),
+    )
+
+
+def assemble_graph_from_knn(
     X: torch.Tensor,
     metric: MetricSpec,
+    reps: Representatives,
+    knn_idx: torch.Tensor,
+    knn_dist: torch.Tensor,
+    M: torch.Tensor,
+    *,
+    stats: Optional[GraphStats] = None,
+    local_connectivity: int = 1,
+    beta_multiplicity: float = BETA_MULTIPLICITY,
+    lambda_backbone: float = LAMBDA_BACKBONE,
+) -> Graph:
+    """Smooth + fuzzy-union + multiplicity + landmark backbone → :class:`Graph`.
+
+    Shared reduce path for single-node :func:`build_graph` and multi-worker
+    bunches after a global ``(reps, knn)`` is assembled.
+    """
+    log = get_logger()
+    dist_fn: DistanceFn = metric
+    if stats is None:
+        stats = GraphStats()
+    knn_idx = torch.as_tensor(knn_idx, dtype=torch.int64, device=X.device)
+    knn_dist = torch.as_tensor(knn_dist, dtype=torch.float32, device=X.device)
+    R = int(reps.rep_idx.shape[0])
+    if knn_idx.shape[0] != R:
+        raise ValueError(
+            f"knn_idx rows {int(knn_idx.shape[0])} != R={R}"
+        )
+
+    rho, sigma, sdiag = smooth_knn(knn_dist, local_connectivity=local_connectivity)
+    stats.n_no_bracket = sdiag["n_no_bracket"]
+    stats.n_hit_floor = sdiag["n_hit_floor"]
+    stats.n_degenerate = sdiag["n_degenerate"]
+
+    p = torch.exp(
+        -torch.clamp(knn_dist - rho.unsqueeze(1), min=0.0) / sigma.unsqueeze(1)
+    )
+    rows = torch.arange(R, device=X.device).unsqueeze(1).expand_as(knn_idx).reshape(-1)
+    cols = knn_idx.reshape(-1)
+    vals = p.reshape(-1)
+    P = sparse.coo_matrix(
+        (
+            vals.detach().cpu().numpy().astype(np.float32),
+            (rows.cpu().numpy(), cols.cpu().numpy()),
+        ),
+        shape=(R, R),
+    ).tocsr()
+    PT = P.T.tocsr()
+    P_sym = P + PT - P.multiply(PT)
+
+    w = reps.weight.cpu().numpy()
+    P_sym = P_sym.tocoo()
+    reweight = (w[P_sym.row] * w[P_sym.col]) ** beta_multiplicity
+    P_sym.data = P_sym.data * reweight
+    P_sym = P_sym.tocsr()
+    if P_sym.data.size:
+        P_sym.data /= P_sym.data.max()
+
+    deg = np.asarray(P_sym.sum(axis=1)).ravel()
+    stats.in_degree_deciles = [
+        float(np.quantile(deg, q)) for q in [i / 10 for i in range(1, 10)]
+    ]
+    log.info("in-degree deciles: %s", [f"{v:.4f}" for v in stats.in_degree_deciles])
+
+    n_comp, _ = connected_components(P_sym, directed=False)
+    stats.n_components_before_backbone = int(n_comp)
+    log.info("connected components before backbone: %d", n_comp)
+    bb = landmark_backbone(M, dist_fn, reps.rep_idx, X, lambda_bb=lambda_backbone)
+    P_sym = P_sym.tocsr()
+    bb = bb.tocsr()
+    diff = bb - P_sym
+    diff.data = np.maximum(diff.data, 0)
+    P_sym = P_sym + diff
+    if P_sym.data.size:
+        mx = P_sym.data.max()
+        if mx > 0:
+            P_sym.data /= mx
+
+    P_sym = P_sym.tocoo()
+    mask = P_sym.row < P_sym.col
+    edges = torch.stack(
+        [
+            torch.as_tensor(P_sym.row[mask], dtype=torch.int64),
+            torch.as_tensor(P_sym.col[mask], dtype=torch.int64),
+        ],
+        dim=1,
+    )
+    weights = torch.as_tensor(P_sym.data[mask], dtype=torch.float32)
+    keep = weights > 0
+    edges, weights = edges[keep], weights[keep]
+    stats.n_reps = R
+    return Graph(
+        edges=edges,
+        weights=weights,
+        reps=reps,
+        knn_idx=knn_idx.cpu(),
+        stats=stats,
+    )
+
+
+def pyramid_from_finest(
+    graph0: Graph,
+    X: torch.Tensor,
+    metric: MetricSpec,
+    *,
     pyramid_scales: int = 3,
     pyramid_rep_ratio: float = PYRAMID_REP_RATIO,
     pyramid_min_reps: int = 256,
     pyramid_coarse_backbone: float = 1.0,
     pyramid_squash: str = "rational_q99",
-    **build_graph_kwargs: Any,
-) -> Tuple[List[Graph], torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Multi-scale graph pyramid: fine graph + Galerkin-coarsened coarse levels.
-
-    Level 0 is the standard :func:`build_graph` output. Each coarser level
-    contracts the previous graph to ``~R0 / pyramid_rep_ratio**l`` reps (floored
-    at ``pyramid_min_reps``) via :func:`_coarsen_graph`. Coarse levels supply the
-    medium/long-range attraction that anchors global (geodesic) structure.
-
-    Default ``pyramid_coarse_backbone=1.0`` bridges any disconnected regions of
-    the coarsest level with strong spanning edges; it is a no-op when that level
-    is already connected. Pass ``0`` to disable; pass ``pyramid_scales=0`` for a
-    single-scale (legacy) graph.
-
-    Note that depth is capped by ``pyramid_min_reps``: coarsening stops once a
-    level reaches it, so the number of levels can be smaller than
-    ``pyramid_scales + 1`` (with the defaults, 4 levels need ``N`` of roughly
-    17k or more). ``pyramid_level_weights`` is matched to the levels actually
-    built -- see :func:`leanmap.train.fit`.
-
-    Returns ``(graphs, M, assign_top1, assign_topc)`` with ``graphs[0]`` finest.
-    """
+    seed: int = 0,
+) -> List[Graph]:
+    """Galerkin-coarsen ``graph0`` into a pyramid (shared single-/multi-node path)."""
     log = get_logger()
-    graph0, M, assign_top1, assign_topc = build_graph(X, metric, **build_graph_kwargs)
     graphs: List[Graph] = [graph0]
     dist_fn: DistanceFn = metric
-    seed = int(build_graph_kwargs.get("seed", 0))
     R0 = int(graph0.reps.rep_idx.shape[0])
     log.info("pyramid level 0: R=%d edges=%d", R0, int(graph0.edges.shape[0]))
     prev = graph0
@@ -2154,6 +2254,52 @@ def build_graph_pyramid(
             graphs[-1], X, metric, pyramid_coarse_backbone
         )
     log.info("pyramid built: %d level(s)", len(graphs))
+    return graphs
+
+
+def build_graph_pyramid(
+    X: torch.Tensor,
+    metric: MetricSpec,
+    pyramid_scales: int = 3,
+    pyramid_rep_ratio: float = PYRAMID_REP_RATIO,
+    pyramid_min_reps: int = 256,
+    pyramid_coarse_backbone: float = 1.0,
+    pyramid_squash: str = "rational_q99",
+    **build_graph_kwargs: Any,
+) -> Tuple[List[Graph], torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Multi-scale graph pyramid: fine graph + Galerkin-coarsened coarse levels.
+
+    Level 0 is the standard :func:`build_graph` output. Each coarser level
+    contracts the previous graph to ``~R0 / pyramid_rep_ratio**l`` reps (floored
+    at ``pyramid_min_reps``) via :func:`_coarsen_graph`. Coarse levels supply the
+    medium/long-range attraction that anchors global (geodesic) structure.
+
+    Default ``pyramid_coarse_backbone=1.0`` bridges any disconnected regions of
+    the coarsest level with strong spanning edges; it is a no-op when that level
+    is already connected. Pass ``0`` to disable; pass ``pyramid_scales=0`` for a
+    single-scale (legacy) graph.
+
+    Note that depth is capped by ``pyramid_min_reps``: coarsening stops once a
+    level reaches it, so the number of levels can be smaller than
+    ``pyramid_scales + 1`` (with the defaults, 4 levels need ``N`` of roughly
+    17k or more). ``pyramid_level_weights`` is matched to the levels actually
+    built -- see :func:`leanmap.train.fit`.
+
+    Returns ``(graphs, M, assign_top1, assign_topc)`` with ``graphs[0]`` finest.
+    """
+    graph0, M, assign_top1, assign_topc = build_graph(X, metric, **build_graph_kwargs)
+    seed = int(build_graph_kwargs.get("seed", 0))
+    graphs = pyramid_from_finest(
+        graph0,
+        X,
+        metric,
+        pyramid_scales=pyramid_scales,
+        pyramid_rep_ratio=pyramid_rep_ratio,
+        pyramid_min_reps=pyramid_min_reps,
+        pyramid_coarse_backbone=pyramid_coarse_backbone,
+        pyramid_squash=pyramid_squash,
+        seed=seed,
+    )
     return graphs, M, assign_top1, assign_topc
 
 

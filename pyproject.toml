@@ -59,6 +59,7 @@ dev = ["pytest>=7.0", "scikit-learn>=1.0"]
 leanmap = "leanmap.cli:main"
 leanmap-graph-build = "leanmap.cli:main_graph_build"
 leanmap-train = "leanmap.cli:main_train"
+leanmap-eps-crawl = "leanmap.cli:main_eps_crawl"
 
 [project.urls]
 Homepage = "https://github.com/phzwart/leanmap"

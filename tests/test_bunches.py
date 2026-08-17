@@ -1,14 +1,18 @@
-"""PR-10 distributed build bunches (ws=1 + unit helpers)."""
+"""Bunches / FileStore multi-worker graph build tests."""
 from __future__ import annotations
 
 import importlib
 import sys
+import threading
+from pathlib import Path
 
 import pytest
 import torch
 
 from leanmap.build.bunches import (
     build_graph_bunches,
+    build_graph_pyramid_bunches,
+    cut_mass,
     distributed_union_find,
     fill_knn_rows,
     halo_fraction,
@@ -16,13 +20,14 @@ from leanmap.build.bunches import (
     margin_halo,
     owned_net,
     partition_bunches,
+    partition_bunches_by_mass,
     probe_shards,
     reconcile_landmarks,
     stitch_graph,
     uf_link,
-    cut_mass,
 )
 from leanmap.build.pipeline import build_graph
+from leanmap.build.transport import FileStoreTransport, make_transport
 from leanmap.metrics import wrap_metric
 
 
@@ -47,7 +52,6 @@ def test_union_find_determinism_parallel_merges():
     for order in orders[1:]:
         assert roots_from(order).tolist() == ref
 
-    # Multi-array merge (mock per-rank parent pointers) matches single-pass.
     parent_a = list(range(n))
     for a, b in edges[:4]:
         uf_link(parent_a, a, b)
@@ -65,7 +69,7 @@ def test_knn_completeness_audit_full_and_thin():
     assert knn_completeness_audit(4, full, strict=True) == pytest.approx(0.0)
 
     thin = full.clone()
-    thin[:, -2:] = -1  # deliberately incomplete neighbour slots
+    thin[:, -2:] = -1
     miss_thin = knn_completeness_audit(4, thin)
     assert miss_thin == pytest.approx(0.5)
     with pytest.raises(RuntimeError, match="completeness audit failed"):
@@ -98,17 +102,20 @@ def test_ws1_build_graph_bunches_matches_build_graph():
 
 def test_bunches_import_does_not_require_mpi4py(monkeypatch):
     """Top-level import of bunches must work without mpi4py installed."""
-    # Simulate missing mpi4py / mpi4py.MPI.
     monkeypatch.setitem(sys.modules, "mpi4py", None)
     monkeypatch.setitem(sys.modules, "mpi4py.MPI", None)
     sys.modules.pop("leanmap.build.bunches", None)
+    sys.modules.pop("leanmap.build.transport", None)
     mod = importlib.import_module("leanmap.build.bunches")
     assert hasattr(mod, "build_graph_bunches")
     assert hasattr(mod, "distributed_union_find")
-    # Touching MPI-only path should raise with hpc install hint.
+    # Env-based size does not need mpi4py.
     monkeypatch.setenv("WORLD_SIZE", "2")
+    assert mod.mpi_world_size() == 2
+    # Explicit MPI transport still requires mpi4py.
+    tmod = importlib.import_module("leanmap.build.transport")
     with pytest.raises(ImportError, match=r"leanmap\[hpc\]"):
-        mod.mpi_world_size()
+        tmod.MPITransport()
 
 
 def test_probe_reconcile_partition_halo_helpers():
@@ -125,12 +132,16 @@ def test_probe_reconcile_partition_halo_helpers():
     bunch = partition_bunches(torch.arange(9), n_bunches=3)
     assert bunch.tolist() == [0, 0, 0, 1, 1, 1, 2, 2, 2]
 
+    assign = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2, 2])
+    mass = partition_bunches_by_mass(assign, n_bunches=2, n_landmarks=3)
+    assert mass.shape == (3,)
+    assert set(mass.tolist()) <= {0, 1}
+
     assign = torch.tensor([0, 0, 1, 1, 2, 2])
     owned, halo = margin_halo(assign, margin=1)
     assert owned.dtype == torch.bool
-    assert halo.any()  # multi-bunch → boundary fringe
+    assert halo.any()
 
-    # top-c path: foreign shortlist → halo
     topc = torch.tensor([[0, 1], [0, 0], [1, 0], [1, 1]])
     _, halo2 = margin_halo(topc, margin=1)
     assert halo2.tolist() == [True, False, True, False]
@@ -157,10 +168,116 @@ def test_owned_net_and_fill_knn_and_metrics():
 
     stitched = stitch_graph(
         [
-            {"rep_idx": torch.tensor([0, 1]), "edges": torch.tensor([[0, 1]]), "weights": torch.tensor([1.0])},
-            {"rep_idx": torch.tensor([2]), "edges": torch.tensor([[0, 0]]), "weights": torch.tensor([0.5])},
+            {
+                "rep_idx": torch.tensor([0, 1]),
+                "edges": torch.tensor([[0, 1]]),
+                "weights": torch.tensor([1.0]),
+            },
+            {
+                "rep_idx": torch.tensor([2]),
+                "edges": torch.tensor([[0, 0]]),
+                "weights": torch.tensor([0.5]),
+            },
         ],
         n_total=3,
     )
     assert stitched["rep_idx"].tolist() == [0, 1, 2]
     assert stitched["edges"].tolist() == [[0, 1], [2, 2]]
+
+
+def test_filestore_transport_collectives(tmp_path: Path):
+    root = tmp_path / "fs"
+    errors: list[BaseException] = []
+    results: dict[int, object] = {}
+
+    def worker(rank: int) -> None:
+        try:
+            t = FileStoreTransport(root, rank=rank, world_size=2, timeout_s=30.0)
+            t.barrier()
+            gathered = t.allgather_obj({"rank": rank})
+            assert [g["rank"] for g in gathered] == [0, 1]
+            b = t.broadcast_obj(100 if rank == 0 else None, root=0)
+            assert b == 100
+            g = t.gather_obj(rank * 10, root=0)
+            results[rank] = g
+            t.barrier()
+        except BaseException as exc:  # noqa: BLE001 — surface in main thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(r,)) for r in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=60)
+    assert not errors, errors
+    assert results[0] == [0, 10]
+    assert results[1] is None
+
+
+def test_filestore_p2_builds_train_ready_pyramid(tmp_path: Path):
+    """Two FileStore workers produce a root pyramid leanmap-train can consume."""
+    torch.manual_seed(0)
+    X = torch.randn(80, 5)
+    metric = wrap_metric("l2", X=X, n_neighbors=6, seed=0)
+    root = tmp_path / "bunch_work"
+    errors: list[BaseException] = []
+    outcomes: dict[int, object] = {}
+
+    def worker(rank: int) -> None:
+        try:
+            t = FileStoreTransport(root, rank=rank, world_size=2, timeout_s=120.0)
+            out = build_graph_pyramid_bunches(
+                X,
+                metric,
+                transport=t,
+                transport_kind="fs",
+                stages_dir=root,
+                pyramid_scales=1,
+                pyramid_min_reps=8,
+                n_neighbors=6,
+                n_landmarks=16,
+                seed=0,
+                knn_mode="brute",
+                epsilon=0.05,
+                delta="eps",
+                n_probe=40,
+            )
+            outcomes[rank] = out
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(r,)) for r in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=180)
+    assert not errors, errors
+    assert outcomes[1] is None
+    graphs, M, a1, ac = outcomes[0]  # type: ignore[misc]
+    assert len(graphs) >= 1
+    g0 = graphs[0]
+    assert int(g0.reps.member_of.shape[0]) == 80
+    assert int(g0.reps.rep_idx.shape[0]) >= 1
+    assert int(g0.edges.shape[0]) >= 1
+    assert int(g0.knn_idx.shape[0]) == int(g0.reps.rep_idx.shape[0])
+    assert knn_completeness_audit(6, g0.knn_idx) == pytest.approx(0.0)
+    assert M.ndim == 2 and a1.shape == (80,) and ac.ndim == 2
+
+
+def test_poisson_landmarks_from_reps_smoke():
+    from leanmap.build.bunches import poisson_landmarks_from_reps
+    from leanmap.distance import EuclideanDistance
+
+    torch.manual_seed(0)
+    X = torch.randn(40, 3)
+    rep_idx = torch.arange(0, 40, 2)
+    M, lm = poisson_landmarks_from_reps(
+        X, rep_idx, EuclideanDistance(), n_landmarks=5, n_neighbors=4, seed=0
+    )
+    assert M.shape[0] == lm.shape[0] <= 5
+    assert set(lm.tolist()).issubset(set(rep_idx.tolist()))
+
+
+def test_make_transport_fs_requires_stages():
+    with pytest.raises(ValueError, match="stages"):
+        make_transport("fs")

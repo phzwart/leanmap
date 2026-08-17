@@ -136,38 +136,48 @@ def coarse_to_fine_plan(
     batch_edges: int,
     lvl_w: Sequence[float],
     coarse_frac: float,
+    *,
+    epoch_unit: str = "edges",
+    n_landmarks: int = 1,
+    landmark_epoch_samples: float = 128.0,
 ) -> List[Tuple[List[int], int]]:
     """Per-epoch ``(edge counts per level, steps)``, coarsest levels admitted first.
 
-    Steps per epoch are set by the *active* levels' edge count, which is where the
-    saving comes from: the fine graph has ``PYRAMID_REP_RATIO`` times more nodes
-    per coarsening, so an epoch that only touches coarse levels needs
-    proportionally fewer steps to cover its edges. Global layout is what the early
-    epochs decide and coarse edges are what carry it, so paying fine-graph prices
-    for them is waste.
+    Steps per epoch are set by the *active* levels' edge count when
+    ``epoch_unit=\"edges\"`` (historical default). With
+    ``epoch_unit=\"landmarks\"``, steps follow
+    :func:`~leanmap.sampling.edges.landmark_epoch_steps` so the budget tracks
+    landmark-basin cover rather than δ-net edge count.
 
     The first ``coarse_frac`` of epochs is divided evenly among the levels,
     starting from the coarsest alone and admitting one finer level at a time;
-    after that every level is active with the configured weights, which is
-    exactly the old behaviour. ``coarse_frac=0`` reproduces it throughout.
+    after that every level is active with the configured weights.
+    ``coarse_frac=0`` reproduces the old behaviour throughout.
     """
+    from leanmap.sampling.edges import landmark_epoch_steps
+
     n_levels = len(edges_per_level)
     plan: List[Tuple[List[int], int]] = []
     n_warm = int(round(max(0.0, min(1.0, coarse_frac)) * epochs))
+    unit = str(epoch_unit).lower()
     for epoch in range(epochs):
         if epoch < n_warm and n_levels > 1:
-            # phase 0 => coarsest only, last phase => everything
             phase = int(n_levels * epoch / max(n_warm, 1))
             finest = max(0, n_levels - 1 - phase)
             active = list(range(finest, n_levels))
         else:
             active = list(range(n_levels))
         counts = _split_budget(batch_edges, lvl_w, active)
-        # An epoch is one pass over the finest *active* level's edges. With every
-        # level active that is the finest graph, which is how epochs were counted
-        # before this schedule existed, so ``coarse_frac=0`` is unchanged.
-        edges = edges_per_level[min(active)]
-        plan.append((counts, max(1, math.ceil(edges / batch_edges))))
+        if unit in ("landmarks", "landmark", "basin"):
+            steps = landmark_epoch_steps(
+                n_landmarks,
+                batch_edges,
+                samples_per_landmark=landmark_epoch_samples,
+            )
+        else:
+            edges = edges_per_level[min(active)]
+            steps = max(1, math.ceil(edges / batch_edges))
+        plan.append((counts, steps))
     return plan
 
 
@@ -750,7 +760,20 @@ def fit(
             dedup=bool(config.dedup),
         )
 
-    if calib_idx is not None:
+    if calib_idx is not None and int(X_cal.shape[0]) == 0:
+        # Some frozen builds (e.g. bunches) store an empty calib split while
+        # training on all rows. Carve a conformal holdout from ambient X only;
+        # graph membership / train_idx stay unchanged.
+        n_cal = min(int(CALIB_FRAC * N), int(config.calib_max))
+        n_cal = max(n_cal, 1)
+        g_cal = torch.Generator().manual_seed(int(config.seed) ^ 0xC411B)
+        calib_idx = torch.randperm(N, generator=g_cal)[:n_cal]
+        X_cal = X_all[calib_idx]
+        log.info(
+            "cached graph had empty calib; carved %d ambient rows for conformal only",
+            n_cal,
+        )
+    elif calib_idx is not None:
         assert X_cal.shape[0] > 0
 
     # 9. FactorStack
@@ -866,9 +889,42 @@ def fit(
     a_param, b_param = find_ab_params(SPREAD, config.min_dist)
     # One EdgeSampler per pyramid level; per-step batch budget is split across
     # levels by weight so a single forward mixes all scales at ~constant cost.
-    edge_samps = [
-        EdgeSampler(X_train, g, seed=config.seed + li) for li, g in enumerate(graphs)
-    ]
+    from leanmap.sampling.edges import basin_balanced_edge_weights
+
+    mix = float(getattr(config, "landmark_sample_mix", 0.0) or 0.0)
+    edge_samps = []
+    for li, g in enumerate(graphs):
+        w_override = None
+        if mix > 0.0:
+            # Primary landmark of each cell via the cell representative's row.
+            rep_rows = g.reps.rep_idx.detach().cpu().long()
+            # assign_top1 is aligned with the ambient rows used to build the graph.
+            a1 = assign_top1.detach().cpu().long()
+            if int(a1.shape[0]) <= int(rep_rows.max().item()):
+                raise RuntimeError(
+                    "assign_top1 shorter than max rep_idx; cannot basin-weight edges"
+                )
+            cell_lm = a1[rep_rows].numpy()
+            w_override = basin_balanced_edge_weights(
+                g.edges.cpu().numpy(),
+                g.weights.cpu().numpy(),
+                cell_lm,
+                mix=mix,
+            )
+        edge_samps.append(
+            EdgeSampler(
+                X_train,
+                g,
+                seed=config.seed + li,
+                weights=w_override,
+            )
+        )
+    if mix > 0.0:
+        log.info(
+            "landmark basin edge mix=%.3g (epoch_unit=%s)",
+            mix,
+            getattr(config, "epoch_unit", "edges"),
+        )
     n_levels = len(graphs)
     if config.pyramid_level_weights is not None:
         lvl_w = [float(x) for x in config.pyramid_level_weights]
@@ -1238,21 +1294,42 @@ def fit(
 
     E = graph.edges.shape[0]
     steps_per_epoch = max(1, math.ceil(E / config.batch_edges))
+    n_lm_plan = int(M.shape[0]) if M is not None else int(config.n_landmarks)
     plan = coarse_to_fine_plan(
         config.epochs,
         [int(g.edges.shape[0]) for g in graphs],
         config.batch_edges,
         lvl_w,
         config.coarse_first_frac,
+        epoch_unit=str(getattr(config, "epoch_unit", "edges")),
+        n_landmarks=n_lm_plan,
+        landmark_epoch_samples=float(
+            getattr(config, "landmark_epoch_samples", 128.0)
+        ),
     )
     total_steps = sum(steps for _, steps in plan)
+    if str(getattr(config, "epoch_unit", "edges")).lower() in (
+        "landmarks",
+        "landmark",
+        "basin",
+    ):
+        log.info(
+            "epoch_unit=landmarks: %d steps/epoch (L=%d × %.4g samples / batch=%d); "
+            "edge-unit would be %d steps/epoch on finest (E=%d)",
+            plan[-1][1],
+            n_lm_plan,
+            float(getattr(config, "landmark_epoch_samples", 128.0)),
+            int(config.batch_edges),
+            steps_per_epoch,
+            int(E),
+        )
     if config.coarse_first_frac > 0 and n_levels > 1:
         log.info(
             "coarse-to-fine: %d total steps vs %d flat (%.0f%% of the work), "
             "first epoch %d step(s) on levels %s",
             total_steps,
-            steps_per_epoch * config.epochs,
-            100.0 * total_steps / max(steps_per_epoch * config.epochs, 1),
+            plan[-1][1] * config.epochs,
+            100.0 * total_steps / max(plan[-1][1] * config.epochs, 1),
             plan[0][1],
             [i for i, c in enumerate(plan[0][0]) if c > 0],
         )

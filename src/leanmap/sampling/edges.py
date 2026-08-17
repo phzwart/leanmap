@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Callable, Optional, Tuple, Union
 
 import numpy as np
@@ -37,6 +38,69 @@ def _cell_member_csr(
         raise RuntimeError(f"empty cell {cell}")
     j = int(rng.integers(start, end))
     return int(values[j])
+
+
+def basin_balanced_edge_weights(
+    edges: ArrayLike,
+    weights: ArrayLike,
+    cell_landmark: ArrayLike,
+    *,
+    mix: float = 1.0,
+) -> np.ndarray:
+    """Reweight edges toward equal landmark-basin coverage.
+
+    Parameters
+    ----------
+    edges :
+        ``(E, 2)`` representative / cell ids.
+    weights :
+        ``(E,)`` fuzzy edge masses (``> 0``).
+    cell_landmark :
+        ``(R,)`` primary landmark id for each cell.
+    mix :
+        ``0`` keeps ``weights``; ``1`` fully equalizes basins via
+        ``0.5 (1/μ_a + 1/μ_b)`` (mean-normalized). Values in between blend.
+
+    Returns
+    -------
+    weights' : ``(E,)`` float64, strictly positive.
+    """
+    e = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+    w = np.maximum(np.asarray(weights, dtype=np.float64).reshape(-1), 1e-12)
+    cl = np.asarray(cell_landmark, dtype=np.int64).reshape(-1)
+    mix = float(np.clip(mix, 0.0, 1.0))
+    if mix <= 0.0 or e.shape[0] == 0:
+        return w.copy()
+    L = int(cl.max()) + 1 if cl.size else 1
+    la = cl[e[:, 0]]
+    lb = cl[e[:, 1]]
+    mu = np.zeros(L, dtype=np.float64)
+    np.add.at(mu, la, w)
+    np.add.at(mu, lb, w)
+    mu = np.maximum(mu, 1e-12)
+    inv = 0.5 * (1.0 / mu[la] + 1.0 / mu[lb])
+    inv = inv / max(float(inv.mean()), 1e-12)
+    out = w * ((1.0 - mix) + mix * inv)
+    return np.maximum(out, 1e-12)
+
+
+def landmark_epoch_steps(
+    n_landmarks: int,
+    batch_edges: int,
+    *,
+    samples_per_landmark: float = 128.0,
+) -> int:
+    """Steps so each landmark expects ``samples_per_landmark`` edge draws.
+
+    With basin-balanced (or uniform-landmark) sampling, one step of
+    ``batch_edges`` draws spreads roughly uniformly across ``L`` basins, so
+    ``steps = ceil(L * samples_per_landmark / batch_edges)``.
+    Independent of graph edge count ``E`` / δ-net size ``R``.
+    """
+    L = max(1, int(n_landmarks))
+    B = max(1, int(batch_edges))
+    s = max(1.0, float(samples_per_landmark))
+    return max(1, int(math.ceil(L * s / B)))
 
 
 class EdgeSampler:

@@ -375,12 +375,31 @@ def main_graph_build(argv: list[str] | None = None) -> int:
     ap.add_argument("--epsilon", type=float, default=None)
     ap.add_argument("--delta", default=None, help="None|eps|auto|<float>")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--stages", default=None, help="optional Zarr stages directory")
+    ap.add_argument(
+        "--stages",
+        default=None,
+        help="shared stages / bunch work directory (required for --bunch-partition fs)",
+    )
     ap.add_argument(
         "--bunch-partition",
-        choices=("local", "mpi"),
+        choices=("local", "fs", "ddp", "mpi"),
         default="local",
-        help="local (default) or mpi (requires leanmap[hpc])",
+        help=(
+            "local single-process (default); fs=shared --stages FileStore; "
+            "ddp=torch.distributed; mpi=mpi4py (leanmap[hpc])"
+        ),
+    )
+    ap.add_argument(
+        "--rank",
+        type=int,
+        default=None,
+        help="worker rank (default: env RANK or 0); used with --bunch-partition fs",
+    )
+    ap.add_argument(
+        "--world-size",
+        type=int,
+        default=None,
+        help="worker world size (default: env WORLD_SIZE or 1); used with fs",
     )
     args = ap.parse_args(argv)
     from leanmap import PLANEConfig
@@ -419,16 +438,30 @@ def main_graph_build(argv: list[str] | None = None) -> int:
         delta=cfg.delta,
         stages_dir=cfg.graph_stages_dir,
     )
-    if args.bunch_partition == "mpi":
-        from leanmap.build.bunches import build_graph_bunches
-
-        # ws=1 delegates to build_graph; wrap as single-level pyramid.
-        g, M, a1, ac = build_graph_bunches(Xt, metric, **{
-            k: v for k, v in build_kw.items() if k != "pyramid_scales"
-        })
-        graphs = [g]
-    else:
+    if args.bunch_partition == "local":
         graphs, M, a1, ac = build_graph_pyramid(Xt, metric, **build_kw)
+    else:
+        from leanmap.build.bunches import build_graph_pyramid_bunches
+        from leanmap.build.transport import make_transport
+
+        transport = make_transport(
+            args.bunch_partition,
+            stages_dir=args.stages or cfg.graph_stages_dir,
+            rank=args.rank,
+            world_size=args.world_size,
+        )
+        result = build_graph_pyramid_bunches(
+            Xt,
+            metric,
+            transport=transport,
+            transport_kind=args.bunch_partition,
+            stages_dir=args.stages or cfg.graph_stages_dir,
+            **build_kw,
+        )
+        if result is None:
+            # Non-root worker: freeze is root-only.
+            return 0
+        graphs, M, a1, ac = result
     out = Path(args.out)
     n = int(Xt.shape[0])
     train_idx = torch.arange(n, dtype=torch.long)
@@ -503,6 +536,24 @@ def main_train(argv: list[str] | None = None) -> int:
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--lambda-path", type=float, default=None)
     ap.add_argument(
+        "--epoch-unit",
+        choices=("edges", "landmarks"),
+        default=None,
+        help="edges=pass over graph edges; landmarks=basin cover (δ-independent)",
+    )
+    ap.add_argument(
+        "--landmark-epoch-samples",
+        type=float,
+        default=None,
+        help="edge draws per landmark per epoch when --epoch-unit landmarks",
+    )
+    ap.add_argument(
+        "--landmark-sample-mix",
+        type=float,
+        default=None,
+        help="0..1 blend toward equal landmark-basin edge sampling",
+    )
+    ap.add_argument(
         "--exemplar-policy",
         choices=("uniform", "sufficient_v1"),
         default="uniform",
@@ -522,9 +573,63 @@ def main_train(argv: list[str] | None = None) -> int:
         cfg.epochs = args.epochs
     if args.lambda_path is not None:
         cfg.lambda_path = args.lambda_path
+    if args.epoch_unit is not None:
+        cfg.epoch_unit = args.epoch_unit
+    if args.landmark_epoch_samples is not None:
+        cfg.landmark_epoch_samples = float(args.landmark_epoch_samples)
+    if args.landmark_sample_mix is not None:
+        cfg.landmark_sample_mix = float(args.landmark_sample_mix)
     result = fit(X, config=cfg, graph_path=args.graph_path)
     result.save(args.out)
     print(f"wrote {args.out}")
+    return 0
+
+
+def main_eps_crawl(argv: list[str] | None = None) -> int:
+    """``leanmap-eps-crawl`` — browse ε → R on a random subsample."""
+    ap = argparse.ArgumentParser(prog="leanmap-eps-crawl")
+    ap.add_argument("--X", required=True, help="features .npy / .npz")
+    ap.add_argument(
+        "--n-sample",
+        type=int,
+        default=10_000,
+        help="random subsample size for the crawl (default: 10000)",
+    )
+    ap.add_argument(
+        "--eps",
+        default=None,
+        help="comma-separated ε grid (default: auto from sample 1-NN quantiles)",
+    )
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--json-out",
+        default=None,
+        help="optional path to write the full crawl report as JSON",
+    )
+    args = ap.parse_args(argv)
+    import torch
+
+    from leanmap.build.resolution import crawl_epsilon, format_epsilon_crawl
+    from leanmap.metrics import wrap_metric
+
+    X = _load_array(args.X)
+    Xt = torch.as_tensor(X, dtype=torch.float32)
+    metric = wrap_metric("l2", X=Xt, n_neighbors=15, seed=args.seed)
+    epsilons = None
+    if args.eps:
+        epsilons = [float(x.strip()) for x in str(args.eps).split(",") if x.strip()]
+    report = crawl_epsilon(
+        Xt,
+        metric,
+        n_sample=args.n_sample,
+        epsilons=epsilons,
+        seed=args.seed,
+        n_rows=int(Xt.shape[0]),
+    )
+    print(format_epsilon_crawl(report))
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps(report, indent=2) + "\n")
+        print(f"wrote {args.json_out}")
     return 0
 
 

@@ -12,7 +12,9 @@ from .edges import (
     NegativeSampler,
     OrdinalTripletSampler,
     StarSampler,
+    basin_balanced_edge_weights,
     estimate_retention_null,
+    landmark_epoch_steps,
 )
 from .paths import MemmapPathSampler, PathTripletSampler
 from .policy import (
@@ -33,7 +35,9 @@ __all__ = [
     "PathTripletSampler",
     "RATIO_CAP_DEFAULT",
     "StarSampler",
+    "basin_balanced_edge_weights",
     "estimate_retention_null",
+    "landmark_epoch_steps",
     "TwoLevelAlias",
     "build_edge_alias",
     "build_two_level_alias",
