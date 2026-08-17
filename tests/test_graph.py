@@ -126,19 +126,19 @@ def test_estimate_epsilon_uses_all_points():
 
 def test_estimate_epsilon_subsample_is_size_corrected():
     """Without a full pass, the subsample quantile is scaled by (n_sub/N)^(1/m)."""
-    from leanmap import graph as graph_mod
+    from leanmap.build import pipeline as pipeline_mod
 
     torch.manual_seed(4)
     X = torch.randn(800, 3)
     metric = wrap_metric("l2", X=X, n_neighbors=5, seed=0)
     eps_full, _ = estimate_epsilon(X, metric, quantile=0.1, seed=0, metric=metric)
 
-    orig = graph_mod._one_nn_all
-    graph_mod._one_nn_all = lambda *a, **k: None
+    orig = pipeline_mod._one_nn_all
+    pipeline_mod._one_nn_all = lambda *a, **k: None
     try:
         eps_sub, diag = estimate_epsilon(X, metric, n_sample=200, quantile=0.1, seed=0)
     finally:
-        graph_mod._one_nn_all = orig
+        pipeline_mod._one_nn_all = orig
 
     assert diag["scope"] == "subsample"
     assert 0.0 < diag["subsample_correction"] < 1.0

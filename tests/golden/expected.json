@@ -1,0 +1,36 @@
+{
+  "digits_10k": {
+    "M_digest": "a2f76f93c11455bb40f8626b2d73573e5803000c163bb229801dd745f6c0f878",
+    "assign_top1_digest": "a4558487baa26c3cc4a272cb89cc19f9680f2d271739d3c52673aebbca9818d3",
+    "fingerprint": "e8af9aabc4edd3880bddfee47a2437c97795e086d2bee0cbeee103c56c7789fc",
+    "fixture": "digits_10k",
+    "g0.edges": "63f319b3fbd33d27cb177e50994eb14f34ce39591668eb9906169f2cdf65acb6",
+    "g0.weights": "7b0809f8b493a19efb33cb844f0abea43685ae203b93749bbf694995167acba4",
+    "g1.edges": "f7a6130831775a3511b8caddcbe344fc09ad480476b4d0169f18b2414db9f7e5",
+    "g1.weights": "bd8a4a148198810132f06ca621cb158c54be661b0f931237896a34152f899037",
+    "g2.edges": "330d13da5879fa8134b18281ddee3bf91cf7b6871f32f12a4ce9177963ab4e1e",
+    "g2.weights": "dd6c5d3030e4d79607c8e15d03d17b2539bf964d6de8829bb514403ee535961c",
+    "n": 10000,
+    "n_edges0": 24235,
+    "n_graphs": 3,
+    "n_reps0": 2352,
+    "seed": 42
+  },
+  "swiss_cone_2k": {
+    "M_digest": "0f175ee423bdd94b4bba86c63a9eefd38e269c0061a324a7d2a6880b5e35ac95",
+    "assign_top1_digest": "693113702000bdf215ec01834051b431bba96154bacb13f6d161e94a07d32411",
+    "fingerprint": "125fac811cdfb336a681171c27740a33d12bb9314f08bf68a0b25634bc7023d1",
+    "fixture": "swiss_cone_2k",
+    "g0.edges": "e6d80f1b898b56dff11daa3038d83d5d4d0e78fbb958b7f1e692146e3b8b7de8",
+    "g0.weights": "04f698a9dd0fb44c12390c48c4d58aac22af8133776f1d98d3d137287b6fe160",
+    "g1.edges": "84d33ccb14ee42b1335bdd9ed98ea2556e6701dab60e96fb7a48e20204d4e894",
+    "g1.weights": "34ec844ef5d64a37e521a7ca9f0fd461a6ea7f4d742ae9bd3f75900247aa596f",
+    "g2.edges": "e3b5d28eb9d250fc7bb6905af249d39a8c73b603085c785f3d93a66a56eb4f29",
+    "g2.weights": "367b5df664f123f130f9334d4450591f88252a4407a482efb2b1030630495480",
+    "n": 2000,
+    "n_edges0": 17038,
+    "n_graphs": 3,
+    "n_reps0": 1990,
+    "seed": 42
+  }
+}

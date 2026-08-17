@@ -9,8 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .conditioning import FactorStack, Role
-from .landmarks import AnchorAffinity, LandmarkAffinity
+from ..conditioning import FactorStack, Role
+from ..landmarks import AnchorAffinity, LandmarkAffinity
 
 
 def fit_pca_weight(
@@ -353,7 +353,7 @@ class PLANE(nn.Module):
         valid when that view is ambient identity and there is no encoder slice.
         Otherwise: FiLM from ``a(M)`` on zero content features.
         """
-        from .conditioning import FactorHyper, identity_view
+        from ..conditioning import FactorHyper, identity_view
 
         M = self.affinity.M.to(device)
         primary_is_ambient = (
@@ -385,7 +385,7 @@ class PLANE(nn.Module):
             return self.encoder(x0, gamma=g, beta=b)
         if self.factors is not None:
             # Multi-factor: PRIMARY from a(M); other roles contribute identity FiLM
-            from .conditioning import GAMMA_MAX, GAMMA_MIN
+            from ..conditioning import GAMMA_MAX, GAMMA_MIN
 
             gamma = None
             beta = None
@@ -464,6 +464,6 @@ class PLANE(nn.Module):
     @classmethod
     def load(cls, path: str, device: Optional[str] = None) -> "PLANE":
         """Load a saved artefact and return a model ready for ``embed()``."""
-        from .train import load_plane
+        from ..train import load_plane
 
         return load_plane(path, device=device)

@@ -58,7 +58,14 @@ from .path import (
     remap_triplets,
     subset_by_group,
 )
-from .config import PLANEConfig
+from .config import (
+    BuildConfig,
+    PLANEConfig,
+    PolicyConfig,
+    StoreConfig,
+    TrainConfig,
+    compose_plane_config,
+)
 from .conformal import (
     MONDRIAN_GROUPS,
     NONCONFORMITY_SCORES,
@@ -158,10 +165,15 @@ from .negative_space import (
 )
 from .train import PLANEResult, fit, load_plane
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "PLANEConfig",
+    "BuildConfig",
+    "StoreConfig",
+    "TrainConfig",
+    "PolicyConfig",
+    "compose_plane_config",
     "PLANE",
     "PLANEResult",
     "fit",

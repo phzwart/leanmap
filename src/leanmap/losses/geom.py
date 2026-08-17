@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from scipy.optimize import curve_fit
 
-from .utils import get_logger
+from ..utils import get_logger
 
 
 def _fit_ab(spread: float, min_dist: float) -> Tuple[float, float]:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 # ---------------------------------------------------------------------------
 # Plumbing constants — never varied as knobs; demoted from PLANEConfig.
@@ -35,15 +35,89 @@ FRAME_NORMAL_THRESH: float = 0.5
 MDS_NEG_EIGEN_WARN: float = 0.10
 
 
+
+@dataclass
+class BuildConfig:
+    """Graph construction knobs (N/R streaming passes)."""
+
+    n_neighbors: int = 15
+    local_connectivity: int = 1
+    min_dist: float = 0.5
+    dedup: bool = True
+    epsilon: Optional[float] = None
+    delta: Optional[Union[float, str]] = None
+    beta_multiplicity: float = BETA_MULTIPLICITY
+    pyramid_scales: int = 3
+    pyramid_min_reps: int = 256
+    pyramid_level_weights: Optional[Sequence[float]] = (1.0, 1.0, 2.0, 4.0)
+    pyramid_coarse_backbone: float = 1.0
+    pyramid_squash: str = "rational_q99"
+    n_landmarks: int = 256
+    landmark_geodesic: bool = False
+    landmark_poisson: bool = False
+    knn_mode: str = "auto"
+    graph_stages_dir: Optional[str] = None
+    gauge_level: Optional[int] = None
+    seed: int = 0
+
+
+@dataclass
+class StoreConfig:
+    """Frozen graph store backend selection."""
+
+    graph_path: Optional[str] = None
+    backend: str = "auto"  # auto | ptfile | dirstore
+    r_spill: int = 50_000
+    full_verify: bool = False
+
+
+@dataclass
+class TrainConfig:
+    """Encoder training schedule and loss weights (subset of PLANEConfig)."""
+
+    width: int = 384
+    depth: int = 3
+    d_out: int = 2
+    epochs: int = 200
+    lr: float = 1e-3
+    batch_edges: int = 4096
+    pca_skip: bool = True
+    warm_start_steps: int = 0
+    warm_start_layout: str = "auto"
+    coarse_first_frac: float = 0.0
+    apply_large_n_schedule: bool = False
+    lambda_path: float = 0.0
+    lambda_class: float = 0.0
+    lambda_geo: float = 0.05
+    lambda_density: float = 1.0
+    device: Optional[str] = None
+    seed: int = 0
+
+
+@dataclass
+class PolicyConfig:
+    """Exemplar stream measure p_t."""
+
+    exemplar_policy: str = "uniform"
+    reweight: bool = True
+
+
 @dataclass
 class PLANEConfig:
     """Hyperparameters for graph construction, model, losses, and training.
 
-    At ``N <= 5k`` :meth:`for_scale` ships the measured digits/s-curve recipe
-    (no PCA skip, raised ``lr``, mid capacity, ``lambda_geo=0.15``). Larger
-    ``N`` keeps a milder default schedule.
-    """
+    .. deprecated:: 0.3
+        Prefer :class:`BuildConfig`, :class:`StoreConfig`, :class:`TrainConfig`,
+        and :class:`PolicyConfig` (compose via :func:`compose_plane_config`).
+        ``PLANEConfig`` remains a compatibility facade for one cycle.
 
+    At ``N <= 5k`` :meth:`for_scale` ships the measured digits/s-curve recipe
+    (no PCA skip, raised ``lr``, mid capacity, ``lambda_geo=0.15``). Mid-scale
+    keeps a milder default schedule. At ``N > 200k`` it also turns on warm
+    start and ``coarse_first_frac=0.2``. Opt into the same fill-in for blank
+    configs at ``N >= 50k`` via ``apply_large_n_schedule`` +
+    :func:`apply_scale_train_defaults`.
+    """
     # geometry
     n_neighbors: int = 15
     local_connectivity: int = 1
@@ -85,6 +159,12 @@ class PLANEConfig:
     # None => estimate when dedup; ignored if dedup=False. ``fit`` writes the
     # resolved value back, so a saved artefact carries a fixed merge radius.
     epsilon: Optional[float] = None
+    # Net radius δ. ``None`` / ``"eps"`` keep δ = ε (bit-compat with today's
+    # ε-net). ``"auto"`` calibrates δ via ``solve_delta`` so expected R lands in
+    # the target band when the α fidelity guard allows. A float uses that radius
+    # directly (clamped to ≥ ε). Default ``None`` always means ε — never auto —
+    # so small-N goldens stay bit-identical.
+    delta: Optional[Union[float, str]] = None
     # Exponent on the cell-multiplicity reweighting (w_i w_j)^beta of edge
     # memberships. This is a statement about what a duplicate row *means*, so it
     # belongs to the dataset, not to the plumbing. Use beta -> 0 when repeated
@@ -215,6 +295,10 @@ class PLANEConfig:
     # is the right test when the MDS negative-eigenvalue ratio is large and the
     # anchor target is not faithfully embeddable.
     lambda_anchor: float = 1.0
+    # Pyramid level for Dijkstra gauge geodesics. ``None`` => auto via
+    # ``select_gauge_level(R)`` (level 0 below R≈3e5, else 1). Always clamped
+    # to 0 when the pyramid has only one level.
+    gauge_level: Optional[int] = None
     lambda_lm: float = 0.1
 
     # Which neighbourhoods come out crowded. Left alone that is decided by
@@ -326,6 +410,14 @@ class PLANEConfig:
     # which is the behaviour every recipe here was tuned against.
     coarse_first_frac: float = 0.0
 
+    # When True, :func:`apply_scale_train_defaults` may fill warm-start /
+    # coarse-first fields that are still at their unset class sentinels
+    # (``warm_start_steps=0``, ``coarse_first_frac=0``) for large ``N``.
+    # Default False keeps existing recipes and small-N goldens bit-compatible;
+    # :meth:`for_scale` for ``N > 200_000`` bakes the large-N schedule in
+    # directly without requiring this flag.
+    apply_large_n_schedule: bool = False
+
     # conformal
     calib_max: int = 2000
 
@@ -338,9 +430,20 @@ class PLANEConfig:
     seed: int = 0
     device: Optional[str] = None
 
+    # Within-epoch exemplar stream measure p_t (PR-9). ``uniform`` reproduces
+    # prior EdgeSampler behaviour (alias ∝ edge mass). ``sufficient_v1`` enables
+    # visit/violation tilts + coverage floors; path/class-axis stay independently
+    # usable under either mode.
+    exemplar_policy: str = "uniform"
+
     @classmethod
     def for_scale(cls, N: int) -> "PLANEConfig":
-        """Return scale-appropriate presets for dataset size ``N``."""
+        """Return scale-appropriate presets for dataset size ``N``.
+
+        ``N <= 5_000`` keeps the measured small-N recipe (warm start off,
+        ``coarse_first_frac=0``). ``N > 200_000`` enables a coarse-first
+        schedule and a short warm-start regression; mid-scale is unchanged.
+        """
         base = cls()
         if N <= 5_000:
             # Measured DIGITS_MATCHED recipe (digits / s-curve scale).
@@ -367,6 +470,10 @@ class PLANEConfig:
                 epochs=200,
                 calib_max=2000,
             )
+        # Large-N: warm start + coarse-first are part of the preset (not gated
+        # on ``apply_large_n_schedule``). Callers that build a blank config and
+        # want the same fill-in at N>=50k can set that flag and call
+        # :func:`apply_scale_train_defaults`.
         return replace(
             base,
             width=512,
@@ -375,4 +482,73 @@ class PLANEConfig:
             n_neighbors=15,
             epochs=50,
             calib_max=2000,
+            coarse_first_frac=0.2,
+            warm_start_steps=50,
+            warm_start_layout="auto",
         )
+
+
+# Unset sentinels for :func:`apply_scale_train_defaults` (class defaults).
+_UNSET_WARM_START_STEPS: int = 0
+_UNSET_COARSE_FIRST_FRAC: float = 0.0
+_LARGE_N_SCHEDULE_THRESHOLD: int = 50_000
+_LARGE_N_COARSE_FIRST_FRAC: float = 0.2
+_LARGE_N_WARM_START_STEPS: int = 50
+
+
+def apply_scale_train_defaults(config: PLANEConfig, N: int) -> PLANEConfig:
+    """Apply N-keyed warm-start / coarse-first defaults when still unset.
+
+    Bit-compat rules
+    ----------------
+    * No-op unless ``config.apply_large_n_schedule`` is True (default False).
+    * ``N < 5_000`` is never mutated (small-N goldens / ``for_scale`` recipe).
+    * For ``N >= 50_000``, only fields still at class sentinels are filled:
+      ``warm_start_steps==0`` → 50, ``coarse_first_frac==0`` → 0.2.
+      ``warm_start_layout`` is left alone (class default ``"auto"`` is already
+      the large-N preference; an explicit choice is never overwritten).
+
+    ``PLANEConfig.for_scale(N>200k)`` sets the same schedule directly so the
+    common ``for_scale`` path does not need the flag.
+    """
+    if not getattr(config, "apply_large_n_schedule", False):
+        return config
+    if N < 5_000:
+        return config
+    if N >= _LARGE_N_SCHEDULE_THRESHOLD:
+        if config.coarse_first_frac == _UNSET_COARSE_FIRST_FRAC:
+            config.coarse_first_frac = _LARGE_N_COARSE_FIRST_FRAC
+        if config.warm_start_steps == _UNSET_WARM_START_STEPS:
+            config.warm_start_steps = _LARGE_N_WARM_START_STEPS
+    return config
+
+
+def compose_plane_config(
+    build: Optional[BuildConfig] = None,
+    store: Optional[StoreConfig] = None,
+    train: Optional[TrainConfig] = None,
+    policy: Optional[PolicyConfig] = None,
+) -> PLANEConfig:
+    """Merge split configs into a :class:`PLANEConfig` compatibility object."""
+    cfg = PLANEConfig()
+    # Bypass dataclass replace noise: copy overlapping fields.
+    for part in (build, store, train, policy):
+        if part is None:
+            continue
+        for k, v in part.__dict__.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+    return cfg
+
+
+def warn_planeconfig_deprecated() -> None:
+    """Emit the one-shot PLANEConfig deprecation notice (CLI / docs hooks)."""
+    import warnings
+
+    warnings.warn(
+        "PLANEConfig is deprecated in leanmap 0.3; prefer BuildConfig, "
+        "StoreConfig, TrainConfig, and PolicyConfig via compose_plane_config(). "
+        "PLANEConfig will be removed in a future major release.",
+        DeprecationWarning,
+        stacklevel=2,
+    )

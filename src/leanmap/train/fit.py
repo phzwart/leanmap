@@ -13,7 +13,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 
-from .conditioning import (
+from ..conditioning import (
     RETENTION_CHANCE,
     RETENTION_WARN,
     ConditioningFactor,
@@ -23,7 +23,7 @@ from .conditioning import (
     default_primary_factor,
     metric_from_factors,
 )
-from .classaxis import (
+from ..classaxis import (
     CLASS_PAIRS_PER_STEP,
     ORDER_CHANCE,
     ORDER_WARN,
@@ -34,13 +34,13 @@ from .classaxis import (
     class_order_loss,
     validate_class_axes,
 )
-from .path import (
+from ..path import (
     PATH_PAIRS_PER_STEP,
     PathConstraint,
     PathTripletSampler,
     path_constraint_loss,
 )
-from .config import (
+from ..config import (
     C_BUCKETS,
     C_SEARCH,
     CALIB_FRAC,
@@ -60,12 +60,13 @@ from .config import (
     SPREAD,
     WARMUP_FRAC,
     WEIGHT_DECAY,
+    apply_scale_train_defaults,
 )
-from .conformal import ConformalCalibrator, geometry_consistency_score, model_weight_hash
-from .density import density_budget, density_correlation_loss, star_log_radius
-from .distance import DistanceFn
-from .evaluate import geodesic_fidelity
-from .graph import (
+from ..conformal import ConformalCalibrator, geometry_consistency_score, model_weight_hash
+from ..density import density_budget, density_correlation_loss, star_log_radius
+from ..distance import DistanceFn, chunked_cdist
+from ..evaluate import geodesic_fidelity
+from ..graph import (
     Graph,
     build_graph,
     build_graph_pyramid,
@@ -74,28 +75,32 @@ from .graph import (
     save_graph_pyramid,
     tensor_fingerprint,
 )
-from .warmstart import LAYOUTS as WARM_START_LAYOUTS, spectral_layout, warm_start
-from .landmarks import AnchorAffinity, LandmarkAffinity, classical_mds, landmark_geodesic_matrix
-from .losses import (
+from ..warmstart import LAYOUTS as WARM_START_LAYOUTS, spectral_layout, warm_start
+from ..landmarks import AnchorAffinity, LandmarkAffinity, classical_mds
+from ..losses import (
     alignment_ramp,
     find_ab_params,
     fuzzy_cross_entropy,
+    gauge_nu_diagnostic,
     geodesic_stress_loss,
+    landmark_geodesics_on_level,
     landmark_regularisation,
     local_rigidity_loss,
+    metric_edge_lengths,
     ordinal_triplet_loss,
     procrustes_anchor_loss,
+    select_gauge_level,
 )
-from .metrics import MetricSpec, wrap_metric
-from .model import ConcatEncoder, FiLMEncoder, PLANE, fit_pca_weight
-from .sampler import (
+from ..metrics import MetricSpec, wrap_metric
+from ..model import ConcatEncoder, FiLMEncoder, PLANE, fit_pca_weight
+from ..sampler import (
     EdgeSampler,
     NegativeSampler,
     OrdinalTripletSampler,
     StarSampler,
     estimate_retention_null,
 )
-from .utils import ensure_2d_float32, get_logger, resolve_device, seed_everything
+from ..utils import ensure_2d_float32, get_logger, resolve_device, seed_everything
 
 
 def _metric_name_from_dist_fn(dist_fn: Any) -> str:
@@ -274,7 +279,7 @@ class PLANEResult:
 
 def load_plane(path: Union[str, Path], device: Optional[str] = None) -> PLANE:
     """Load a saved artefact into a ``PLANE`` ready for ``embed()``."""
-    from .metrics import get_metric
+    from ..metrics import get_metric
 
     payload = torch.load(str(path), map_location=device or "cpu", weights_only=False)
     cfg = PLANEConfig(**{k: v for k, v in payload["config"].items() if k in PLANEConfig.__dataclass_fields__})
@@ -296,7 +301,7 @@ def load_plane(path: Union[str, Path], device: Optional[str] = None) -> PLANE:
     if factor_payload:
         # Rebuild FactorStack with identity views (callables are not serialised;
         # identity PRIMARY matches the default fit path).
-        from .conditioning import identity_view
+        from ..conditioning import identity_view
 
         defs: List[ConditioningFactor] = []
         affs: List[AnchorAffinity] = []
@@ -465,8 +470,8 @@ def fit(
         ``X`` (before any calibration split). Does not enter the neighbour
         graph. Requires ``config.lambda_path > 0`` to affect the layout.
     """
-    from .conditioning import identity_view
-    from .landmarks import assign_buckets, init_anchors
+    from ..conditioning import identity_view
+    from ..landmarks import assign_buckets, init_anchors
 
     log = get_logger()
     if config is None:
@@ -475,6 +480,10 @@ def fit(
     seed_everything(config.seed)
     device = resolve_device(config.device)
     X_all = torch.as_tensor(ensure_2d_float32(X), dtype=torch.float32)
+    # Optional large-N schedule fill-in (no-op unless apply_large_n_schedule).
+    # for_scale(N>200k) already bakes warm start / coarse-first; this covers
+    # blank configs that opt in at N>=50k without changing small-N goldens.
+    apply_scale_train_defaults(config, int(X_all.shape[0]))
     enc_view = encoder_view if encoder_view is not None else (lambda t: t)
 
     if precomputed_knn is not None:
@@ -581,7 +590,7 @@ def fit(
     elif isinstance(dist_fn, str) or isinstance(dist_fn, MetricSpec) or hasattr(dist_fn, "blocks"):
         metric = wrap_metric(dist_fn, X=X_train, n_neighbors=config.n_neighbors, seed=config.seed)
     else:
-        from .metrics import get_metric
+        from ..metrics import get_metric
 
         metric = wrap_metric(
             get_metric("custom", fn=dist_fn, differentiable=True),
@@ -682,6 +691,7 @@ def fit(
             n_landmarks=n_graph_landmarks,
             c_buckets=C_BUCKETS,
             epsilon=config.epsilon,
+            delta=config.delta,
             dedup=config.dedup,
             local_connectivity=config.local_connectivity,
             beta_multiplicity=config.beta_multiplicity,
@@ -708,6 +718,13 @@ def fit(
         log.info(
             "epsilon=%.6g frozen into the saved config (pass epsilon=None to re-estimate)",
             config.epsilon,
+        )
+    if config.delta is None or config.delta == "auto" or config.delta == "eps":
+        config = replace(config, delta=float(getattr(graph.stats, "delta", graph.stats.epsilon)))
+        log.info(
+            "delta=%.6g frozen into the saved config (mode=%s)",
+            config.delta,
+            graph.stats.extra.get("delta_mode", "eps"),
         )
 
     if (
@@ -930,18 +947,35 @@ def fit(
             config.density_ramp,
             config.density_var_shift,
         )
-    # Coarse geodesic backbone: classical MDS of landmark geodesics +
-    # Procrustes pull (absolute gauge) plus optional pairwise stress.
+    # Coarse geodesic backbone: classical MDS of landmark geodesics on a
+    # selectable pyramid level (metric edge lengths) + Procrustes pull
+    # (absolute gauge) plus optional pairwise stress.
     geo_pack = None
     if config.lambda_geo > 0:
-        gk = (
-            LANDMARK_GEODESIC_K
-            if LANDMARK_GEODESIC_K is not None
-            else config.n_neighbors
-        )
-        X_lm, G_geo, finite_geo = landmark_geodesic_matrix(
-            X_train, M, metric, n_neighbors=gk
-        )
+        n_levels = len(graphs)
+        n_reps0 = int(graphs[0].reps.rep_idx.shape[0])
+        if n_levels <= 1:
+            resolved_gauge = 0
+        elif config.gauge_level is not None:
+            resolved_gauge = int(config.gauge_level)
+            resolved_gauge = max(0, min(resolved_gauge, n_levels - 1))
+        else:
+            resolved_gauge = select_gauge_level(n_reps0)
+            resolved_gauge = max(0, min(resolved_gauge, n_levels - 1))
+
+        g_gauge = graphs[resolved_gauge]
+        X_rep_g = X_train[g_gauge.reps.rep_idx]
+        lengths = metric_edge_lengths(X_rep_g, g_gauge.edges, metric)
+        # Map each landmark to its nearest training row, then to the level node.
+        _, nn_idx = chunked_cdist(metric, M, X_train, topk=1, out_device=X_train.device)
+        lm_raw = nn_idx[:, 0].detach().cpu().to(torch.int64)
+        X_lm = X_train[lm_raw].contiguous()
+        lm_level = g_gauge.reps.member_of[lm_raw].to(torch.int64)
+
+        G_geo = landmark_geodesics_on_level(g_gauge, lengths, lm_level)
+        finite_geo = torch.isfinite(G_geo)
+        finite_geo = finite_geo.clone()
+        finite_geo.fill_diagonal_(False)
         ii, jj = torch.where(torch.triu(finite_geo, diagonal=1))
         if ii.numel() == 0:
             log.warning(
@@ -951,26 +985,35 @@ def fit(
             Z_mds, mds_diag = classical_mds(
                 G_geo, d=config.d_out, finite=finite_geo, return_diagnostics=True
             )
-            graph.stats.extra.update(mds_diag)
-            neg_ratio = float(mds_diag["mds_neg_eigen_ratio"])
+            nu = gauge_nu_diagnostic(Z_mds, G_geo, finite=finite_geo)
+            gauge_info = {
+                "gauge_level": int(resolved_gauge),
+                "nu": float(nu),
+                **mds_diag,
+            }
+            graph.stats.extra.update(gauge_info)
+            neg_ratio = float(nu)
             if neg_ratio > MDS_NEG_EIGEN_WARN:
                 # Reported, not acted on: making a loss weight a hidden function
                 # of a diagnostic is the buried coupling this config avoids.
                 log.warning(
-                    "classical MDS negative-eigenvalue mass = %.3f (> %.2f): the "
-                    "landmark geodesics are not well embeddable in %d-D, so the "
-                    "Procrustes target is a lossy projection. Consider "
-                    "lambda_anchor=0 with lambda_frame > 0, which keeps metric "
-                    "fidelity without pinning a gauge that does not exist.",
+                    "classical MDS negative-eigenvalue mass ν=%.3f (> %.2f) on "
+                    "gauge level %d: the landmark geodesics are not well "
+                    "embeddable in %d-D, so the Procrustes target is a lossy "
+                    "projection. Consider lambda_anchor=0 with lambda_frame > 0, "
+                    "which keeps metric fidelity without pinning a gauge that "
+                    "does not exist.",
                     neg_ratio,
                     MDS_NEG_EIGEN_WARN,
+                    resolved_gauge,
                     config.d_out,
                 )
             else:
                 log.info(
-                    "classical MDS negative-eigenvalue mass = %.3f; top-%d "
+                    "classical MDS ν=%.3f on gauge level %d; top-%d "
                     "eigenvalues carry %.3f of the positive spectrum",
                     neg_ratio,
+                    resolved_gauge,
                     config.d_out,
                     float(mds_diag["mds_top_eigen_frac"]),
                 )
@@ -984,9 +1027,10 @@ def fit(
             }
             n_pairs = int(ii.numel())
             log.info(
-                "geodesic backbone: L=%d MDS+Procrustes + stress pairs=%d "
-                "(%.1f%%) geo median=%.4g lambda_geo=%.3g ramp=%s",
+                "geodesic backbone: L=%d level=%d MDS+Procrustes + stress "
+                "pairs=%d (%.1f%%) geo median=%.4g lambda_geo=%.3g ramp=%s",
                 X_lm.shape[0],
+                resolved_gauge,
                 n_pairs,
                 100.0 * n_pairs / max(X_lm.shape[0] * (X_lm.shape[0] - 1) / 2, 1),
                 float(g_vals.median().item()),
@@ -1318,11 +1362,15 @@ def fit(
             x_mid, x_far, mask = x_mid.to(device), x_far.to(device), mask.to(device)
             z_mid, _, _ = model(x_mid)
             z_far, _, _ = model(x_far)
+            # DDP: allreduce ordinal path-scale batch mean (ā of ||z_a-z_f||)
+            # via allreduce_path_scale / sync_train_stats before the EMA update.
             L_ord, scale_state = ordinal_triplet_loss(
                 z_i, z_j, z_mid, z_far, mask, scale_state
             )
             retentions.append(retention)
 
+            # DDP: allreduce_mean_affinity(a_i.mean(0)) before entropy in
+            # landmark_regularisation (per-rank ā biases H(ā)).
             L_lm = landmark_regularisation(a_i, Dm_i, eta=ETA_BALANCE)
 
             # Dedicated pairs rather than reusing the edge batch: the edge
@@ -1367,6 +1415,7 @@ def fit(
                     zn, _, _ = model(xn.to(device))
                     zm, _, _ = model(xm.to(device))
                     zf, _, _ = model(xf.to(device))
+                    # DDP: allreduce_path_scale(batch_s) before scale_state EMA.
                     l_p, st_p, ofrac = path_constraint_loss(
                         za,
                         zn,
@@ -1413,6 +1462,8 @@ def fit(
                 B_d, m_d, _ = xdn.shape
                 zdc, _, _ = model(xdc.to(device))
                 zdn, _, _ = model(xdn.reshape(B_d * m_d, -1).to(device))
+                # DDP: allreduce_density_moments(mean, sq_mean, count) before
+                # correlation centering (local means ≠ global moments).
                 L_dens = density_correlation_loss(
                     zdc,
                     zdn.view(B_d, m_d, -1),
@@ -1423,6 +1474,9 @@ def fit(
 
             L_geo = z_i.sum() * 0.0
             if geo_pack is not None and geo_ramp > 0:
+                # DDP: geo is replicated on every rank — do NOT allreduce geo
+                # pair tensors / geodesic distances (identical inputs → grads
+                # average cleanly under DDP).
                 # Embed ALL landmarks; Procrustes-pull toward classical MDS
                 # layout (untwists the global gauge). Mild pairwise stress on
                 # a subsample keeps metric fidelity without trapping a twist.

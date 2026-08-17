@@ -1,6 +1,8 @@
 # Design: Scaling leanmap graph construction and training to 10M rows
 
-**Status:** design proposal for external review  
+> **Superseded for implementation** by [`leanmap_scale_design_v2.md`](leanmap_scale_design_v2.md) and the choices in [`departures_from_10m_design.md`](departures_from_10m_design.md). This file remains as historical review context.
+
+**Status:** design proposal for external review (historical)  
 **Audience:** ML systems and scientific software reviewers  
 **Scope:** leanmap core APIs; motivating workload is large ambient embeddings (e.g. protein n-mer feature matrices at \(N \sim 3\times 10^5\) today, target \(N \sim 10^7\))  
 **Code today:** [`src/leanmap/graph.py`](../../src/leanmap/graph.py), [`src/leanmap/graph_stages.py`](../../src/leanmap/graph_stages.py), [`src/leanmap/train.py`](../../src/leanmap/train.py), [`src/leanmap/sampler.py`](../../src/leanmap/sampler.py), optional `leanmap[hpc]` (`faiss`, `zarr`, `mpi4py`)

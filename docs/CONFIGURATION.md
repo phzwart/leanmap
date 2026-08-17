@@ -1,8 +1,32 @@
 # Configuration guide
 
-Practical settings for leanmap. Every knob listed here is part of the public
-`PLANEConfig` surface. Defaults match the measured recipe for `N ≤ 5k` when
-you call `PLANEConfig.for_scale(N)`.
+Practical settings for leanmap. Prefer the **split configs** introduced in
+0.3; `PLANEConfig` remains a compatibility facade for one deprecation cycle.
+
+```python
+from leanmap import (
+    BuildConfig,
+    TrainConfig,
+    PolicyConfig,
+    compose_plane_config,
+    fit,
+)
+
+build = BuildConfig(n_landmarks=128, pyramid_scales=3)
+train = TrainConfig(epochs=40, lr=2e-2, pca_skip=False)
+policy = PolicyConfig(exemplar_policy="uniform")
+cfg = compose_plane_config(build=build, train=train, policy=policy)
+# or still: cfg = PLANEConfig.for_scale(len(X))
+result = fit(X, dist_fn="l2", config=cfg)
+Z, score = result.embed(X)
+```
+
+**Core capabilities** (path constraints, class-axis ordering, conformal /
+Mondrian OOD, density ordering, conditioning) are first-class — not optional
+extras. See `lambda_path`, `lambda_class`, `path_constraints=`, `class_axes=`.
+
+Defaults match the measured recipe for `N ≤ 5k` when you call
+`PLANEConfig.for_scale(N)` (or compose equivalent fields).
 
 ```python
 from leanmap import PLANEConfig, fit
@@ -16,6 +40,22 @@ Derive `n_landmarks` and `tau_scale` from the data rather than guessing:
 
 ```bash
 python examples/exploratory/calibrate.py --X data.npy --target-perp 8
+```
+
+### Scale knobs (v2)
+
+| Knob | Config | Notes |
+|------|--------|-------|
+| `delta` | Build | `None`/`"eps"` = today; `"auto"` calibrates into R band |
+| `gauge_level` | Build | `None` = auto (0 below \(R\approx3\times10^5\)) |
+| `exemplar_policy` | Policy | `uniform` (default) or `sufficient_v1` |
+| Store backend | Store | `auto` picks `ptfile` vs directory on R |
+
+CLI (App. B):
+
+```bash
+leanmap-graph-build --X X.npy --out graph.pt
+leanmap-train --X X.npy --graph-path graph.pt --exemplar-policy uniform
 ```
 
 ---
