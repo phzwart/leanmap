@@ -54,40 +54,56 @@ so modulating before the norm would make `GAIN` a literal no-op and leave
 
 Helper: `scale_quotient_factorization()` builds direction + log-magnitude factors.
 
-## Class order as a gauge fix (`d_out - 1` directions)
+## Class order as a gauge fix
+
+The usual request is: embed `X` with the graph losses, and if `y` has an order,
+find a direction along which that order is preserved as much as the neighbour
+graph will allow.
+
+**One ordering is one direction**, however many values `y` takes. K classes give
+you K−1 adjacent comparisons, all of which live on a single number line. Asking
+for K directions for one ordered label would spend the whole embedding on a
+one-dimensional constraint. K directions are for K *different* orderings.
 
 `AXIS` orders the map by a scalar *computable from `x`*. A **class label** is not
 computable from `x` — that is what you want the map to help you infer — so it
-cannot be a conditioning factor at all: every factor's `view` is evaluated on
-every forward pass including inference (`affinities_forward` → `view_batch`), so a
-label-reading view would demand the answer as input.
-
-Labels instead enter as a **gauge fix**. The unsupervised objective determines
-shape but not orientation — `fuzzy_cross_entropy` sees only distances,
-`local_rigidity_loss` is rotation/reflection-invariant — so rotation and
-reflection are free parameters the data never constrains, and refits spend them
-arbitrarily. A user ordering of the classes is the natural thing to spend them on.
+cannot be a conditioning factor at all. Labels enter as a **gauge fix**. The
+unsupervised objective determines shape but not orientation — `fuzzy_cross_entropy`
+sees only distances, `local_rigidity_loss` is rotation/reflection-invariant — so
+rotation and reflection are free parameters the data never constrains. A user
+ordering of the classes is the natural thing to spend them on.
 
 ```python
-from leanmap import PLANEConfig, fit, ordinal_class_axis
+from leanmap import PLANEConfig, fit, ordinal_class_axis, class_axis_report
 
 cfg = PLANEConfig.for_scale(len(X))
-cfg.lambda_class = 1.0                      # 0 = off (default)
-ax = ordinal_class_axis(n_classes=5, axis=0, order=[2, 0, 1, 4, 3])
+cfg.lambda_class = 1.0
+# y is integer codes 0..K-1, already in the desired order.
+# axis=None: the fit discovers the direction. One ordering → one ClassAxis.
+ax = ordinal_class_axis(K, axis=None, name="y")
 res = fit(X, dist_fn="l2", config=cfg, class_labels=y, class_axes=[ax])
+Z, _ = res.model.embed(X)
+rep = class_axis_report(Z, y, [ax])
+# rep["order_adjacent_y"]          did the sequence take?
+# rep["dir_y_0"], rep["dir_y_1"]   the direction it found
 ```
 
-At most **`d_out - 1`** axes may *name a coordinate* (`validate_class_axes` raises,
-it does not warn): the remainder must stay free, or the labels have stopped
-choosing among equivalent layouts and started dictating the layout, and the map
-can no longer disagree with them. Inference needs no label.
+Pinning (`axis=0`) names a coordinate and its sign — use that when a reader will
+navigate by "further right means later". Discovered (`axis=None`) is the weaker
+and usual request: preserve the order along *some* projection, and leave the
+remaining `d_out − 1` directions to the graph.
+
+At most **`d_out − 1`** axes may *name a coordinate* (`validate_class_axes` raises,
+it does not warn). Free-direction axes (`axis=None`) are counted separately and
+capped at `d_out` total, with a warning if they fill every coordinate. Inference
+needs no label.
 
 | property | how |
 |---|---|
 | order only | hinge on the *sign* of the gap; spacing and position stay the graph's business |
 | zero force once satisfied | `relu`, not a pull — ordered pairs contribute exactly no gradient |
-| scale free | margin is a fraction of the coordinate's own running spread |
-| free axes untouched | `dL/dz` is exactly zero off the constrained coordinates |
+| scale free | margin is a fraction of the coordinate's (or direction's) own running spread |
+| pinned axes stay put | `dL/dz` is exactly zero off a *pinned* coordinate; a free direction may lean (see `tilt`) unless `orthogonal=True` |
 | labels out of the graph | metric, kNN, ε-net and memberships are unchanged — no leakage into what "neighbour" means |
 
 Only the *order* of `rank` is read, so equal ranks express a partial order
@@ -95,14 +111,18 @@ Only the *order* of `rank` is read, so equal ranks express a partial order
 whose `logsigmoid` never reaches zero: that is a ranking objective meant to keep
 pressing, this is a gauge fix that should stop.
 
-### Two orderings: pin the primary, let the secondary pick its own direction
+### Two (or K) orderings: one `ClassAxis` per ordering
 
-Only one ordering is usually worth an axis. For a second, coarser factor — a
-parity, a treatment arm, a broad stage — you generally have no basis for claiming
-*which way* the map should lay it out, and claiming one anyway is friction you get
-nothing for. `axis=None` asks only that the groups come apart along **some**
-direction, recomputed each step and oriented low-to-high, so neither the direction
-nor the sign is constrained:
+K different rankings of the same labels — digit value *and* parity, a stage *and*
+a treatment arm — are K `ClassAxis` objects, and need `d_out >= K`. They are not
+K directions extracted from one ranking.
+
+Only one ordering is usually worth pinning to a named coordinate. For a second,
+coarser factor you generally have no basis for claiming *which way* the map should
+lay it out, and claiming one anyway is friction you get nothing for. `axis=None`
+asks only that the groups come apart along **some** direction, recomputed each
+step and oriented low-to-high, so neither the direction nor the sign is
+constrained:
 
 ```python
 from leanmap import grouped_class_axis, ordinal_class_axis
@@ -113,13 +133,64 @@ parity = grouped_class_axis([[0,2,4,6,8], [1,3,5,7,9]],          # tied ranks wi
 res = fit(X, dist_fn="l2", config=cfg, class_labels=y, class_axes=[digit, parity])
 ```
 
-Because the chosen direction is zeroed on the pinned coordinates, a
-free-direction term **provably cannot move a pinned axis** — `dL/dz` is exactly
-zero there however hard it is weighted — so a secondary factor is safe to add to
-a primary ordering you care about. Pinned axes are capped at `d_out - 1`;
-free-direction axes are counted separately and the total is capped at `d_out`,
-with a warning (not a refusal) when they fill it, since asking for a separation
-with a free sign is strictly weaker than naming a coordinate.
+The **angle** to the pinned axes is discovered too, not assumed: two orderings of
+the same labels are under no obligation to be square to each other. `tilt_<name>`
+reports the lean in degrees (0 = square, 90 = absorbed into a pinned coordinate
+and no longer a direction of its own). Pass `orthogonal=True` to force it to zero,
+which buys back a guarantee — the term then **provably cannot move a pinned axis**,
+since `dL/dz` is exactly zero there however hard it is weighted. Worth having when
+the pinned ordering is the deliverable; the wrong default otherwise.
+
+Pinned axes are capped at `d_out - 1`; free-direction axes are counted separately
+and the total is capped at `d_out`, with a warning (not a refusal) when they fill
+it, since asking for a separation with a free sign is weaker than naming a
+coordinate.
+
+### The direction needs a metric, not just a difference of means
+
+The separating direction is \(\Sigma_w^{-1}(\mu_{hi}-\mu_{lo})\) — Fisher's
+discriminant, whitened by the **within-group** covariance. This is a correction,
+not a refinement, and it exists because of the pinned axis:
+
+> A plain difference of means is measured in Euclidean units of the embedding, so
+> it over-weights whichever coordinate is stretched. With a pinned ordering
+> present, the stretched coordinate is *always* the pinned one, because stretching
+> it is what ordering it does.
+
+On digits the within-group spread runs `[1.33, 0.68]`, twice as wide along the
+pinned axis, and the correction shows up almost entirely in the reported angle
+rather than in the scores (digit ordering pinned to `z0`, parity on a free
+direction, 20 epochs, seed 0):
+
+| | digit adj | parity | tilt | 5-NN |
+|---|---|---|---|---|
+| `d=2` Euclidean, tilt free | 0.975 | 0.999 | 14.5° | 0.984 |
+| `d=2` whitened, tilt free | 0.977 | 1.000 | 2.1° | 0.978 |
+| `d=2` whitened, orthogonal | 0.973 | 0.999 | 0.0° | 0.981 |
+| `d=3` Euclidean, tilt free | 0.980 | 1.000 | 14.2° | 0.988 |
+| `d=3` whitened, tilt free | 0.972 | 0.999 | 2.8° | 0.987 |
+| `d=3` whitened, orthogonal | 0.977 | 0.999 | 0.0° | 0.988 |
+
+All six are the same fit to within run-to-run noise. What whitening buys on this
+dataset is an *honest* angle: parity here is very nearly square to digit value, and
+only the whitened estimate says so — the 14° Euclidean lean is units, not
+structure, and reading it as structure would be reading the aspect ratio of the
+embedding. Since `tilt` is the number you would use to decide whether a secondary
+ordering is genuinely independent, having it be untrustworthy by default is worse
+than the scores suggest.
+
+The scores do come apart when the geometry is less forgiving. On a synthetic case
+built to stretch the pinned axis hard, adjacent-class ordering is 0.809 and parity
+0.751 unwhitened, against 0.999 and 0.959 whitened: the term spends its budget
+fighting the pinned ordering along a direction it only thinks is informative.
+`whiten=False` recovers the plain difference of means, useful mainly for seeing
+the artefact.
+
+Whitening cannot fix a second, independent confound. Even and odd digits differ by
+exactly one in mean digit value (4.0 vs 5.0), pure arithmetic, so *some* parity
+separation genuinely lies along the pinned axis and is already accounted for
+there. Only `orthogonal=True` residualises that away. The two switches address
+different problems, which is why both exist.
 
 On digits, `z0` ordering the value and parity on a free direction (20 epochs,
 `lambda_class=16`, `margin=0.30`, early ramp; run-to-run spread ≈0.03):
@@ -175,6 +246,62 @@ Hence the warning below `order_adjacent ≈ 0.6` — raising `lambda_class` ther
 distorts the layout instead of fixing it. Always report the **shuffled-label
 null** at the same `lambda_class`; if it also orders, the term is fitting any
 labels it is handed. See `examples/digits_class_axis.py`.
+
+### What the ordering means in the features (`axis_loadings`)
+
+`class_axis_report` says whether an ordering took. `axis_loadings` says what it
+*means*, by taking `d(z · u)/dx` for the axis's direction `u`. That gradient lives
+in input space, so it has the shape of a measurement and can be read as one — an
+8×8 image on digits, a spectrum on FTIR. It is a biplot loading with the roles
+swapped: instead of drawing features as arrows in the embedding, it draws your axis
+in the space of the features, which is the more useful direction when the axis is
+something you named.
+
+```python
+rep = class_axis_report(Z, y, axes)
+dirs = {"parity": [rep[f"dir_parity_{j}"] for j in range(d_out)]}
+ld = axis_loadings(res.model, X, axes, directions=dirs)   # pass the report's own
+ld.loading["digit"]      # (D,) per standard deviation of each feature
+ld.stability["digit"]    # read this first
+```
+
+**Read `stability` first, and expect to be disappointed.** A biplot presumes a
+linear map; a neural embedding is not one, so the gradient belongs to the point it
+was taken at and the returned loading is a *mean*. `stability` is the resultant
+length of the per-point unit loadings, `1.0` if every point agrees. On digits with
+the default configuration it is 0.38 for a pinned digit axis and 0.57 for a free
+parity direction, and the 10th percentile of per-point agreement is `-0.43` with
+the worst point at `-0.996`. That last number is the one that matters: for a
+sizeable minority of points the mean loading points the **opposite way along the
+axis** from their own gradient. The image still looks entirely plausible. It is an
+average over evidence that disagrees in sign.
+
+`pca_skip=True` is the fix, and the effect is large:
+
+| | digit stability | parity stability | digit adj |
+|---|---|---|---|
+| `pca_skip=False` (default) | 0.38 | 0.57 | 0.975 |
+| `pca_skip=True` | 0.83 | 0.86 | 0.952 |
+
+The encoder is then `W x_n + residual`, and the loading of `W` is exact and
+identical at every point — a biplot in the original sense rather than an average
+standing in for one. Note the trade: adjacent-digit ordering slips from 0.975 to
+0.952, so interpretability is bought with a little ordering accuracy. See
+`examples/digits_axis_loadings.py`, which draws the mean Jacobian and the linear
+part side by side; they agree closely when stability is high, which is the check
+that the statistic is doing its job.
+
+**Units are per standard deviation, not per raw unit.** This is the correlation-vs-
+covariance biplot distinction and here it is not cosmetic. The encoder standardises
+by an `x_std` clamped below at `1e-6`, so a raw-unit loading carries a `1/x_std`
+factor of `1e6` for any feature that never varied — the three dead border pixels of
+digits, say — and those would dominate every plot while meaning nothing (measured
+raw gradient norms run to ~1e4, mostly them). Standardising removes the factor but
+cannot make a constant feature meaningful: there is no "one standard deviation" of
+something that never moved, so its entry is arbitrary rather than large. That is
+what `feature_std` is returned for, and why the example greys those pixels instead
+of letting a diverging colormap render them white — white is the colour of "does
+not matter", which is the opposite of "cannot say".
 
 ### Inference readout
 

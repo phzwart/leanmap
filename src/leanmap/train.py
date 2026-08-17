@@ -34,6 +34,12 @@ from .classaxis import (
     class_order_loss,
     validate_class_axes,
 )
+from .path import (
+    PATH_PAIRS_PER_STEP,
+    PathConstraint,
+    PathTripletSampler,
+    path_constraint_loss,
+)
 from .config import (
     C_BUCKETS,
     C_SEARCH,
@@ -404,6 +410,7 @@ def fit(
     rebuild_graph: bool = False,
     class_labels: Optional[np.ndarray | torch.Tensor] = None,
     class_axes: Optional[Sequence[ClassAxis]] = None,
+    path_constraints: Optional[Sequence[PathConstraint]] = None,
 ) -> PLANEResult:
     """Fit PLANE. Calibration split is taken from raw ``X`` before the graph.
 
@@ -453,6 +460,10 @@ def fit(
         Labels never enter the graph, the metric or the conditioning — only these
         gauge terms — so inference needs no label and the neighbourhood target is
         unchanged.
+    path_constraints : sequence of PathConstraint, optional
+        Explicit ``(anchor, near, mid)`` index triples into the same rows as
+        ``X`` (before any calibration split). Does not enter the neighbour
+        graph. Requires ``config.lambda_path > 0`` to affect the layout.
     """
     from .conditioning import identity_view
     from .landmarks import assign_buckets, init_anchors
@@ -685,6 +696,7 @@ def fit(
             fps_geodesic_k=LANDMARK_GEODESIC_K,
             fps_poisson=config.landmark_poisson,
             precomputed_knn=precomputed_knn,
+            stages_dir=config.graph_stages_dir,
         )
     graph = graphs[0]  # finest graph: reps/negatives/knn_idx/stats live here
 
@@ -1047,6 +1059,56 @@ def fit(
                 config.d_out - sum(a.is_pinned for a in axes_list),
                 config.d_out,
             )
+
+    path_on = bool(path_constraints) and float(config.lambda_path) > 0.0
+    path_samplers: List[Tuple[PathConstraint, PathTripletSampler]] = []
+    path_states: List[Dict[str, float]] = []
+    if path_constraints and not path_on:
+        log.warning(
+            "path_constraints were supplied but lambda_path=%.3g, so the path "
+            "term is not applied",
+            config.lambda_path,
+        )
+    if path_on:
+        assert path_constraints is not None
+        for pc in path_constraints:
+            if pc.n_rows_required() > N:
+                raise ValueError(
+                    f"PathConstraint {pc.name!r} indexes row {pc.n_rows_required()-1} "
+                    f"but X has {N} rows"
+                )
+            kept = (
+                pc.restrict(train_idx.cpu().numpy(), N)
+                if train_idx is not None
+                else pc
+            )
+            if kept is None:
+                log.warning(
+                    "path %r: no triplets survived the train split — skipping",
+                    pc.name,
+                )
+                continue
+            samp_p = PathTripletSampler(X_train, kept, seed=config.seed + 17)
+            path_samplers.append((kept, samp_p))
+            path_states.append({})
+            n_anch = int(np.unique(kept.triplets[:, 0]).size)
+            log.info(
+                "path %r: %d triplets (%d anchors of %d train), weight=%.3g x "
+                "lambda_path=%.3g ramp=%s c=%.3g C=%.3g",
+                kept.name,
+                int(kept.triplets.shape[0]),
+                n_anch,
+                int(X_train.shape[0]),
+                kept.weight,
+                config.lambda_path,
+                tuple(config.path_ramp),
+                kept.c,
+                kept.C,
+            )
+        if not path_samplers:
+            path_on = False
+            log.warning("lambda_path>0 but no usable triplets after the split")
+
     # Fixed once so the order diagnostic tracks the same points every epoch and
     # its trajectory is a statement about the layout, not about resampling.
     class_diag_idx: Optional[torch.Tensor] = None
@@ -1195,18 +1257,21 @@ def fit(
             "geo": 0.0,
             "dens": 0.0,
             "class": 0.0,
+            "path": 0.0,
         }
         retentions = []
         gammas = []
         min_dm = []
         usage = []
         class_active: Dict[str, List[float]] = {}
+        path_ords: List[float] = []
 
         t_frac = epoch / max(config.epochs - 1, 1)
         frame_ramp = alignment_ramp(t_frac, *config.frame_ramp)
         geo_ramp = alignment_ramp(t_frac, *config.geo_ramp)
         dens_ramp = alignment_ramp(t_frac, *config.density_ramp) if density_on else 0.0
         class_ramp = alignment_ramp(t_frac, *config.class_ramp) if class_on else 0.0
+        path_ramp = alignment_ramp(t_frac, *config.path_ramp) if path_on else 0.0
         lvl_counts, epoch_steps = plan[epoch]
 
         pbar = tqdm(
@@ -1286,10 +1351,38 @@ def fit(
                             class_pinned,
                             spread_c,
                             margin=float(config.class_margin),
+                            orthogonal=ax_c.orthogonal,
+                            whiten=ax_c.whiten,
                         )
                     class_parts.append(ax_c.weight * l_ax)
                     class_active.setdefault(ax_c.name, []).append(active)
                 L_class = torch.stack(class_parts).sum()
+
+            L_path = z_i.sum() * 0.0
+            if path_samplers and path_ramp > 0:
+                path_parts = []
+                for pi, ((pc_p, samp_p), st_p) in enumerate(zip(path_samplers, path_states)):
+                    xa, xn, xm, xf, dtn, dtm = samp_p.sample(PATH_PAIRS_PER_STEP)
+                    za, _, _ = model(xa.to(device))
+                    zn, _, _ = model(xn.to(device))
+                    zm, _, _ = model(xm.to(device))
+                    zf, _, _ = model(xf.to(device))
+                    l_p, st_p, ofrac = path_constraint_loss(
+                        za,
+                        zn,
+                        zm,
+                        zf,
+                        dtn.to(device),
+                        dtm.to(device),
+                        c=float(pc_p.c),
+                        C=float(pc_p.C),
+                        margin=float(config.path_margin),
+                        scale_state=st_p,
+                    )
+                    path_states[pi] = st_p
+                    path_parts.append(pc_p.weight * l_p)
+                    path_ords.append(ofrac)
+                L_path = torch.stack(path_parts).sum()
 
             L_frame = z_i.sum() * 0.0
             if star_samp is not None and frame_ramp > 0:
@@ -1361,6 +1454,7 @@ def fit(
                 + config.lambda_geo * geo_ramp * L_geo
                 + config.lambda_density * dens_ramp * L_dens
                 + config.lambda_class * class_ramp * L_class
+                + config.lambda_path * path_ramp * L_path
             )
             opt.zero_grad()
             if not torch.isfinite(loss):
@@ -1389,6 +1483,7 @@ def fit(
             totals["geo"] += float(L_geo.item()) if torch.is_tensor(L_geo) else 0.0
             totals["dens"] += float(L_dens.item()) if torch.is_tensor(L_dens) else 0.0
             totals["class"] += float(L_class.item()) if torch.is_tensor(L_class) else 0.0
+            totals["path"] += float(L_path.item()) if torch.is_tensor(L_path) else 0.0
             with torch.no_grad():
                 gammas.append(gamma.mean().item())
                 gammas.append(gamma.std().item())
@@ -1421,6 +1516,7 @@ def fit(
                     "geo": f"{totals['geo'] / steps_done:.3f}",
                     "dens": f"{totals['dens'] / steps_done:.3f}",
                     "cls": f"{totals['class'] / steps_done:.3f}" if class_on else "—",
+                    "path": f"{totals['path'] / steps_done:.3f}" if path_on else "—",
                     "ret": f"{float(np.mean(retentions)):.2f}" if retentions else "—",
                     "lr": f"{opt.param_groups[0]['lr']:.4g}",
                 },
@@ -1428,6 +1524,11 @@ def fit(
             )
 
         nstep = epoch_steps
+        if not usage:
+            log.warning("epoch %d: every step skipped (non-finite loss) — aborting", epoch + 1)
+            raise RuntimeError(
+                f"all {epoch_steps} steps in epoch {epoch + 1} had non-finite loss"
+            )
         mean_a = torch.stack(usage).mean(dim=0).clamp_min(1e-12)
         usage_ent = float((-(mean_a * mean_a.log()).sum()).item())
         g_mean = float(np.mean(gammas[0::2])) if gammas else 0.0
@@ -1441,6 +1542,8 @@ def fit(
             "geo": totals["geo"] / nstep,
             "dens": totals["dens"] / nstep,
             "class": totals["class"] / nstep,
+            "path": totals["path"] / nstep,
+            "path_ord": float(np.mean(path_ords)) if path_ords else 0.0,
             "retention": ret,
             "mean_gamma": g_mean,
             "std_gamma": g_std,
@@ -1449,8 +1552,8 @@ def fit(
         }
         log.info(
             "epoch %d: geom=%.4f ord=%.4f "
-            "lm=%.4f frame=%.4f geo=%.4f dens=%.4f class=%.4f "
-            "retention=%.3f (chance≈%.3f) mean(gamma)=%.3f std(gamma)=%.3f "
+            "lm=%.4f frame=%.4f geo=%.4f dens=%.4f class=%.4f path=%.4f "
+            "path_ord=%.3f retention=%.3f (chance≈%.3f) mean(gamma)=%.3f std(gamma)=%.3f "
             "usage_ent=%.3f minDm=%.4f",
             epoch + 1,
             metrics["geom"],
@@ -1460,6 +1563,8 @@ def fit(
             metrics["geo"],
             metrics["dens"],
             metrics["class"],
+            metrics["path"],
+            metrics["path_ord"],
             metrics["retention"],
             retention_chance,
             metrics["mean_gamma"],
@@ -1505,13 +1610,18 @@ def fit(
             metrics.update(report)
             for ax_c in axes_list:
                 adj = report.get(f"order_adjacent_{ax_c.name}", float("nan"))
+                where = "coordinate %d" % ax_c.axis if ax_c.is_pinned else (
+                    "a direction tilted %.1f deg into the pinned axes%s"
+                    % (
+                        report.get(f"tilt_{ax_c.name}", float("nan")),
+                        " (forced square)" if ax_c.orthogonal else "",
+                    )
+                )
                 log.info(
                     "class axis %r on %s: ordering accuracy %.3f (adjacent "
                     "classes %.3f, chance %.2f%s)",
                     ax_c.name,
-                    f"coordinate {ax_c.axis}"
-                    if ax_c.is_pinned
-                    else "its best-separating direction",
+                    where,
                     report.get(f"order_{ax_c.name}", float("nan")),
                     adj,
                     ORDER_CHANCE,

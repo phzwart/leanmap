@@ -713,18 +713,41 @@ def test_precomputed_knn_injected_into_graph():
     assert graph.knn_idx.shape == (X.shape[0], k)
 
 
-def test_precomputed_knn_requires_dedup_false():
+def test_precomputed_knn_with_dedup_uses_rep_space():
+    """precomputed_knn is over representatives (R), allowed with dedup=True."""
     torch.manual_seed(0)
-    X = torch.randn(20, 3)
+    X = torch.randn(40, 4)
+    # Force no compression so R == N for a simple check with ambient knn.
+    metric = wrap_metric("l2", X=X, n_neighbors=5, seed=0)
+    knn_idx, knn_dist = _brute_l2_knn(X, 5)
+    graph, *_ = build_graph(
+        X,
+        metric,
+        n_neighbors=5,
+        n_landmarks=8,
+        dedup=True,
+        epsilon=0.0,
+        seed=0,
+        knn_mode="brute",
+        precomputed_knn=(knn_idx, knn_dist),
+    )
+    assert graph.stats.knn_mode == "precomputed"
+    assert graph.knn_idx.shape[0] == X.shape[0]
+
+
+def test_precomputed_knn_rejects_wrong_R_when_compressed():
+    torch.manual_seed(0)
+    X = torch.cat([torch.randn(1, 3).repeat(20, 1), torch.randn(20, 3)], dim=0)
     knn_idx, knn_dist = _brute_l2_knn(X, 3)
     metric = wrap_metric("l2", X=X, n_neighbors=3, seed=0)
-    with pytest.raises(ValueError, match="dedup=False"):
+    with pytest.raises(ValueError, match="expected R="):
         build_graph(
             X,
             metric,
             n_neighbors=3,
             n_landmarks=4,
             dedup=True,
+            epsilon=0.5,
             seed=0,
             precomputed_knn=(knn_idx, knn_dist),
         )

@@ -138,6 +138,7 @@ bash publication/reproduce.sh --fit    # also retrain digits_clean.pt
 | [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) | Every public knob, defaults, measured ranges |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Paper evidence on four datasets |
 | [`docs/METRICS.md`](docs/METRICS.md) | Battery, nulls, traps, Mondrian OOD notes |
+| [`docs/design/10m_scale_graph_and_train.md`](docs/design/10m_scale_graph_and_train.md) | Design: freeze-then-train, 10M-scale graph build, exemplar streams, DDP |
 | [`docs/math/leanmap.tex`](docs/math/leanmap.tex) | Mathematics (cover, Mondrian categories, LDA) |
 | [`examples/research/`](examples/research/) | SAXS P(r), digits density, novelty demos |
 | [`src/leanmap/README.md`](src/leanmap/README.md) | Design notes (conditioning, pyramid, conformal) |

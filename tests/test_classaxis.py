@@ -12,9 +12,12 @@ from leanmap.classaxis import (
     ClassAxisReadout,
     ClassOrderSampler,
     ClassRegionConformal,
+    axis_loadings,
     class_axis_report,
     class_direction_loss,
     class_order_loss,
+    direction_tilt,
+    free_direction,
     grouped_class_axis,
     ordinal_class_axis,
     validate_class_axes,
@@ -101,19 +104,77 @@ def test_free_direction_axis_is_allowed_where_a_second_pinned_axis_is_not():
         )
 
 
-def test_free_direction_term_cannot_move_a_pinned_coordinate():
-    """The guarantee that lets a secondary factor be weighted without fear."""
+def test_orthogonal_free_direction_cannot_move_a_pinned_coordinate():
+    """The guarantee bought by opting in to orthogonal=True."""
     torch.manual_seed(0)
     z_lo = torch.randn(128, 3, requires_grad=True)
     z_hi = torch.randn(128, 3, requires_grad=True)
-    loss, _, active, u = class_direction_loss(z_lo, z_hi, pinned_axes=(0,))
+    loss, _, active, u = class_direction_loss(
+        z_lo, z_hi, pinned_axes=(0,), orthogonal=True
+    )
     loss.backward()
 
     assert active > 0.0, "random points should leave some pairs unordered"
     assert float(u[0]) == 0.0
+    assert direction_tilt(u.numpy(), (0,)) == pytest.approx(0.0, abs=1e-6)
     for g in (z_lo.grad, z_hi.grad):
         assert torch.all(g[:, 0] == 0.0)
         assert float(g[:, 1:].abs().max()) > 0.0
+
+
+def test_discovered_direction_may_lean_into_a_pinned_axis():
+    """The default: the angle is found, not assumed, so the tilt is nonzero and
+    the term does reach the pinned coordinate."""
+    torch.manual_seed(0)
+    z_lo = torch.randn(128, 3, requires_grad=True)
+    z_hi = torch.randn(128, 3, requires_grad=True)
+    loss, _, _, u = class_direction_loss(z_lo, z_hi, pinned_axes=(0,))
+    loss.backward()
+
+    assert abs(float(u[0])) > 1e-6, "the direction should be free to lean"
+    assert direction_tilt(u.numpy(), (0,)) > 0.0
+    assert float(z_hi.grad[:, 0].abs().max()) > 0.0
+
+
+def test_whitening_removes_the_stretch_artefact_in_the_direction():
+    """A pinned ordering stretches its coordinate, so a Euclidean difference of
+    means leans into it for reasons that are about units, not about the grouping.
+
+    Built so the right answer is known exactly. One latent ``b`` carries the group
+    offset; ``z1 = b`` and ``z0 = 8a + 2b``, i.e. the pinned coordinate is eight
+    times wider and picks up ``b`` at a gain of 2. The whole of the grouping is
+    therefore explained by ``z1``, and the leaning part of ``z0`` is a copy of it
+    the stretch has magnified.
+
+    Euclidean: ``dmu = (2, 1)`` after the offset, so the direction leans ~63
+    degrees into the pinned axis. Whitened: ``Sigma^-1 dmu = (0, 1)`` exactly,
+    because the covariance knows ``z0``'s ``b`` content is the same ``b``.
+    """
+    torch.manual_seed(0)
+    n = 4096
+    lat = torch.randn(2 * n, 2)
+    lat[n:, 1] += 1.5  # the offset goes in the latent, so z0 inherits it too
+    z = torch.stack([8.0 * lat[:, 0] + 2.0 * lat[:, 1], lat[:, 1]], dim=1)
+    z_lo, z_hi = z[:n], z[n:]
+
+    lean_euclid = direction_tilt(
+        free_direction(z_lo, z_hi, pinned_axes=(0,), whiten=False).numpy(), (0,)
+    )
+    lean_white = direction_tilt(
+        free_direction(z_lo, z_hi, pinned_axes=(0,), whiten=True).numpy(), (0,)
+    )
+
+    assert lean_euclid > 50.0, f"expected a large artefact, got {lean_euclid:.1f}"
+    assert lean_white < 5.0, f"whitening should remove it, got {lean_white:.1f}"
+
+
+def test_tilt_is_the_angle_away_from_the_pinned_subspace():
+    assert direction_tilt(np.array([0.0, 1.0]), (0,)) == pytest.approx(0.0)
+    assert direction_tilt(np.array([1.0, 0.0]), (0,)) == pytest.approx(90.0)
+    root = float(np.sqrt(0.5))
+    assert direction_tilt(np.array([root, root]), (0,)) == pytest.approx(45.0)
+    # No pinned axes means nothing to lean into.
+    assert direction_tilt(np.array([1.0, 0.0]), ()) == pytest.approx(0.0)
 
 
 def test_free_direction_does_not_constrain_the_sign():
@@ -138,6 +199,8 @@ def test_free_direction_falls_back_when_the_groups_coincide():
     z = torch.randn(64, 3) * 0.01
     loss, _, _, u = class_direction_loss(z, z.clone(), pinned_axes=(0,))
     assert float(loss) > 0.0, "coincident groups are not separated, so not satisfied"
+    # The fallback reaches for an unpinned coordinate even when free to tilt:
+    # with no separation to find there is no reason to pick a fight.
     assert float(u[0]) == 0.0
     assert float(torch.linalg.vector_norm(u)) == pytest.approx(1.0, abs=1e-5)
 
@@ -492,6 +555,41 @@ def test_the_free_direction_term_does_not_spoil_the_pinned_ordering(
     assert both > alone - 0.05, f"adding parity cost the chain {alone - both:.3f}"
 
 
+def test_readout_follows_a_discovered_direction():
+    """position() must use the free direction, not silently fall back to z0."""
+    rng = np.random.default_rng(0)
+    # Order lives on z1, not z0: classes 0,1,2 stacked vertically.
+    Z, y = [], []
+    for c in range(3):
+        Z.append(np.column_stack([
+            rng.normal(0.0, 0.2, 80),
+            rng.normal(3.0 * c, 0.2, 80),
+        ]))
+        y.append(np.full(80, c))
+    Z = torch.as_tensor(np.concatenate(Z), dtype=torch.float32)
+    y = torch.as_tensor(np.concatenate(y), dtype=torch.int64)
+
+    class _Embed:
+        def eval(self):
+            return self
+
+        def parameters(self):
+            yield torch.zeros(1)
+
+        def __call__(self, x):
+            return Z[: x.shape[0]], None, None
+
+    ax = ordinal_class_axis(3, axis=None, name="y")
+    # from_model embeds X; feed Z as if it were X so the stub just returns it.
+    readout = ClassAxisReadout.from_model(_Embed(), Z, y, ax)
+    assert readout.direction is not None
+    # The discovered direction should be essentially e1.
+    assert abs(readout.direction[1]) > abs(readout.direction[0])
+    pos = readout.position(Z).numpy()
+    means = [pos[y.numpy() == c].mean() for c in range(3)]
+    assert all(means[i] < means[i + 1] for i in range(2)), means
+
+
 def test_readout_position_follows_the_requested_order(gauge_on):
     res, ax, _, _ = gauge_on
     readout = ClassAxisReadout.from_model(
@@ -571,3 +669,130 @@ def test_class_regions_do_not_detect_ambient_outliers(gauge_on):
     Z_far, _ = res.model.embed(torch.full((2, 2), 1e4))
     inside = bool(((Z_far.detach() >= lo) & (Z_far.detach() <= hi)).all())
     assert inside, "ambient outlier left the map's range; caveat may be stale"
+
+
+# --------------------------------------------------------------------------
+# Axis loadings: the biplot reading of a requested ordering
+# --------------------------------------------------------------------------
+
+
+class _StubEncoder(torch.nn.Module):
+    """Standardise, then apply a fixed map -- mirrors the real encoder's front end."""
+
+    def __init__(self, x_mean, x_std):
+        super().__init__()
+        self.register_buffer("x_mean", x_mean)
+        self.register_buffer("x_std", x_std)
+
+
+class _StubModel(torch.nn.Module):
+    """``z = f((x - mean) / std)`` with the interface :func:`axis_loadings` needs.
+
+    A stub rather than a fit, because the point is to check the loading against an
+    analytically known answer: for a *linear* ``f`` the loading is exactly ``W^T u``
+    and the stability is exactly 1, and neither statement is checkable against a
+    trained model whose true Jacobian nobody knows.
+    """
+
+    def __init__(self, W, x_mean, x_std, bilinear=False):
+        super().__init__()
+        self.encoder = _StubEncoder(x_mean, x_std)
+        self.W = torch.nn.Parameter(W.clone())
+        self.bilinear = bool(bilinear)
+
+    def _z(self, x):
+        x_n = (x - self.encoder.x_mean) / self.encoder.x_std
+        if self.bilinear:
+            # Pairwise products: d(x_i x_j) = (x_j, x_i), a gradient whose direction
+            # turns with the point rather than merely changing length.
+            x_n = x_n * torch.roll(x_n, shifts=1, dims=1)
+        return x_n @ self.W.T
+
+    def forward(self, x):
+        return self._z(x), None, None
+
+    def embed(self, X, **kw):
+        with torch.no_grad():
+            return self._z(X), None
+
+
+def test_loading_of_a_linear_map_is_its_weight_row():
+    """Units check: the loading is per standard deviation, not per raw unit."""
+    torch.manual_seed(0)
+    D, d_out = 6, 2
+    W = torch.randn(d_out, D)
+    x_std = torch.tensor([1.0, 10.0, 0.1, 2.0, 5.0, 0.5])
+    X = torch.randn(256, D) * x_std
+    model = _StubModel(W, torch.zeros(D), x_std)
+
+    ax = ClassAxis(axis=0, rank=torch.arange(3.0), name="a")
+    ld = axis_loadings(model, X, [ax], sample=None)
+    # dz/dx = W / x_std, so a raw-unit loading would be scaled by 1/x_std and the
+    # 0.1-std feature would look 10x more important than it is.
+    assert np.allclose(ld.loading["a"], W[0].numpy(), atol=1e-4), ld.loading["a"]
+    # A linear map has the same gradient everywhere, so every point agrees exactly.
+    assert ld.stability["a"] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_stability_falls_when_the_loading_depends_on_the_point():
+    """The statistic has to notice a map whose gradient direction is not fixed."""
+    torch.manual_seed(0)
+    D = 4
+    W = torch.eye(2, D)
+    x_std = torch.ones(D)
+    X = torch.randn(512, D)
+    ax = ClassAxis(axis=0, rank=torch.arange(3.0), name="a")
+
+    linear = axis_loadings(_StubModel(W, torch.zeros(D), x_std), X, [ax], sample=None)
+    curved = axis_loadings(
+        _StubModel(W, torch.zeros(D), x_std, bilinear=True), X, [ax], sample=None
+    )
+    assert linear.stability["a"] > 0.99
+    # Here z0 = x0 * x_{D-1}, so the loading is (x_{D-1}, ..., x0): it points a
+    # different way at every point, and over a symmetric X they cancel.
+    assert curved.stability["a"] < 0.3, curved.stability["a"]
+
+
+def test_free_direction_loading_needs_labels_or_a_direction():
+    """An unpinned axis has no coordinate to differentiate, so it must be located."""
+    torch.manual_seed(0)
+    D = 5
+    model = _StubModel(torch.randn(2, D), torch.zeros(D), torch.ones(D))
+    X = torch.randn(64, D)
+    free = grouped_class_axis([[0, 2], [1, 3]], axis=None, name="p")
+
+    with pytest.raises(ValueError, match="direction has to be located"):
+        axis_loadings(model, X, [free], sample=None)
+
+    given = axis_loadings(
+        model, X, [free], directions={"p": np.array([1.0, 0.0])}, sample=None
+    )
+    assert given.loading["p"].shape == (D,)
+
+
+def test_dead_features_are_reported_so_they_can_be_masked():
+    """A never-varying feature has no standard deviation to be a loading per."""
+    torch.manual_seed(0)
+    D = 5
+    x_std = torch.tensor([1.0, 1.0, 1e-6, 1.0, 1.0])  # feature 2 never moved
+    model = _StubModel(torch.randn(2, D), torch.zeros(D), x_std)
+    X = torch.randn(64, D)
+    X[:, 2] = 0.0
+    ld = axis_loadings(
+        model, X, [ClassAxis(axis=0, rank=torch.arange(2.0), name="a")], sample=None
+    )
+    assert ld.feature_std[2] <= 1e-5
+    assert np.all(ld.feature_std[[0, 1, 3, 4]] > 1e-5)
+
+
+def test_loading_follows_the_requested_direction(gauge_on):
+    """On a real fit: flipping the axis direction flips the loading's sign."""
+    res, ax, _, _ = gauge_on
+    up = axis_loadings(
+        res.model, res.X_train, [ax], directions={ax.name: np.array([1.0, 0.0])}
+    )
+    down = axis_loadings(
+        res.model, res.X_train, [ax], directions={ax.name: np.array([-1.0, 0.0])}
+    )
+    assert np.allclose(up.loading[ax.name], -down.loading[ax.name], atol=1e-5)
+    assert up.stability[ax.name] == pytest.approx(down.stability[ax.name], abs=1e-5)

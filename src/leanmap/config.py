@@ -277,6 +277,12 @@ class PLANEConfig:
     # ``density_var_shift``; the source of truth is ``classaxis.CLASS_MARGIN``.
     class_margin: float = 0.05
 
+    # Path constraint: bi-Lipschitz in a user index, from an explicit triplet
+    # table (see ``leanmap.path``). 0 = off. Stays out of the neighbour graph.
+    lambda_path: float = 0.0
+    path_ramp: Tuple[float, float] = (0.2, 0.45)
+    path_margin: float = 0.05
+
     # optimisation
     batch_edges: int = 4096
     epochs: int = 200
@@ -325,6 +331,9 @@ class PLANEConfig:
 
     # knn
     knn_mode: str = "auto"
+    # Optional directory for Zarr graph stages (landmarks / ε-net / knn spill).
+    # None disables staging. Requires the optional ``zarr`` dependency.
+    graph_stages_dir: Optional[str] = None
 
     seed: int = 0
     device: Optional[str] = None

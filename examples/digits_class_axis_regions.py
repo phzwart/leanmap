@@ -15,6 +15,11 @@ Two consequences worth knowing before reading the figure:
   admissible as either class at that alpha, which the prediction set reports as a
   set of size two rather than hiding behind a margin.
 
+The digit order is *pinned* to ``z0`` here so the figure's horizontal axis is
+literally the requested sequence. The usual request -- discover a direction,
+leave both coordinates to the graph except for the order -- is
+``digits_class_axis.py`` (``axis=None``).
+
 Three disjoint splits, because "held out" has to mean it: ``train`` fits the
 encoder and supplies the class point clouds the regions are measured from,
 ``calib`` supplies the per-class conformal distributions, and ``test`` is touched

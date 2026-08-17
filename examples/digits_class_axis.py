@@ -1,11 +1,15 @@
 #!/usr/bin/env python
-"""Ordering the digits 0-9 along one axis, and paying for it honestly.
+"""Ordering the digits 0-9 along a direction the fit discovers.
 
-Asks for a reading order the unsupervised map has no reason to produce -- digit
-0 on the left through digit 9 on the right -- by spending one of the two
-embedding coordinates on it (see :mod:`leanmap.classaxis`). The other coordinate
-is left entirely free, which is the whole constraint: labels choose among
-layouts the objective was already indifferent to, they do not choose the layout.
+The graph losses set the shape of the cloud. One ordered label -- here the digit
+value -- is one :class:`~leanmap.ClassAxis` with ``axis=None``, so the fit finds
+a direction along which 0 sits below 1 sits below ... sits below 9, and leaves
+the other coordinate to the neighbour graph. K classes do not ask for K
+directions; they ask for one number line.
+
+See :mod:`leanmap.classaxis`. Pinning the order to ``z0`` (``axis=0``) is the
+stronger request, shown in ``digits_two_orderings.py``; this example is the
+usual one: preserve the order along some projection.
 
 Three fits, because the first one on its own proves nothing:
 
@@ -27,12 +31,13 @@ Three fits, because the first one on its own proves nothing:
     keeps every marginal and destroys only the association, which is the same
     null the rest of this repo reports against.
 
-Measured at 20 epochs, digit order 0-9 on ``z0``::
+Measured at 20 epochs, digit order 0-9 on a discovered direction
+(``axis=None``; chance on a free direction is slightly above 0.5)::
 
     run                            order  adjacent    5-NN
-    off (lambda_class=0)           0.599     0.518   0.945
-    on (lambda_class=1)            0.831     0.669   0.911
-    null (shuffled labels)         0.541     0.514   0.377
+    off (lambda_class=0)           0.638     0.556   0.942
+    on (lambda_class=1)            0.848     0.676   0.913
+    null (shuffled labels)         0.550     0.515   0.369
 
 Three things to read off that, in order of importance.
 
@@ -125,10 +130,17 @@ def _run(name, X_tr, y_tr, X_cal, args, lam, ax):
     Z = Z.detach()
     report = class_axis_report(Z, torch.as_tensor(y_tr), [ax])
     knn = KNeighborsClassifier(n_neighbors=5).fit(Z.numpy(), y_tr)
+    direction = None
+    if not ax.is_pinned:
+        direction = np.asarray(
+            [report[f"dir_{ax.name}_{j}"] for j in range(Z.shape[1])],
+            dtype=np.float64,
+        )
     return {
         "name": name,
         "result": res,
         "Z": Z,
+        "direction": direction,
         "order": report[f"order_{ax.name}"],
         "order_adjacent": report[f"order_adjacent_{ax.name}"],
         # Resubstitution 5-NN is fine as a *relative* structure measure across
@@ -146,13 +158,26 @@ def _scatter(runs, y, path):
     fig, axes = plt.subplots(1, len(runs), figsize=(5.2 * len(runs), 4.6))
     for ax_p, run in zip(np.atleast_1d(axes), runs):
         z = run["Z"].numpy()
-        sc = ax_p.scatter(z[:, 0], z[:, 1], c=y, cmap="tab10", s=5, alpha=0.85)
+        u = run.get("direction")
+        if u is not None and z.shape[1] >= 2:
+            # Draw in the frame (discovered direction, its complement) so left
+            # to right is the requested order, not whichever coordinate the
+            # encoder happened to use.
+            e = u / max(float(np.linalg.norm(u)), 1e-12)
+            v = np.array([-e[1], e[0]])
+            a = np.stack([z @ e, z @ v], axis=1)
+            xlab, ylab = "projection on the discovered direction (0 → 9)", "orthogonal"
+        else:
+            a = z
+            xlab, ylab = "z0", "z1"
+        sc = ax_p.scatter(a[:, 0], a[:, 1], c=y, cmap="tab10", s=5, alpha=0.85)
         ax_p.set_title(
             f"{run['name']}\norder={run['order']:.3f} "
             f"adjacent={run['order_adjacent']:.3f} 5-NN={run['knn5']:.3f}"
         )
-        ax_p.set_xlabel("z0  (ordered axis: 0 → 9)")
-        ax_p.set_ylabel("z1  (free)")
+        ax_p.set_xlabel(xlab)
+        ax_p.set_ylabel(ylab)
+        ax_p.set_aspect("equal", adjustable="datalim")
     fig.colorbar(sc, ax=np.atleast_1d(axes).tolist(), label="digit", fraction=0.02)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=160, bbox_inches="tight")
@@ -173,7 +198,7 @@ def main() -> None:
     y = data.target.astype("int64")
     tr_i, cal_i = _split(X, y, seed=args.seed)
     X_tr, y_tr, X_cal, y_cal = X[tr_i], y[tr_i], X[cal_i], y[cal_i]
-    ax = ordinal_class_axis(N_CLASSES, axis=0, name="digit")
+    ax = ordinal_class_axis(N_CLASSES, axis=None, name="digit")
 
     runs = [
         _run("off (lambda_class=0)", X_tr, y_tr, X_cal, args, 0.0, ax),

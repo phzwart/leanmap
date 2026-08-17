@@ -32,9 +32,18 @@ direction, recomputed each step and oriented low-to-high, so neither the
 direction nor the sign is constrained. This is the honest form for a secondary
 or coarse factor: you want even and odd to be tellable apart in the map, but you
 have no basis for claiming which way round the map should lay them out, and
-claiming one anyway is friction you get nothing for. Because the direction is
-zeroed on the pinned coordinates, such a term provably cannot disturb a pinned
-axis however hard it is weighted -- so the primary ordering stays clean.
+claiming one anyway is friction you get nothing for.
+
+Its angle to the pinned axes is discovered too, for the same reason -- two
+orderings of the same labels are under no obligation to be square to each other,
+and insisting on it would decide an answer the data is entitled to give.
+:func:`direction_tilt` reports the lean, in degrees, as ``tilt_<name>``: near
+``0`` the two orderings are independent in these features, and near ``90`` the
+secondary one has been absorbed into a pinned coordinate and is not a separate
+direction at all. Passing ``orthogonal=True`` holds the tilt at zero and buys
+back a guarantee -- the term then cannot move a pinned coordinate however hard it
+is weighted -- which is worth having when the pinned ordering is the deliverable,
+and is the wrong default otherwise.
 
 Per-axis :attr:`ClassAxis.weight` scales ``lambda_class``, since a secondary
 factor generally wants a fraction of the force the primary one gets.
@@ -100,6 +109,15 @@ SPREAD_MOMENTUM: float = 0.9
 # which the estimate agrees with the layout and the EMA only tracks it.
 DIRECTION_MOMENTUM: float = 0.95
 
+# Ridge on the within-group covariance before inverting it, as a fraction of its
+# mean diagonal. The original reason for preferring a raw difference of means was
+# that a covariance inverse is the fragile part of a step estimated from a few
+# hundred pairs -- true in the ambient dimension, but this covariance is
+# ``d_out x d_out`` with ``d_out`` a handful, so a relative ridge is enough to
+# make it safe and the correction it buys is not optional (see
+# :func:`free_direction`).
+DIRECTION_RIDGE: float = 1e-3
+
 # Pairs drawn per step. The constraint is a gauge fix over a handful of
 # directions, not a per-point objective, so it needs far fewer samples than the
 # edge batch; this keeps the extra forward pass a few percent of a step.
@@ -134,6 +152,23 @@ class ClassAxis:
         Multiplier on ``config.lambda_class`` for this axis alone. A secondary
         factor usually wants less force than the primary one, and one weight for
         all axes would make that inexpressible.
+    orthogonal : bool
+        For a free-direction axis, whether to *force* the direction square to the
+        pinned axes instead of letting the fit discover its angle. The default
+        discovers it: an ordering may genuinely be best expressed along a
+        direction that leans into the pinned one, and forbidding that is an
+        imposition of the same kind the mechanism exists to avoid. The cost is
+        that the term can then push a pinned coordinate, so read ``tilt_<name>``
+        to see how far it leans. Setting this to ``True`` restores the guarantee
+        that the term cannot move a pinned axis at all, at the price of deciding
+        the answer in advance.
+    whiten : bool
+        For a free-direction axis, whether to take the separating direction in the
+        metric of the within-group covariance instead of the Euclidean one. On by
+        default and rarely worth turning off: without it the direction leans
+        toward whichever coordinate the other loss terms have stretched, which is
+        the pinned one by construction. ``False`` recovers a plain difference of
+        means, which is useful mainly for seeing the artefact.
     name : str
         Label for diagnostics and logging.
     """
@@ -141,6 +176,8 @@ class ClassAxis:
     axis: Optional[int]
     rank: torch.Tensor
     weight: float = 1.0
+    orthogonal: bool = False
+    whiten: bool = True
     name: str = "class"
 
     def __post_init__(self) -> None:
@@ -155,17 +192,23 @@ class ClassAxis:
 
 def ordinal_class_axis(
     n_classes: int,
-    axis: int = 0,
+    axis: Optional[int] = 0,
     order: Optional[Sequence[int]] = None,
     name: str = "class",
     weight: float = 1.0,
+    orthogonal: bool = False,
+    whiten: bool = True,
 ) -> ClassAxis:
-    """A totally ordered chain of classes on one coordinate.
+    """A totally ordered chain of classes, on a named coordinate or a free direction.
 
-    ``order`` lists label codes from low to high along the axis; the default is
-    ``0..K-1``, i.e. the label codes already are the order. This is the common
-    case -- a stage, a severity, a reading order -- where the classes come with
-    a sequence attached.
+    ``order`` lists label codes from low to high; the default is ``0..K-1``, i.e.
+    the label codes already are the order. This is the common case -- a stage, a
+    severity, a reading order -- where the classes come with a sequence attached.
+
+    One ordering is one direction, however many classes it has. ``axis=None`` lets
+    the fit discover that direction; ``axis=j`` pins it to coordinate ``j``. The
+    default pins to ``z0`` for back-compatibility; pass ``axis=None`` when the
+    request is "preserve this order along some projection", which is the usual one.
     """
     if order is None:
         rank = torch.arange(n_classes, dtype=torch.float32)
@@ -177,7 +220,14 @@ def ordinal_class_axis(
         rank = torch.empty(n_classes, dtype=torch.float32)
         for position, label in enumerate(order):
             rank[int(label)] = float(position)
-    return ClassAxis(axis=axis, rank=rank, name=name, weight=weight)
+    return ClassAxis(
+        axis=axis,
+        rank=rank,
+        name=name,
+        weight=weight,
+        orthogonal=orthogonal,
+        whiten=whiten,
+    )
 
 
 def grouped_class_axis(
@@ -186,6 +236,8 @@ def grouped_class_axis(
     n_classes: Optional[int] = None,
     name: str = "group",
     weight: float = 1.0,
+    orthogonal: bool = False,
+    whiten: bool = True,
 ) -> ClassAxis:
     """An ordered sequence of *groups* of classes on one coordinate.
 
@@ -197,7 +249,9 @@ def grouped_class_axis(
 
     ``axis=None`` is usually what a coarse secondary factor wants: the groups get
     ordered along a direction the fit picks rather than one you name, which is a
-    strictly weaker request and costs the layout correspondingly less.
+    weaker request and costs the layout correspondingly less. Its angle to the
+    pinned axes is discovered as well; pass ``orthogonal=True`` to force it
+    square to them.
 
     >>> grouped_class_axis([[0, 2, 4, 6, 8], [1, 3, 5, 7, 9]], axis=None, name="parity")
     ...  # doctest: +SKIP
@@ -219,7 +273,14 @@ def grouped_class_axis(
     for position, g in enumerate(groups):
         for c in g:
             rank[int(c)] = float(position)
-    return ClassAxis(axis=axis, rank=rank, name=name, weight=weight)
+    return ClassAxis(
+        axis=axis,
+        rank=rank,
+        name=name,
+        weight=weight,
+        orthogonal=orthogonal,
+        whiten=whiten,
+    )
 
 
 def validate_class_axes(
@@ -439,29 +500,77 @@ def _pinned_mask(d_out: int, pinned_axes: Sequence[int]) -> torch.Tensor:
 
 
 def free_direction(
-    z_lo: torch.Tensor, z_hi: torch.Tensor, pinned_axes: Sequence[int] = ()
+    z_lo: torch.Tensor,
+    z_hi: torch.Tensor,
+    pinned_axes: Sequence[int] = (),
+    orthogonal: bool = False,
+    whiten: bool = True,
 ) -> torch.Tensor:
     """The direction along which the ordered groups currently separate best.
 
-    The difference of the two group means, with the pinned coordinates zeroed out
-    and the remainder normalised. For a two-group factor this *is* the optimal
-    separating direction up to the within-group covariance, and unlike a Fisher
-    direction it needs no covariance inverse -- which would be the fragile part
-    of the step, estimated from a few hundred pairs.
+    ``Sigma_w^-1 (mu_hi - mu_lo)``, normalised: the difference of the group means
+    taken in the metric of the *within-group* covariance rather than the Euclidean
+    one. For a two-group factor this is Fisher's discriminant, and the
+    ``Sigma_w^-1`` is not a refinement but a correction for the frame the
+    difference is measured in.
 
-    Zeroing the pinned coordinates is what keeps the secondary constraint from
-    interfering with the primary one. Since the hinge sees only ``z @ u`` and
-    ``u`` is exactly zero on every pinned coordinate, ``dL/dz`` vanishes there:
-    the free-direction term provably cannot push the axis you named, no matter
-    how strongly it is weighted.
+    Why it matters here specifically. A raw difference of means is in the units of
+    the embedding, so it over-weights whichever coordinate happens to be stretched
+    -- and with a pinned ordering present, the stretched coordinate is *always* the
+    pinned one, because stretching it is what ordering it does. On digits the
+    within-group spread runs about ``[1.33, 0.68]``, twice as wide along the pinned
+    axis, and the unwhitened estimate leans 11 degrees into it where the whitened
+    one leans 4.8 and with the opposite sign. That lean is an artefact of the
+    metric, and following it makes the term fight the pinned ordering for nothing.
 
-    Degenerate case: if the group means coincide inside the free subspace there
-    is no separating direction to find, and the first free coordinate is used
-    instead. Any direction is equally wrong at that point, and an arbitrary one
-    at least produces a gradient that starts pulling the groups apart.
+    Whitening does not fix a second, unrelated confound: a coarse grouping can be
+    arithmetically correlated with the pinned ordering, as even/odd is with digit
+    value (mean digit 4 against 5), so *some* of the separation genuinely lies
+    along the pinned axis and is already accounted for there. Only
+    ``orthogonal=True`` removes that, by residualising it away entirely.
+
+    By default the angle to the pinned axes is discovered: whatever direction
+    separates the groups is used, including one that leans into a pinned
+    coordinate, because an ordering has no obligation to be square to another
+    one. :func:`class_axis_report` reports that lean as ``tilt_<name>``.
+
+    ``orthogonal=True`` instead works wholly inside the unpinned coordinates --
+    whitening by the conditional covariance there, not the marginal one -- which
+    forces the lean to zero and buys a guarantee: the hinge then sees only
+    ``z @ u`` for a ``u`` that is exactly zero on every pinned coordinate, so
+    ``dL/dz`` vanishes there and the term cannot push a named axis however hard it
+    is weighted.
+
+    Degenerate case: if the group means coincide there is no separating direction
+    to find, and a coordinate is used instead -- the first unpinned one, since
+    reaching for a pinned one would put the term straight into a fight it has no
+    reason to pick. Any direction is equally wrong at that point, and an
+    arbitrary one at least produces a gradient that starts pulling the groups
+    apart.
     """
-    keep = _pinned_mask(z_lo.shape[1], pinned_axes).to(z_lo.device)
-    u = (z_hi.mean(dim=0) - z_lo.mean(dim=0)) * keep
+    d = z_lo.shape[1]
+    keep = _pinned_mask(d, pinned_axes).to(z_lo.device)
+    delta = z_hi.mean(dim=0) - z_lo.mean(dim=0)
+    idx = torch.nonzero(keep).reshape(-1) if orthogonal else torch.arange(
+        d, device=z_lo.device
+    )
+
+    u = torch.zeros_like(delta)
+    sub = delta[idx]
+    if whiten and idx.numel() > 1:
+        centred = torch.cat(
+            [z_lo - z_lo.mean(dim=0, keepdim=True), z_hi - z_hi.mean(dim=0, keepdim=True)]
+        )[:, idx]
+        n_obs = centred.shape[0]
+        S = (centred.T @ centred) / max(n_obs - 1, 1)
+        ridge = DIRECTION_RIDGE * torch.diagonal(S).mean().clamp_min(1e-12)
+        S = S + ridge * torch.eye(idx.numel(), device=S.device, dtype=S.dtype)
+        try:
+            sub = torch.linalg.solve(S, sub)
+        except Exception:
+            pass  # keep the Euclidean direction rather than fail a step
+    u[idx] = sub
+
     n = torch.linalg.vector_norm(u)
     if not torch.isfinite(n) or float(n) < 1e-8:
         u = torch.zeros_like(u)
@@ -476,6 +585,8 @@ def class_direction_loss(
     pinned_axes: Sequence[int] = (),
     state: Optional[Dict[str, Any]] = None,
     margin: float = CLASS_MARGIN,
+    orthogonal: bool = False,
+    whiten: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, Any], float, torch.Tensor]:
     """:func:`class_order_loss` with the direction chosen by the fit, not the user.
 
@@ -501,6 +612,15 @@ def class_direction_loss(
     plane's worth of arrangements, and the geometry keeps a genuinely free
     direction inside that plane.
 
+    The angle to the pinned axes is discovered rather than assumed. That means
+    this term *can* move a pinned coordinate, in proportion to how far its
+    direction leans into one, and ``tilt_<name>`` in
+    :func:`class_axis_report` is how you see that happening. A large tilt is
+    informative rather than alarming: it says the two orderings are not
+    independent in these features, which is a fact about the data. If the pinned
+    ordering is the deliverable and must be protected regardless, pass
+    ``orthogonal=True`` and the tilt is held at zero by construction.
+
     The direction is smoothed across steps (:data:`DIRECTION_MOMENTUM`) rather
     than taken fresh, which is not a variance nicety but load bearing. Before the
     groups separate there is no direction to find, the per-step estimate is noise,
@@ -520,7 +640,9 @@ def class_direction_loss(
         return z_lo.sum() * 0.0, state, 0.0, torch.zeros(d)
 
     with torch.no_grad():
-        u_batch = free_direction(z_lo, z_hi, pinned_axes)
+        u_batch = free_direction(
+            z_lo, z_hi, pinned_axes, orthogonal=orthogonal, whiten=whiten
+        )
         prev_u = state.get("u")
         if prev_u is None:
             u = u_batch
@@ -569,32 +691,76 @@ def _auc(lo: np.ndarray, hi: np.ndarray) -> float:
     return float((r_hi - n_hi * (n_hi + 1) / 2.0) / (n_lo * n_hi))
 
 
+def direction_tilt(u: np.ndarray, pinned: Sequence[int]) -> float:
+    """Degrees by which ``u`` leans into the pinned subspace, in ``[0, 90]``.
+
+    ``arcsin`` of the norm of the pinned components: ``0`` means square to every
+    pinned axis (what ``orthogonal=True`` forces), ``90`` means lying entirely
+    inside them, i.e. the secondary ordering has been absorbed into the primary
+    one's coordinates and is no longer a separate direction at all. With exactly
+    one pinned axis, the angle to that axis is ``90 - tilt``.
+    """
+    if not len(pinned):
+        return 0.0
+    lean = float(np.linalg.norm(np.asarray(u, dtype=np.float64)[list(pinned)]))
+    return float(np.degrees(np.arcsin(min(1.0, max(0.0, lean)))))
+
+
 def _report_direction(
-    z: np.ndarray, lab: np.ndarray, rnk: np.ndarray, pinned: Sequence[int]
+    z: np.ndarray,
+    lab: np.ndarray,
+    rnk: np.ndarray,
+    pinned: Sequence[int],
+    orthogonal: bool = False,
+    whiten: bool = True,
 ) -> np.ndarray:
-    """Rank-weighted combination of group means, the batch-free form of
-    :func:`free_direction`.
+    """Rank-weighted combination of group means, whitened by the within-group
+    covariance -- the batch-free form of :func:`free_direction`.
 
     Each *group* of tied ranks contributes its mean with equal weight regardless
     of size, matching the sampler's uniform-over-ordered-pairs convention, so a
-    populous class cannot tilt the direction. Reduces to the difference of means
+    populous class cannot tilt the direction. Reduces to Fisher's discriminant
     for two groups.
     """
     present = np.unique(lab)
     groups: Dict[float, List[np.ndarray]] = {}
+    members: Dict[float, List[np.ndarray]] = {}
     for c in present:
-        groups.setdefault(float(rnk[int(c)]), []).append(z[lab == c].mean(axis=0))
+        r = float(rnk[int(c)])
+        groups.setdefault(r, []).append(z[lab == c].mean(axis=0))
+        members.setdefault(r, []).append(z[lab == c])
     ranks = np.asarray(sorted(groups), dtype=np.float64)
     means = np.stack([np.mean(groups[r], axis=0) for r in ranks])
     w = ranks - ranks.mean()
     # np.dot, not @: numpy 2.2's matmul emits spurious divide-by-zero warnings on
     # the 2-D-by-1-D gemv path, which np.dot does not take.
     d = np.dot(w, means)
-    d[list(pinned)] = 0.0
+
+    free = [j for j in range(z.shape[1]) if j not in set(pinned)]
+    idx = free if orthogonal else list(range(z.shape[1]))
+    if whiten and len(idx) > 1:
+        blocks = [
+            np.concatenate(members[r])[:, idx]
+            - np.concatenate(members[r])[:, idx].mean(axis=0)
+            for r in ranks
+        ]
+        centred = np.concatenate(blocks)
+        S = np.cov(centred, rowvar=False)
+        S = S + DIRECTION_RIDGE * max(float(np.mean(np.diag(S))), 1e-12) * np.eye(
+            len(idx)
+        )
+        try:
+            sub = np.linalg.solve(S, d[idx])
+        except np.linalg.LinAlgError:
+            sub = d[idx]
+        d = np.zeros_like(d)
+        d[idx] = sub
+    elif orthogonal:
+        d[list(pinned)] = 0.0
+
     n = float(np.linalg.norm(d))
     if not np.isfinite(n) or n < 1e-12:
         d = np.zeros_like(d)
-        free = [j for j in range(z.shape[1]) if j not in set(pinned)]
         d[free[0]] = 1.0
         return d
     return d / n
@@ -624,7 +790,11 @@ def class_axis_report(
     For a free-direction axis the score is read along the direction that best
     separates its groups in the layout being reported, since that is what the
     term asked for. The chosen direction is reported as ``dir_<name>_<j>`` so the
-    arrangement the fit settled on is visible rather than implicit.
+    arrangement the fit settled on is visible rather than implicit, and
+    ``tilt_<name>`` gives the angle in degrees by which it leans into the pinned
+    axes (see :func:`direction_tilt`): ``0`` is square to them, ``90`` means the
+    ordering has been absorbed into a pinned coordinate and is no longer a
+    direction of its own. With one pinned axis the angle to it is ``90 - tilt``.
 
     One caveat that does not apply to the pinned case: because that direction is
     chosen on the same points being scored, chance is *above* ``ORDER_CHANCE``.
@@ -645,10 +815,13 @@ def class_axis_report(
         if ax.is_pinned:
             u = z[:, ax.axis]
         else:
-            direction = _report_direction(z, lab, rnk, pinned)
+            direction = _report_direction(
+                z, lab, rnk, pinned, orthogonal=ax.orthogonal, whiten=ax.whiten
+            )
             u = np.dot(z, direction)
             for j, v in enumerate(direction):
                 out[f"dir_{ax.name}_{j}"] = float(v)
+            out[f"tilt_{ax.name}"] = direction_tilt(direction, pinned)
         by_class = {int(c): u[lab == c] for c in np.unique(lab)}
         present = sorted(by_class)
         all_scores: List[float] = []
@@ -675,6 +848,194 @@ def class_axis_report(
 
 
 @dataclass
+class AxisLoadings:
+    """What each requested ordering means in terms of the input features.
+
+    See :func:`axis_loadings`.
+
+    Attributes
+    ----------
+    loading : dict of str to (D,) ndarray
+        Per axis, the change in position along that axis per one standard
+        deviation of each input feature. Signed: positive entries push toward the
+        high-rank end of the ordering.
+    stability : dict of str to float
+        Per axis, how much the loading direction rotates across the data, as the
+        mean resultant length of the per-point unit loadings. ``1.0`` means every
+        point agrees and one loading describes the whole map; low values mean the
+        mean is a summary of disagreeing evidence rather than a description of
+        anything. Read this before reading ``loading``.
+    direction : dict of str to (d_out,) ndarray
+        The embedding-space direction each loading was taken along.
+    feature_std : (D,) ndarray
+        Training standard deviation of each input feature, for masking: features
+        that never varied have an arbitrary loading.
+    """
+
+    loading: Dict[str, np.ndarray]
+    stability: Dict[str, float]
+    direction: Dict[str, np.ndarray]
+    feature_std: np.ndarray
+
+
+def axis_loadings(
+    model: Any,
+    X: torch.Tensor,
+    axes: Sequence[ClassAxis],
+    labels: Optional[torch.Tensor] = None,
+    *,
+    directions: Optional[Mapping[str, np.ndarray]] = None,
+    sample: Optional[int] = 512,
+    batch_size: int = 128,
+    seed: int = 0,
+) -> AxisLoadings:
+    """The input-space gradient of each requested ordering: a biplot loading.
+
+    :func:`class_axis_report` says whether an ordering took. This says what it
+    *means*: for an axis with embedding direction ``u``, the gradient
+    ``d(z . u)/dx`` is a vector in feature space, so it has the shape of a
+    measurement and can be read as one -- an image for image inputs, a spectrum for
+    spectral inputs. It is the loading of a biplot with the usual roles swapped:
+    rather than drawing the features as arrows in the embedding, it draws the axis
+    in the space of the features, which is the more useful way round when the axis
+    is something the user asked for by name.
+
+    Read ``stability`` first, and expect to be disappointed
+    ------------------------------------------------------
+
+    A biplot presumes a linear map and this one is not, so the gradient belongs to
+    the point it was taken at and the returned loading is a mean over sampled
+    points. Whether that mean stands for anything is an empirical question, and on
+    digits with the default configuration the answer is no: resultant length 0.40
+    for a pinned digit axis and 0.27 for a free parity direction, with the 10th
+    percentile of per-point agreement at ``-0.43`` and the worst point at
+    ``-0.996``. That last number is the one to take seriously -- for a substantial
+    minority of points the mean loading points the *opposite* way along the axis
+    from the gradient they actually have, so the mean image is not a weak
+    description of the map, it is an average over evidence that disagrees in sign.
+    Restricting to one class raises the resultant only to about 0.66.
+
+    So a low ``stability`` is not a caveat to note and move past. It says the
+    question "what does this axis mean in the features" has no single answer for
+    this fit, and a rendered mean loading will look perfectly plausible while
+    meaning nothing in particular. Two ways to get an answer that holds:
+    interpret locally, taking loadings over a region small enough to agree with
+    itself; or fit with ``pca_skip=True``, which gives the encoder an explicitly
+    linear component whose loading is globally valid by construction rather than by
+    luck, and reserve the interpretation for that part.
+
+    Units
+    -----
+
+    Loadings are per *standard deviation* of each feature, not per raw unit -- the
+    difference between a correlation and a covariance biplot, and here not a
+    stylistic choice. The encoder standardises its input by a training ``x_std``
+    clamped below at ``1e-6``, so a raw-unit loading carries a ``1/x_std`` factor
+    of ``1e6`` for any feature that never varied, such as the dead border pixels of
+    an image. Measured on digits, raw-unit gradient norms run to ~1e4 and are
+    dominated by exactly those pixels; standardising removes the factor. It cannot
+    make a constant feature meaningful, though -- there is no "one standard
+    deviation" of a feature that never moved, so its entry is arbitrary rather than
+    merely large, which is what ``feature_std`` is returned to let callers mask.
+
+    Parameters
+    ----------
+    model : PLANE
+        A fitted model. ``forward`` is used rather than ``embed``, which is wrapped
+        in ``torch.no_grad`` and so cannot carry a gradient.
+    X, labels
+        Points to take the gradient at, and their class labels. Labels are needed
+        only to locate a free-direction axis, and only when ``directions`` is not
+        supplied.
+    directions
+        Precomputed embedding directions by axis name, e.g. built from the
+        ``dir_<name>_<j>`` entries of a :func:`class_axis_report`. Passing the
+        report's own directions is how to guarantee the loading describes the same
+        axis the score was taken along; otherwise it is recomputed here and a
+        differently-sampled direction can disagree slightly.
+    sample
+        Points to draw for the gradient, or ``None`` for all of them. A few hundred
+        is plenty for both the mean and its resultant, and the cost is one backward
+        pass per axis.
+    """
+    dev = next(model.parameters()).device
+    X = torch.as_tensor(X)
+    n = X.shape[0]
+    if sample is not None and int(sample) < n:
+        idx = torch.as_tensor(
+            np.random.default_rng(seed).choice(n, size=int(sample), replace=False)
+        )
+    else:
+        idx = torch.arange(n)
+    Xs = X[idx]
+
+    enc = getattr(model, "encoder", model)
+    x_std = getattr(enc, "x_std", None)
+    x_std = (
+        torch.ones(X.shape[1])
+        if x_std is None
+        else x_std.detach().cpu().reshape(-1).clone()
+    )
+
+    with torch.no_grad():
+        Z, _ = model.embed(X)
+    Z = Z.detach().cpu()
+    d_out = Z.shape[1]
+
+    # A pinned axis is a basis vector; a free one has to be located, either from a
+    # report the caller already has or from the labels.
+    dirs: Dict[str, np.ndarray] = {}
+    pinned = [a.axis for a in axes if a.is_pinned]
+    for ax in axes:
+        if directions is not None and ax.name in directions:
+            dirs[ax.name] = np.asarray(
+                directions[ax.name], dtype=np.float64
+            ).reshape(-1)
+        elif ax.is_pinned:
+            e = np.zeros(d_out, dtype=np.float64)
+            e[ax.axis] = 1.0
+            dirs[ax.name] = e
+        elif labels is None:
+            raise ValueError(
+                f"axis {ax.name!r} names no coordinate, so its direction has to be "
+                "located: pass labels=, or directions= from class_axis_report"
+            )
+        else:
+            dirs[ax.name] = _report_direction(
+                np.ascontiguousarray(Z.numpy(), dtype=np.float64),
+                labels.detach().cpu().numpy().astype(np.int64),
+                ax.rank.detach().cpu().numpy().astype(np.float64),
+                pinned,
+                orthogonal=ax.orthogonal,
+                whiten=ax.whiten,
+            )
+
+    loading: Dict[str, np.ndarray] = {}
+    stability: Dict[str, float] = {}
+    for ax in axes:
+        u = torch.as_tensor(dirs[ax.name], dtype=torch.float32, device=dev)
+        rows = []
+        for s in range(0, Xs.shape[0], batch_size):
+            # forward(), not embed(): the latter is no_grad. It also does not move
+            # inputs to the model device the way embed() does, hence the .to(dev).
+            xb = Xs[s : s + batch_size].clone().to(dev).requires_grad_(True)
+            out = model.forward(xb)
+            z = out[0] if isinstance(out, tuple) else out
+            (z @ u).sum().backward()
+            rows.append(xb.grad.detach().cpu())
+        g = torch.cat(rows) * x_std  # per standard deviation, not per raw unit
+        gn = g / g.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        loading[ax.name] = g.mean(dim=0).numpy().astype(np.float64)
+        stability[ax.name] = float(gn.mean(dim=0).norm())
+    return AxisLoadings(
+        loading=loading,
+        stability=stability,
+        direction=dirs,
+        feature_std=x_std.numpy().astype(np.float64),
+    )
+
+
+@dataclass
 class ClassAxisReadout:
     """Inference-time reading of an ordered axis.
 
@@ -688,15 +1049,33 @@ class ClassAxisReadout:
     data settled into, so a point between two classes reads as between them
     instead of being forced to one side. That statement is only available
     because the axis was ordered in the first place.
+
+    A pinned axis is read along its named coordinate. A free-direction axis
+    (``ClassAxis.axis is None``) is read along the direction
+    :func:`from_model` locates on the training layout -- the same direction
+    :func:`class_axis_report` scores -- so ``position`` still means "where on
+    the requested order" rather than "where on ``z0``".
     """
 
-    axis: int
+    axis: Optional[int]
     rank: torch.Tensor
     classes: List[int]
     class_pos: Dict[int, float]
     z_by_class: Dict[int, torch.Tensor] = field(default_factory=dict)
     k: int = 5
     name: str = "class"
+    direction: Optional[np.ndarray] = None
+
+    def _along(self, Z: torch.Tensor) -> np.ndarray:
+        z = np.ascontiguousarray(Z.detach().cpu().numpy(), dtype=np.float64)
+        if self.direction is not None:
+            return np.dot(z, self.direction)
+        if self.axis is None:
+            raise ValueError(
+                "ClassAxisReadout has neither a pinned axis nor a direction; "
+                "pass a pinned ClassAxis or let from_model locate a free one"
+            )
+        return z[:, self.axis]
 
     @classmethod
     @torch.no_grad()
@@ -708,6 +1087,7 @@ class ClassAxisReadout:
         ax: ClassAxis,
         k: int = 5,
         batch_size: int = 4096,
+        axes: Optional[Sequence[ClassAxis]] = None,
     ) -> "ClassAxisReadout":
         model.eval()
         device = next(model.parameters()).device
@@ -719,8 +1099,22 @@ class ClassAxisReadout:
         lab = labels.detach().cpu().reshape(-1).to(torch.int64)
         present = sorted({int(c) for c in lab.tolist()})
         z_by_class = {c: Z[lab == c] for c in present}
+        direction = None
+        if ax.is_pinned:
+            coord = Z[:, ax.axis].numpy().astype(np.float64)
+        else:
+            others = list(axes) if axes is not None else [ax]
+            direction = _report_direction(
+                np.ascontiguousarray(Z.numpy(), dtype=np.float64),
+                lab.numpy().astype(np.int64),
+                ax.rank.detach().cpu().numpy().astype(np.float64),
+                [a.axis for a in others if a.is_pinned],
+                orthogonal=ax.orthogonal,
+                whiten=ax.whiten,
+            )
+            coord = np.dot(Z.numpy().astype(np.float64), direction)
         class_pos = {
-            c: float(z_by_class[c][:, ax.axis].median().item()) for c in present
+            c: float(np.median(coord[lab.numpy() == c])) for c in present
         }
         return cls(
             axis=ax.axis,
@@ -730,6 +1124,7 @@ class ClassAxisReadout:
             z_by_class=z_by_class,
             k=int(k),
             name=ax.name,
+            direction=direction,
         )
 
     def _ordered_classes(self) -> List[int]:
@@ -748,7 +1143,7 @@ class ClassAxisReadout:
         fp = np.asarray([float(self.rank[c]) for c in seq], dtype=np.float64)
         keep = np.argsort(xp, kind="stable")
         xp, fp = xp[keep], fp[keep]
-        u = Z[:, self.axis].detach().cpu().numpy().astype(np.float64)
+        u = self._along(Z)
         return torch.as_tensor(np.interp(u, xp, fp), dtype=torch.float32)
 
     def region_score(self, Z: torch.Tensor, c: int) -> torch.Tensor:

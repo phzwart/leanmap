@@ -38,6 +38,12 @@ dependencies = [
 # FAISS accelerates kNN for fit (ANN). Brute-force knn_mode works without it.
 # Install faiss-cpu from PyPI, or a CUDA FAISS build from conda for GPU indices.
 cpu = ["faiss-cpu>=1.7"]
+# Large-N / HPC graph build: Zarr stages + optional MPI knn shards + Faiss.
+hpc = [
+    "faiss-cpu>=1.7",
+    "zarr>=2.14,<3",
+    "mpi4py>=3.1",
+]
 examples = [
     "scikit-learn>=1.0",
     "matplotlib>=3.5",

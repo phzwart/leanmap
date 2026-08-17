@@ -7,6 +7,11 @@ Toy demos, research gallery, and the paper-battery harness.
 | `s_curve.py` | Standalone S-curve fit / plot |
 | `swiss_roll.py` | Standalone swiss-roll fit / plot |
 | `digits.py` | Standalone 8×8 digits fit / plot |
+| `digits_class_axis.py` | One ordered label → one discovered direction (off / on / shuffled null) |
+| `digits_two_orderings.py` | Digit value pinned, parity on a free direction |
+| `digits_two_orderings_regions.py` | Density + conformal regions in that two-ordering frame |
+| `digits_axis_loadings.py` | What those axes mean in pixels (`axis_loadings`) |
+| `digits_class_axis_regions.py` | Per-class conformal regions on a pinned digit axis |
 | `digits_emd.py` | Digits with L1-tree → torchemd EMD-rescored kNN |
 | `cellcycle_emd.py` | CellCycle merged subset → zarr + L1 (or EMD) kNN + leanmap |
 | `cellcycle_explorer.py` | Dash explorer: latent scatter + cell image inspection |

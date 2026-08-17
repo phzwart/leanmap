@@ -28,7 +28,7 @@ from .config import (
     PYRAMID_REP_RATIO,
 )
 from .metrics import MetricSpec
-from .utils import get_logger
+from .utils import get_logger, rss_mb
 
 
 @dataclass
@@ -117,7 +117,8 @@ def validate_precomputed_knn(
     knn_dist : (N, k) float
         Non-negative finite edge distances (any metric; need not match ambient).
     n : int
-        Expected number of rows (``R`` when ``dedup=False``).
+        Expected number of rows (``R`` = number of representatives; equals ``N``
+        when ``dedup=False``).
     n_neighbors : int, optional
         If set and ``k > n_neighbors``, truncate columns to ``n_neighbors``.
         If ``k < n_neighbors``, the supplied ``k`` is kept.
@@ -143,7 +144,7 @@ def validate_precomputed_knn(
         )
     if knn_idx.shape[0] != n:
         raise ValueError(
-            f"precomputed_knn has {knn_idx.shape[0]} rows but training matrix has {n}"
+            f"precomputed_knn has {knn_idx.shape[0]} rows but expected R={n}"
         )
     k = int(knn_idx.shape[1])
     if k < 1:
@@ -655,6 +656,155 @@ def _measure_knn_recall(
     return float(np.mean(overlaps))
 
 
+def _knn_spill_to_stages(
+    X_rep: torch.Tensor,
+    dist_fn: DistanceFn,
+    k: int,
+    mode: str,
+    metric: Optional[MetricSpec],
+    stages_root: Path,
+    landmarks: Optional[torch.Tensor] = None,
+    assign_topc: Optional[torch.Tensor] = None,
+    c_search: int = C_SEARCH,
+    extra_assign_topc: Optional[List[torch.Tensor]] = None,
+    batch: int = 2048,
+) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+    """Compute representative kNN in row batches and spill to Zarr stages."""
+    from . import graph_stages as stages
+
+    log = get_logger()
+    R = int(X_rep.shape[0])
+    info: dict = {"mode": f"spill_{mode}", "spill": True}
+    g = stages.create_knn_store(stages_root, R, k)
+    # Prefer ANN when possible — IVF shortlists on full R are the OOM risk.
+    use_mode = mode
+    if use_mode in ("auto", "ivf") and metric is not None and metric.l2_transform is not None:
+        if _faiss_available():
+            use_mode = "ann"
+    if use_mode == "ann" and (metric is None or metric.l2_transform is None or not _faiss_available()):
+        use_mode = "brute"
+
+    if use_mode == "ann":
+        import faiss
+
+        assert metric is not None and metric.l2_transform is not None
+        Xt = metric.l2_transform(X_rep).detach().cpu().numpy().astype(np.float32)
+        d = Xt.shape[1]
+        nlist = min(int(np.sqrt(R)), max(R // 39, 1))
+        nlist = max(nlist, 1)
+        quant = faiss.IndexFlatL2(d)
+        index = faiss.IndexIVFFlat(quant, d, nlist)
+        index.train(Xt)
+        index.add(Xt)
+        index.nprobe = min(32, nlist)
+        idx_path = stages_root / "faiss_ivf.index"
+        faiss.write_index(index, str(idx_path))
+        del index
+        try:
+            index = faiss.read_index(str(idx_path), faiss.IO_FLAG_MMAP)
+        except Exception:  # noqa: BLE001
+            index = faiss.read_index(str(idx_path))
+        index.nprobe = min(32, nlist)
+        k_over = min(R, max(4 * k, k + 1))
+        log.info(
+            "knn spill ANN: R=%d nlist=%d nprobe=%d batch=%d -> %s",
+            R,
+            nlist,
+            index.nprobe,
+            batch,
+            idx_path,
+        )
+        for s in range(0, R, batch):
+            e = min(R, s + batch)
+            _, cand = index.search(Xt[s:e], k_over)
+            batch_idx = np.empty((e - s, k), dtype=np.int64)
+            batch_dist = np.empty((e - s, k), dtype=np.float32)
+            for bi, i in enumerate(range(s, e)):
+                cidx = [int(j) for j in cand[bi].tolist() if j >= 0 and j != i]
+                if len(cidx) < k:
+                    drow = dist_fn(X_rep[i : i + 1], X_rep)[0]
+                    drow[i] = float("inf")
+                    vv, ii = torch.topk(drow, k=k, largest=False)
+                    batch_dist[bi] = vv.detach().cpu().numpy()
+                    batch_idx[bi] = ii.detach().cpu().numpy()
+                    continue
+                C = X_rep[torch.as_tensor(cidx, dtype=torch.int64, device=X_rep.device)]
+                drow = dist_fn(X_rep[i : i + 1], C)[0]
+                vv, ii = torch.topk(drow, k=min(k, int(drow.numel())), largest=False)
+                out_i = np.array([cidx[int(j)] for j in ii.tolist()], dtype=np.int64)
+                out_v = vv.detach().cpu().numpy().astype(np.float32)
+                if out_i.size < k:
+                    pad_i = np.full(k - out_i.size, out_i[0] if out_i.size else 0, dtype=np.int64)
+                    pad_v = np.full(
+                        k - out_v.size, float(out_v[-1]) if out_v.size else 0.0, dtype=np.float32
+                    )
+                    out_i = np.concatenate([out_i, pad_i])
+                    out_v = np.concatenate([out_v, pad_v])
+                batch_idx[bi] = out_i[:k]
+                batch_dist[bi] = out_v[:k]
+            g.idx[s:e] = batch_idx
+            g.dist[s:e] = batch_dist
+            if (e // batch) % 20 == 0 or e == R:
+                log.info(
+                    "knn spill progress %d / %d RSS≈%.0f MiB",
+                    e,
+                    R,
+                    rss_mb(),
+                )
+        info["mode"] = "spill_ann"
+    else:
+        log.info("knn spill brute tiles: R=%d batch=%d", R, batch)
+        chunk_b = 16384
+        for s in range(0, R, batch):
+            e = min(R, s + batch)
+            vals, idx = chunked_cdist(
+                dist_fn,
+                X_rep[s:e],
+                X_rep,
+                topk=k + 1,
+                out_device=X_rep.device,
+                chunk_a=min(1024, e - s),
+                chunk_b=chunk_b,
+            )
+            batch_idx = np.empty((e - s, k), dtype=np.int64)
+            batch_dist = np.empty((e - s, k), dtype=np.float32)
+            for bi, i in enumerate(range(s, e)):
+                row_i = idx[bi]
+                row_v = vals[bi]
+                m = row_i != i
+                kept_i = row_i[m][:k]
+                kept_v = row_v[m][:k]
+                if kept_i.numel() < k:
+                    drow = dist_fn(X_rep[i : i + 1], X_rep)[0]
+                    drow[i] = float("inf")
+                    kept_v, kept_i = torch.topk(drow, k=k, largest=False)
+                batch_idx[bi] = kept_i.detach().cpu().numpy().astype(np.int64)
+                batch_dist[bi] = kept_v.detach().cpu().numpy().astype(np.float32)
+            g.idx[s:e] = batch_idx
+            g.dist[s:e] = batch_dist
+            if (e // batch) % 20 == 0 or e == R:
+                log.info(
+                    "knn spill progress %d / %d RSS≈%.0f MiB",
+                    e,
+                    R,
+                    rss_mb(),
+                )
+        info["mode"] = "spill_brute"
+
+    stages.mark_knn_complete(stages_root)
+    log.info("knn spill complete: R=%d k=%d RSS≈%.0f MiB", R, k, rss_mb())
+    loaded = stages.load_knn(stages_root)
+    assert loaded is not None
+    knn_idx, knn_dist = loaded
+    knn_idx = knn_idx.to(device=X_rep.device)
+    knn_dist = knn_dist.to(device=X_rep.device)
+    try:
+        info["recall"] = _measure_knn_recall(X_rep, dist_fn, knn_idx, k)
+    except Exception:  # noqa: BLE001
+        info["recall"] = None
+    return knn_dist, knn_idx, info
+
+
 def knn_representatives(
     X_rep: torch.Tensor,
     dist_fn: DistanceFn,
@@ -697,7 +847,9 @@ def knn_representatives(
     info: dict = {}
 
     if mode == "auto":
-        if R <= 200_000:
+        # Prefer ANN/IVF well before R=200k so full-rep graphs stay off the
+        # brute tile path (peak RAM). Exactness is recovered by rescoring.
+        if R <= 50_000:
             mode = "brute"
         elif (
             metric is not None
@@ -710,8 +862,17 @@ def knn_representatives(
     info["mode"] = mode
 
     if mode == "brute":
+        # Shrink B-tile when R is large so peak distance tiles stay bounded.
+        chunk_b = 65536 if R <= 40_000 else 16384
+        chunk_a = 4096 if R <= 40_000 else 1024
         vals, idx = chunked_cdist(
-            dist_fn, X_rep, X_rep, topk=k + 1, out_device=X_rep.device
+            dist_fn,
+            X_rep,
+            X_rep,
+            topk=k + 1,
+            out_device=X_rep.device,
+            chunk_a=chunk_a,
+            chunk_b=chunk_b,
         )
         arange = torch.arange(R, device=X_rep.device)
         self_mask = idx == arange.unsqueeze(1)
@@ -1180,6 +1341,7 @@ def build_graph(
     fps_geodesic_k: Optional[int] = None,
     fps_poisson: bool = False,
     precomputed_knn: Optional[Tuple[Any, Any]] = None,
+    stages_dir: Optional[Union[str, Path]] = None,
 ) -> Tuple[Graph, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Full graph pipeline on the training split.
 
@@ -1192,8 +1354,6 @@ def build_graph(
     dedup : bool
         If True (default), collapse near-duplicates with an ε-net before kNN.
         If False, force ``epsilon=0`` and keep ``R == N``.
-        Must be False when ``precomputed_knn`` is supplied (indices refer to
-        ambient rows).
     extra_ivf_anchors : sequence of (view_fn, view_metric, M_f), optional
         Additional factor anchors for joint IVF shortlists (union of per-factor
         top-c buckets).
@@ -1205,10 +1365,13 @@ def build_graph(
     fps_view_metric : DistanceFn, optional
         Metric on ``fps_view`` outputs (default: Euclidean).
     precomputed_knn : (knn_idx, knn_dist) or None
-        Optional caller-supplied kNN. ``knn_idx`` / ``knn_dist`` are ``(N, k)``
-        into the same row space as ``X``. Edge distances may use a different
-        metric than ``metric`` (e.g. EMD-rescored edges with an L1 ambient
-        metric for landmarks). Requires ``dedup=False``.
+        Optional caller-supplied kNN over **representatives**. Arrays are
+        ``(R, k)`` with indices in ``[0, R)``. When ``dedup=False`` (so
+        ``R == N``) this is the ambient row space. When ``dedup=True``, supply
+        neighbors among the ε-net reps (after a prior build or external ANN).
+    stages_dir : path, optional
+        Zarr stage directory (landmarks → ε-net → knn). Resume if fingerprint
+        matches; requires the optional ``zarr`` dependency.
 
     Returns
     -------
@@ -1220,12 +1383,26 @@ def build_graph(
     log = get_logger()
     dist_fn: DistanceFn = metric  # MetricSpec.__call__ applies natural_scale
     stats = GraphStats(dedup=bool(dedup))
+    stages_p = Path(stages_dir) if stages_dir is not None else None
+    stages = None
+    if stages_p is not None:
+        from . import graph_stages as stages
 
-    if precomputed_knn is not None and dedup:
-        raise ValueError(
-            "precomputed_knn requires dedup=False so neighbor indices align with "
-            "ambient rows (R == N)"
-        )
+        if stages.read_meta(stages_p) is None or not stages.fingerprint_matches(
+            stages_p, X
+        ):
+            stages.init_meta(
+                stages_p,
+                X,
+                epsilon=epsilon,
+                n_landmarks=n_landmarks,
+                n_neighbors=n_neighbors,
+                seed=seed,
+                dedup=bool(dedup),
+                knn_mode=knn_mode,
+            )
+        else:
+            log.info("stages: fingerprint match under %s", stages_p)
 
     if not metric.is_true_metric:
         log.info(
@@ -1258,7 +1435,21 @@ def build_graph(
 
     # 4.2 landmarks — FPS in scoring space, or in fps_view (conditioning) space
     ivf_view_assign: Optional[Tuple[Any, DistanceFn, torch.Tensor]] = None
-    if fps_view is not None:
+    loaded_landmarks = (
+        stages.load_landmarks(stages_p) if stages is not None else None
+    )
+    if loaded_landmarks is not None:
+        M, assign_top1, assign_topc = loaded_landmarks
+        M = M.to(device=X.device, dtype=X.dtype)
+        assign_top1 = assign_top1.to(device=X.device)
+        assign_topc = assign_topc.to(device=X.device)
+        if int(M.shape[0]) != int(n_landmarks):
+            log.warning(
+                "stages landmarks L=%d != config n_landmarks=%d; keeping staged L",
+                int(M.shape[0]),
+                int(n_landmarks),
+            )
+    elif fps_view is not None:
         v_metric = fps_view_metric if fps_view_metric is not None else EuclideanDistance()
         V = fps_view(X)
         idx = fps_init_indices(V, v_metric, n_landmarks, seed=seed)
@@ -1296,13 +1487,45 @@ def build_graph(
             M = fps_init(X, dist_fn, n_landmarks, seed=seed)
         assign_top1, assign_topc = assign_buckets(X, M, dist_fn, c=c_buckets)
     L = M.shape[0]
+    if stages is not None and loaded_landmarks is None:
+        stages.save_landmarks(stages_p, M, assign_top1, assign_topc)
+    log.info("landmarks done: L=%d RSS≈%.0f MiB", L, rss_mb())
 
     # 4.3 representatives (+ halo pass across Voronoi boundaries)
-    reps = build_representatives(X, assign_top1, dist_fn, eps, L, seed=seed)
-    reps, halo_info = _halo_merge(X, reps, assign_topc, dist_fn, eps)
-    stats.extra.update(halo_info)
+    loaded_enet = stages.load_enet(stages_p) if stages is not None else None
+    if loaded_enet is not None:
+        reps, staged_eps = loaded_enet
+        reps = Representatives(
+            rep_idx=reps.rep_idx.to(device=X.device),
+            member_of=reps.member_of.to(device=X.device),
+            weight=reps.weight.to(device=X.device),
+            offsets=reps.offsets.to(device=X.device),
+            values=reps.values.to(device=X.device),
+        )
+        if abs(float(staged_eps) - float(eps)) > 1e-12:
+            log.warning(
+                "stages ε-net epsilon=%.6g != config epsilon=%.6g; using staged",
+                staged_eps,
+                eps,
+            )
+        stats.epsilon = float(staged_eps)
+        stats.extra["halo_pairs"] = stats.extra.get("halo_pairs", 0)
+        stats.extra["halo_merged"] = stats.extra.get("halo_merged", 0)
+        stats.extra["stages_enet"] = True
+    else:
+        reps = build_representatives(X, assign_top1, dist_fn, eps, L, seed=seed)
+        reps, halo_info = _halo_merge(X, reps, assign_topc, dist_fn, eps)
+        stats.extra.update(halo_info)
+        if stages is not None:
+            stages.save_enet(stages_p, reps, float(eps))
     stats.n_reps = int(reps.rep_idx.shape[0])
     stats.compression_ratio = float(X.shape[0]) / max(stats.n_reps, 1)
+    log.info(
+        "ε-net done: R=%d compression=%.4f RSS≈%.0f MiB",
+        stats.n_reps,
+        stats.compression_ratio,
+        rss_mb(),
+    )
     X_rep = X[reps.rep_idx]
 
     # Assign landmarks for representatives (for IVF)
@@ -1336,15 +1559,11 @@ def build_graph(
     if mode == "auto" and ivf_view_assign is not None:
         mode = "ivf"
 
-    # 4.4 kNN — caller-supplied, or exact distances via scoring metric
+    # 4.4 kNN — staged / caller-supplied / computed
+    R = int(X_rep.shape[0])
+    staged_knn = stages.load_knn(stages_p) if stages is not None else None
     if precomputed_knn is not None:
         raw_idx, raw_dist = precomputed_knn
-        R = int(X_rep.shape[0])
-        if R != int(X.shape[0]):
-            raise ValueError(
-                "precomputed_knn requires R == N (dedup=False); got "
-                f"R={R}, N={int(X.shape[0])}"
-            )
         knn_idx, knn_dist, k_eff = validate_precomputed_knn(
             raw_idx, raw_dist, R, n_neighbors=n_neighbors
         )
@@ -1359,18 +1578,48 @@ def build_graph(
         stats.knn_mode = "precomputed"
         stats.knn_recall = None
         stats.extra["precomputed_k"] = int(k_eff)
-    else:
-        knn_dist, knn_idx, knn_info = knn_representatives(
-            X_rep,
-            dist_fn,
-            k=n_neighbors,
-            mode=mode,
-            landmarks=landmarks_for_ivf,
-            assign_topc=rep_topc,
-            c_search=c_search,
-            metric=metric,
-            extra_assign_topc=extra_assign_topc,
+    elif staged_knn is not None:
+        knn_idx, knn_dist = staged_knn
+        knn_idx, knn_dist, k_eff = validate_precomputed_knn(
+            knn_idx, knn_dist, R, n_neighbors=n_neighbors
         )
+        knn_idx = knn_idx.to(device=X.device)
+        knn_dist = knn_dist.to(device=X.device)
+        stats.knn_mode = "staged"
+        stats.knn_recall = None
+        stats.extra["precomputed_k"] = int(k_eff)
+    else:
+        use_spill = stages is not None and R > 50_000
+        if use_spill:
+            knn_dist, knn_idx, knn_info = _knn_spill_to_stages(
+                X_rep,
+                dist_fn,
+                k=n_neighbors,
+                mode=mode,
+                metric=metric,
+                stages_root=stages_p,
+                landmarks=landmarks_for_ivf,
+                assign_topc=rep_topc,
+                c_search=c_search,
+                extra_assign_topc=extra_assign_topc,
+            )
+        else:
+            knn_dist, knn_idx, knn_info = knn_representatives(
+                X_rep,
+                dist_fn,
+                k=n_neighbors,
+                mode=mode,
+                landmarks=landmarks_for_ivf,
+                assign_topc=rep_topc,
+                c_search=c_search,
+                metric=metric,
+                extra_assign_topc=extra_assign_topc,
+            )
+            if stages is not None:
+                g = stages.create_knn_store(stages_p, R, int(n_neighbors))
+                g.idx[:] = knn_idx.detach().cpu().numpy().astype(np.int64)
+                g.dist[:] = knn_dist.detach().cpu().numpy().astype(np.float32)
+                stages.mark_knn_complete(stages_p)
         stats.knn_mode = knn_info.get("mode", knn_mode)
         stats.knn_recall = knn_info.get("recall")
 

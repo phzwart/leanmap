@@ -8,8 +8,9 @@ axis: ``z0`` must increase with the digit, which fixes one direction and its
 sign. Parity is a coarse secondary factor, and there is no honest reason to
 claim which way a map should lay out even versus odd -- so it gets a
 *free-direction* axis, which asks only that the two groups come apart along some
-direction and lets the fit choose which. Because that direction is zeroed on
-``z0``, the parity term cannot disturb the digit ordering however hard it pushes.
+direction and lets the fit choose which -- including its angle to ``z0``. The
+default discovers that angle (read ``tilt_parity``); ``orthogonal=True`` forces
+it square to the pinned axis and then the parity term cannot move ``z0``.
 
 The arms are chosen to show what each choice costs:
 

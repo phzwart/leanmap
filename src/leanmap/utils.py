@@ -27,6 +27,22 @@ def get_logger() -> logging.Logger:
     return _LOGGER
 
 
+def rss_mb() -> float:
+    """Current process resident set size in MiB, or ``-1`` if unavailable."""
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # macOS reports bytes; Linux reports KiB.
+        import sys
+
+        if sys.platform == "darwin":
+            return float(usage) / (1024.0 * 1024.0)
+        return float(usage) / 1024.0
+    except Exception:  # noqa: BLE001
+        return -1.0
+
+
 def seed_everything(seed: int = 0) -> None:
     """Seed ``random``, ``numpy``, and ``torch`` for reproducibility.
 
