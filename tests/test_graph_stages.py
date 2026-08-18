@@ -46,10 +46,16 @@ def test_stages_landmarks_enet_knn_roundtrip(tmp_path: Path):
         offsets=torch.arange(11, dtype=torch.int64),
         values=torch.arange(30, dtype=torch.int64),
     )
-    save_enet(root, reps, 0.2)
-    loaded, eps = load_enet(root)
+    save_enet(root, reps, 0.2, halo_done=True)
+    loaded, eps, halo_done = load_enet(root)
     assert eps == pytest.approx(0.2)
+    assert halo_done is True
     assert torch.equal(loaded.rep_idx, reps.rep_idx)
+
+    # Pre-halo checkpoint round-trip
+    save_enet(root, reps, 0.2, halo_done=False)
+    _, _, halo_done2 = load_enet(root)
+    assert halo_done2 is False
 
     store = create_knn_store(root, 10, 3)
     store.idx[:] = np.array([[(i + j + 1) % 10 for j in range(3)] for i in range(10)], dtype=np.int64)

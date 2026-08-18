@@ -10,6 +10,7 @@ from leanmap.diagnostics.record import DiagnosticsRecord
 __all__ = [
     "build_path_triplets",
     "build_path_triplets_with_stats",
+    "build_collinear_spatial_triplets",
     "remap_triplets",
     "record_path_build_stats",
 ]
@@ -247,6 +248,93 @@ def build_path_triplets(
     )
     record_path_build_stats(diagnostics, stats)
     return tri, dt
+
+
+def build_collinear_spatial_triplets(
+    image_id: np.ndarray,
+    row: np.ndarray,
+    col: np.ndarray,
+    *,
+    max_gap: float = 3.0,
+    directions: Tuple[str, ...] = ("horizontal", "vertical"),
+) -> Dict[str, Any]:
+    """Collinear 3-pixel path triplets on a (possibly subsampled) mask.
+
+    For each scanline (fixed ``image_id`` + row for horizontal, or + col for
+    vertical), sort pixels along the free axis and emit consecutive triples
+    ``(p[i], p[i+1], p[i+2])`` whose successive gaps are ``<= max_gap`` in
+    pixel units. ``triplet_dt`` stores the *spatial* lags
+    ``(|t_near-t_a|, |t_mid-t_a|)`` so the bi-Lipschitz hinges are in pixel
+    index, not ambient chemistry distance.
+
+    Returns a dict with keys ``horizontal`` / ``vertical``, each
+    ``{"triplets": (T,3) int64, "triplet_dt": (T,2) float32, "n": int}``.
+    """
+    image_id = np.asarray(image_id).reshape(-1)
+    row = np.asarray(row, dtype=np.int64).reshape(-1)
+    col = np.asarray(col, dtype=np.int64).reshape(-1)
+    n = int(image_id.shape[0])
+    if row.shape[0] != n or col.shape[0] != n:
+        raise ValueError("image_id, row, col length mismatch")
+    max_gap = float(max_gap)
+    if max_gap <= 0:
+        raise ValueError("max_gap must be > 0")
+
+    out: Dict[str, Any] = {}
+    for direction in directions:
+        if direction == "horizontal":
+            # group = (image, row); free axis = col
+            group = image_id.astype(np.int64) * (int(row.max()) + 1) + row
+            free = col.astype(np.float64)
+        elif direction == "vertical":
+            group = image_id.astype(np.int64) * (int(col.max()) + 1) + col
+            free = row.astype(np.float64)
+        else:
+            raise ValueError(f"unknown direction {direction!r}")
+
+        tri_parts: list[np.ndarray] = []
+        dt_parts: list[np.ndarray] = []
+        n_groups = 0
+        n_gap_drop = 0
+        for g in np.unique(group):
+            idx = np.flatnonzero(group == g)
+            if idx.size < 3:
+                continue
+            n_groups += 1
+            order = np.argsort(free[idx], kind="mergesort")
+            idx_s = idx[order]
+            t_s = free[idx_s]
+            # consecutive triples in sorted order
+            for i in range(idx_s.size - 2):
+                a, b, c = int(idx_s[i]), int(idx_s[i + 1]), int(idx_s[i + 2])
+                dt_n = float(t_s[i + 1] - t_s[i])
+                dt_m = float(t_s[i + 2] - t_s[i])
+                gap1 = dt_n
+                gap2 = float(t_s[i + 2] - t_s[i + 1])
+                if gap1 <= 0 or gap2 <= 0 or dt_m <= dt_n:
+                    n_gap_drop += 1
+                    continue
+                if gap1 > max_gap or gap2 > max_gap:
+                    n_gap_drop += 1
+                    continue
+                tri_parts.append(np.array([[a, b, c]], dtype=np.int64))
+                dt_parts.append(np.array([[dt_n, dt_m]], dtype=np.float32))
+
+        if tri_parts:
+            triplets = np.concatenate(tri_parts, axis=0)
+            triplet_dt = np.concatenate(dt_parts, axis=0)
+        else:
+            triplets = np.zeros((0, 3), dtype=np.int64)
+            triplet_dt = np.zeros((0, 2), dtype=np.float32)
+        out[direction] = {
+            "triplets": triplets,
+            "triplet_dt": triplet_dt,
+            "n": int(triplets.shape[0]),
+            "n_groups": int(n_groups),
+            "n_gap_drop": int(n_gap_drop),
+            "max_gap": max_gap,
+        }
+    return out
 
 
 def remap_triplets(

@@ -28,7 +28,7 @@ from ..config import (
     PYRAMID_REP_RATIO,
 )
 from ..metrics import MetricSpec
-from ..utils import get_logger, rss_mb
+from ..utils import BUILD_PROGRESS, get_logger, rss_mb
 
 
 @dataclass
@@ -397,6 +397,9 @@ def _halo_merge(
     assign_topc: torch.Tensor,
     dist_fn: DistanceFn,
     epsilon: float,
+    *,
+    chunk: int = 2048,
+    skip_compression_below: float = 1.05,
 ) -> Tuple[Representatives, dict]:
     """Merge ε-close representatives that landed in different landmark buckets.
 
@@ -412,11 +415,42 @@ def _halo_merge(
     to whichever pair was seen first. Roots are the lowest representative index,
     so the labelling is deterministic.
 
+    Distances are evaluated in ``chunk × chunk`` tiles so peak memory stays
+    ``O(chunk²)`` rather than ``O(S²)`` for a shortlist of size ``S``. When the
+    in-bucket δ-net barely compressed (``N/R < skip_compression_below``) **and**
+    ``R`` is large, the pass is skipped: at that radius cross-boundary merges are
+    almost never found either, and the old all-pairs shortlist path OOM'd near
+    half a million representatives.
+
     Returns the rebuilt ``Representatives`` and a diagnostics dict.
     """
+    log = get_logger()
     R = int(reps.rep_idx.shape[0])
-    info = {"halo_pairs": 0, "halo_merged": 0, "R_before": R}
+    N = int(reps.member_of.shape[0])
+    compression = float(N) / max(R, 1)
+    info: Dict[str, Any] = {
+        "halo_pairs": 0,
+        "halo_merged": 0,
+        "R_before": R,
+        "compression_ratio": compression,
+    }
     if R < 2 or epsilon <= 0.0:
+        return reps, info
+
+    # Large-N escape hatch only — small graphs still run the merge so unit
+    # tests and tiny datasets keep bit-exact halo behaviour.
+    _LARGE_R_SKIP = 100_000
+    if compression < float(skip_compression_below) and R >= _LARGE_R_SKIP:
+        info["halo_skipped"] = "low_compression"
+        info["R_after"] = R
+        log.info(
+            "halo skip: compression_ratio=%.4f < %.2f with R=%d (>=%d); "
+            "cross-bucket merges at this radius are negligible",
+            compression,
+            float(skip_compression_below),
+            R,
+            _LARGE_R_SKIP,
+        )
         return reps, info
 
     rep_idx = reps.rep_idx
@@ -449,28 +483,60 @@ def _halo_merge(
             ra, rb = rb, ra
         parent[rb] = ra
 
+    chunk = max(64, int(chunk))
     n_pairs = 0
+    max_S = 0
+    n_buckets_scanned = 0
     for members in shortlist.values():
         if len(members) < 2:
             continue
-        idx_t = torch.as_tensor(sorted(members), dtype=torch.int64)
-        D = dist_fn(X_rep[idx_t], X_rep[idx_t])
-        close = (D <= epsilon).nonzero(as_tuple=False)
-        for a_pos, b_pos in close.tolist():
-            if a_pos >= b_pos:
-                continue
-            ra, rb = int(idx_t[a_pos]), int(idx_t[b_pos])
-            # Same-bucket pairs are already handled by the greedy net.
-            if int(rep_top1[ra]) == int(rep_top1[rb]):
-                continue
-            n_pairs += 1
-            union(ra, rb)
+        idx_t = torch.as_tensor(sorted(set(members)), dtype=torch.int64)
+        S = int(idx_t.numel())
+        max_S = max(max_S, S)
+        n_buckets_scanned += 1
+        BUILD_PROGRESS.set(
+            "δ-net",
+            f"halo merge bucket {n_buckets_scanned} S={S} pairs≈{n_pairs}",
+        )
+        # Blocked upper-triangle: peak tile is chunk×chunk floats.
+        for i0 in range(0, S, chunk):
+            i1 = min(S, i0 + chunk)
+            ii = idx_t[i0:i1]
+            Xi = X_rep[ii]
+            for j0 in range(i0, S, chunk):
+                j1 = min(S, j0 + chunk)
+                jj = idx_t[j0:j1]
+                Xj = X_rep[jj]
+                D = dist_fn(Xi, Xj)
+                close = (D <= epsilon).nonzero(as_tuple=False)
+                for a_pos, b_pos in close.tolist():
+                    # Skip lower triangle / diagonal inside the diagonal tile.
+                    if j0 == i0 and a_pos >= b_pos:
+                        continue
+                    ra = int(ii[a_pos])
+                    rb = int(jj[b_pos])
+                    if ra == rb:
+                        continue
+                    # Same-bucket pairs are already handled by the greedy net.
+                    if int(rep_top1[ra]) == int(rep_top1[rb]):
+                        continue
+                    n_pairs += 1
+                    union(ra, rb)
+
+    info["halo_max_shortlist"] = int(max_S)
+    info["halo_chunk"] = int(chunk)
 
     roots = [find(r) for r in range(R)]
     uniq = sorted(set(roots))
     if len(uniq) == R:
         info["halo_pairs"] = n_pairs
         info["R_after"] = R
+        log.info(
+            "halo pass: %d cross-bucket pair(s), no merges (R=%d, max_shortlist=%d)",
+            n_pairs,
+            R,
+            max_S,
+        )
         return reps, info
 
     remap = {old: new for new, old in enumerate(uniq)}
@@ -491,13 +557,15 @@ def _halo_merge(
             "R_after": R_new,
         }
     )
-    get_logger().info(
+    log.info(
         "halo pass: %d cross-bucket pair(s) within epsilon merged %d representative(s) "
-        "(R %d -> %d)",
+        "(R %d -> %d, max_shortlist=%d, chunk=%d)",
         n_pairs,
         R - R_new,
         R,
         R_new,
+        max_S,
+        chunk,
     )
     return (
         Representatives(rep_idx_new, member_of, counts.float(), offsets, order),
@@ -535,6 +603,8 @@ def build_representatives(
     -------
     Representatives
     """
+    import time as _time
+
     log = get_logger()
     n = X.shape[0]
     rng = np.random.default_rng(seed)
@@ -551,9 +621,25 @@ def build_representatives(
         log.info("epsilon=0: skipping deduplication (R == N)")
         return Representatives(rep_idx, member_of, weight, offsets, values)
 
+    log.info(
+        "δ-net start: L=%d N=%d epsilon=%.6g RSS≈%.0f MiB",
+        L,
+        n,
+        float(epsilon),
+        rss_mb(),
+    )
+    BUILD_PROGRESS.set("δ-net", f"0/{L} buckets R≈0")
+    _last_prog = _time.monotonic()
+
     for b in range(L):
         P = torch.where(assign_top1 == b)[0]
         if P.numel() == 0:
+            now = _time.monotonic()
+            if b + 1 == L or (now - _last_prog) >= 10.0:
+                _last_prog = now
+                detail = f"{b + 1}/{L} buckets R≈{len(all_reps)}"
+                BUILD_PROGRESS.set("δ-net", detail)
+                log.info("δ-net progress %s RSS≈%.0f MiB", detail, rss_mb())
             continue
         if P.numel() > max_bucket:
             # Approximate: sub-block nets then merge.
@@ -593,6 +679,13 @@ def build_representatives(
             for raw_i, local_j in mem.items():
                 member_of[raw_i] = base + local_j
 
+        now = _time.monotonic()
+        if b + 1 == L or (now - _last_prog) >= 10.0:
+            _last_prog = now
+            detail = f"{b + 1}/{L} buckets R≈{len(all_reps)}"
+            BUILD_PROGRESS.set("δ-net", detail)
+            log.info("δ-net progress %s RSS≈%.0f MiB", detail, rss_mb())
+
     if (member_of < 0).any():
         raise RuntimeError("build_representatives left unassigned points")
 
@@ -611,6 +704,7 @@ def build_representatives(
     log.info("compression_ratio = N/R = %.4f (N=%d, R=%d)", compression, n, R)
     if compression < 1.05:
         log.info("deduplication was a no-op (compression_ratio < 1.05)")
+    BUILD_PROGRESS.set("δ-net", f"done R={R}")
     return Representatives(rep_idx, member_of, weight, offsets, values)
 
 
@@ -706,6 +800,7 @@ def _knn_spill_to_stages(
             nlist,
             rss_mb(),
         )
+        BUILD_PROGRESS.set("kNN spill", f"ANN train R={R} nlist={nlist}")
         quant = faiss.IndexFlatL2(d)
         index = faiss.IndexIVFFlat(quant, d, nlist)
         index.train(Xt)
@@ -728,6 +823,10 @@ def _knn_spill_to_stages(
             batch,
             idx_path,
         )
+        BUILD_PROGRESS.set("kNN spill", f"0/{R} (0.0%)")
+        import time as _time
+
+        _last_hb = _time.monotonic()
         for s in range(0, R, batch):
             e = min(R, s + batch)
             _, cand = index.search(Xt[s:e], k_over)
@@ -758,17 +857,25 @@ def _knn_spill_to_stages(
                 batch_dist[bi] = out_v[:k]
             g.idx[s:e] = batch_idx
             g.dist[s:e] = batch_dist
-            if (e // batch) % 20 == 0 or e == R:
+            now = _time.monotonic()
+            if e == R or (now - _last_hb) >= 10.0:
+                _last_hb = now
+                pct = 100.0 * e / max(R, 1)
+                detail = f"{e}/{R} ({pct:.1f}%)"
+                BUILD_PROGRESS.set("kNN spill", detail)
                 log.info(
-                    "knn spill progress %d / %d RSS≈%.0f MiB",
-                    e,
-                    R,
+                    "knn spill progress %s RSS≈%.0f MiB",
+                    detail,
                     rss_mb(),
                 )
         info["mode"] = "spill_ann"
     else:
         log.info("knn spill brute tiles: R=%d batch=%d", R, batch)
+        BUILD_PROGRESS.set("kNN spill", f"0/{R} (0.0%) brute")
         chunk_b = 16384
+        import time as _time
+
+        _last_hb = _time.monotonic()
         for s in range(0, R, batch):
             e = min(R, s + batch)
             vals, idx = chunked_cdist(
@@ -796,16 +903,21 @@ def _knn_spill_to_stages(
                 batch_dist[bi] = kept_v.detach().cpu().numpy().astype(np.float32)
             g.idx[s:e] = batch_idx
             g.dist[s:e] = batch_dist
-            if (e // batch) % 20 == 0 or e == R:
+            now = _time.monotonic()
+            if e == R or (now - _last_hb) >= 10.0:
+                _last_hb = now
+                pct = 100.0 * e / max(R, 1)
+                detail = f"{e}/{R} ({pct:.1f}%)"
+                BUILD_PROGRESS.set("kNN spill", detail)
                 log.info(
-                    "knn spill progress %d / %d RSS≈%.0f MiB",
-                    e,
-                    R,
+                    "knn spill progress %s RSS≈%.0f MiB",
+                    detail,
                     rss_mb(),
                 )
         info["mode"] = "spill_brute"
 
     stages.mark_knn_complete(stages_root)
+    BUILD_PROGRESS.set("kNN spill", f"complete R={R}")
     log.info("knn spill complete: R=%d k=%d RSS≈%.0f MiB", R, k, rss_mb())
     loaded = stages.load_knn(stages_root)
     assert loaded is not None
@@ -1559,6 +1671,7 @@ def build_graph(
             )
 
     # 4.2 landmarks — FPS in scoring space, or in fps_view (conditioning) space
+    BUILD_PROGRESS.set("landmarks", f"L={n_landmarks}")
     ivf_view_assign: Optional[Tuple[Any, DistanceFn, torch.Tensor]] = None
     loaded_landmarks = (
         stages.load_landmarks(stages_p) if stages is not None else None
@@ -1618,9 +1731,11 @@ def build_graph(
 
     # 4.3 representatives (+ halo pass across Voronoi boundaries)
     # Net at δ (defaults to ε). ε remains in stats for diagnostics / nesting.
+    # Checkpoint the pre-halo ε-net so a halo crash does not lose the δ-net work.
     loaded_enet = stages.load_enet(stages_p) if stages is not None else None
+    halo_done = False
     if loaded_enet is not None:
-        reps, staged_radius = loaded_enet
+        reps, staged_radius, halo_done = loaded_enet
         reps = Representatives(
             rep_idx=reps.rep_idx.to(device=X.device),
             member_of=reps.member_of.to(device=X.device),
@@ -1635,17 +1750,34 @@ def build_graph(
                 net_radius,
             )
         stats.delta = float(staged_radius)
-        stats.extra["halo_pairs"] = stats.extra.get("halo_pairs", 0)
-        stats.extra["halo_merged"] = stats.extra.get("halo_merged", 0)
         stats.extra["stages_enet"] = True
+        if halo_done:
+            stats.extra["halo_pairs"] = stats.extra.get("halo_pairs", 0)
+            stats.extra["halo_merged"] = stats.extra.get("halo_merged", 0)
+            log.info(
+                "stages: reusing post-halo ε-net R=%d (skipping δ-net + halo)",
+                int(reps.rep_idx.shape[0]),
+            )
+        else:
+            log.info(
+                "stages: reusing pre-halo ε-net R=%d (resuming halo only)",
+                int(reps.rep_idx.shape[0]),
+            )
     else:
+        BUILD_PROGRESS.set("δ-net", f"start L={L} N={int(X.shape[0])}")
         reps = build_representatives(
             X, assign_top1, dist_fn, net_radius, L, seed=seed
         )
+        if stages is not None:
+            # Persist before halo so an OOM in the merge does not redo δ-net.
+            stages.save_enet(stages_p, reps, float(net_radius), halo_done=False)
+
+    if not halo_done:
+        BUILD_PROGRESS.set("δ-net", "halo merge")
         reps, halo_info = _halo_merge(X, reps, assign_topc, dist_fn, net_radius)
         stats.extra.update(halo_info)
         if stages is not None:
-            stages.save_enet(stages_p, reps, float(net_radius))
+            stages.save_enet(stages_p, reps, float(net_radius), halo_done=True)
     stats.n_reps = int(reps.rep_idx.shape[0])
     stats.compression_ratio = float(X.shape[0]) / max(stats.n_reps, 1)
     if stats.delta == 0.0 and float(net_radius) != 0.0:
@@ -1661,6 +1793,7 @@ def build_graph(
     X_rep = X[reps.rep_idx]
 
     # Assign landmarks for representatives (for IVF)
+    BUILD_PROGRESS.set("kNN", "assign reps")
     if ivf_view_assign is not None:
         view_fn, v_metric, M_view = ivf_view_assign
         V_rep = view_fn(X_rep)
@@ -1693,6 +1826,7 @@ def build_graph(
 
     # 4.4 kNN — staged / caller-supplied / computed
     R = int(X_rep.shape[0])
+    BUILD_PROGRESS.set("kNN", f"start R={R} mode={mode}")
     log.info("kNN start: R=%d mode=%s stages=%s RSS≈%.0f MiB", R, mode, stages_p, rss_mb())
     staged_knn = stages.load_knn(stages_p) if stages is not None else None
     if precomputed_knn is not None:
@@ -1765,6 +1899,7 @@ def build_graph(
             stats.knn_recall,
             rss_mb(),
         )
+        BUILD_PROGRESS.set("kNN", f"done mode={stats.knn_mode}")
     graph = assemble_graph_from_knn(
         X,
         metric,
@@ -2432,8 +2567,12 @@ def save_graph_pyramid(
 
 
 def load_graph_pyramid(path: Union[str, Path]) -> Dict[str, Any]:
-    """Load a pyramid written by :func:`save_graph_pyramid`."""
+    """Load a pyramid written by :func:`save_graph_pyramid` or a DirStore."""
     path = Path(path)
+    if path.is_dir():
+        from leanmap.store.dirstore import DirStore
+
+        return DirStore(path).load()
     try:
         payload = torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:

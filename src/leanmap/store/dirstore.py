@@ -18,6 +18,30 @@ from .schema import META_FILENAME, STORE_DIRS, STORE_SCHEMA_VERSION
 PathLike = Union[str, Path]
 
 
+def _numeric_delta(value: Any, fallback: Any = None) -> Optional[float]:
+    """Coerce a stored/config δ to float.
+
+    Config may pass ``\"auto\"`` / ``\"eps\"``; those are not radii. Prefer
+    ``fallback`` (usually ``graph.stats.delta``) in that case.
+    """
+    for candidate in (value, fallback):
+        if candidate is None:
+            continue
+        if isinstance(candidate, str):
+            text = candidate.strip().lower()
+            if text in ("", "none", "auto", "eps"):
+                continue
+            try:
+                return float(text)
+            except ValueError:
+                continue
+        try:
+            return float(candidate)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _json_default(obj: Any) -> Any:
     if isinstance(obj, (np.integer,)):
         return int(obj)
@@ -246,10 +270,14 @@ class DirStore:
             "n_pyramid_levels": len(graphs),
             "diagnostics": diag,
         }
-        if delta is not None:
-            meta["delta"] = float(delta)
+        resolved_delta = _numeric_delta(
+            delta,
+            getattr(graphs[0].stats, "delta", None) if graphs else None,
+        )
+        if resolved_delta is not None:
+            meta["delta"] = resolved_delta
             if isinstance(meta["diagnostics"], dict):
-                meta["diagnostics"]["delta"] = float(delta)
+                meta["diagnostics"]["delta"] = resolved_delta
 
         # gauge/ artefact when helpers recorded a level / ν.
         if isinstance(diag, dict) and (

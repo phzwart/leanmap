@@ -128,7 +128,13 @@ def load_landmarks(
     return M, top1, topc
 
 
-def save_enet(root: Path, reps: Representatives, epsilon: float) -> None:
+def save_enet(
+    root: Path,
+    reps: Representatives,
+    epsilon: float,
+    *,
+    halo_done: bool = False,
+) -> None:
     base = stages_root(root) / "enet"
     _save_array(base / "rep_idx", reps.rep_idx.detach().cpu().numpy().astype(np.int64))
     _save_array(base / "member_of", reps.member_of.detach().cpu().numpy().astype(np.int64))
@@ -136,10 +142,22 @@ def save_enet(root: Path, reps: Representatives, epsilon: float) -> None:
     _save_array(base / "offsets", reps.offsets.detach().cpu().numpy().astype(np.int64))
     _save_array(base / "values", reps.values.detach().cpu().numpy().astype(np.int64))
     (base / "epsilon.txt").write_text(repr(float(epsilon)) + "\n")
-    get_logger().info("stages: wrote ε-net R=%d", int(reps.rep_idx.shape[0]))
+    (base / "halo_done.txt").write_text("1\n" if halo_done else "0\n")
+    get_logger().info(
+        "stages: wrote ε-net R=%d halo_done=%s",
+        int(reps.rep_idx.shape[0]),
+        bool(halo_done),
+    )
 
 
-def load_enet(root: Path) -> Optional[Tuple[Representatives, float]]:
+def load_enet(
+    root: Path,
+) -> Optional[Tuple[Representatives, float, bool]]:
+    """Load staged ε-net.
+
+    Returns ``(reps, epsilon, halo_done)``. Older stages without
+    ``halo_done.txt`` are treated as ``halo_done=True`` (post-halo snapshot).
+    """
     base = Path(root) / "enet"
     if not (base / "rep_idx").exists():
         return None
@@ -151,8 +169,18 @@ def load_enet(root: Path) -> Optional[Tuple[Representatives, float]]:
         values=torch.as_tensor(_load_array(base / "values"), dtype=torch.int64),
     )
     eps = float((base / "epsilon.txt").read_text().strip())
-    get_logger().info("stages: loaded ε-net R=%d", int(reps.rep_idx.shape[0]))
-    return reps, eps
+    halo_path = base / "halo_done.txt"
+    if halo_path.exists():
+        halo_done = halo_path.read_text().strip() not in ("0", "false", "False")
+    else:
+        # Legacy caches were written after the halo pass.
+        halo_done = True
+    get_logger().info(
+        "stages: loaded ε-net R=%d halo_done=%s",
+        int(reps.rep_idx.shape[0]),
+        halo_done,
+    )
+    return reps, eps, halo_done
 
 
 class _KnnStore:

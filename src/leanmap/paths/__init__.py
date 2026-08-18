@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from .build import (
+    build_collinear_spatial_triplets,
     build_path_triplets,
     build_path_triplets_with_stats,
     record_path_build_stats,
@@ -29,6 +30,7 @@ __all__ = [
     "PATH_PAIRS_PER_STEP",
     "PathConstraint",
     "PathTripletSampler",
+    "build_collinear_spatial_triplets",
     "build_path_triplets",
     "build_path_triplets_with_stats",
     "encode_groups",

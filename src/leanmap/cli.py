@@ -410,8 +410,9 @@ def main_graph_build(argv: list[str] | None = None) -> int:
     )
     from leanmap.metrics import wrap_metric
     from leanmap.store import open_graph_store, select_backend
-    from leanmap.utils import seed_everything
+    from leanmap.utils import BUILD_PROGRESS, Heartbeat, get_logger, seed_everything
 
+    log = get_logger()
     X = _load_array(args.X)
     seed_everything(args.seed)
     cfg = PLANEConfig.for_scale(len(X))
@@ -438,30 +439,49 @@ def main_graph_build(argv: list[str] | None = None) -> int:
         delta=cfg.delta,
         stages_dir=cfg.graph_stages_dir,
     )
-    if args.bunch_partition == "local":
-        graphs, M, a1, ac = build_graph_pyramid(Xt, metric, **build_kw)
-    else:
-        from leanmap.build.bunches import build_graph_pyramid_bunches
-        from leanmap.build.transport import make_transport
+    log.info(
+        "graph-build start: N=%d d=%d knn_mode=%s pyramid_scales=%d L=%d k=%d",
+        Xt.shape[0],
+        Xt.shape[1],
+        cfg.knn_mode,
+        cfg.pyramid_scales,
+        cfg.n_landmarks,
+        cfg.n_neighbors,
+    )
+    BUILD_PROGRESS.set("graph-build", "starting")
+    try:
+        with Heartbeat(
+            "graph-build",
+            interval=10.0,
+            detail=BUILD_PROGRESS.format,
+        ):
+            if args.bunch_partition == "local":
+                graphs, M, a1, ac = build_graph_pyramid(Xt, metric, **build_kw)
+            else:
+                from leanmap.build.bunches import build_graph_pyramid_bunches
+                from leanmap.build.transport import make_transport
 
-        transport = make_transport(
-            args.bunch_partition,
-            stages_dir=args.stages or cfg.graph_stages_dir,
-            rank=args.rank,
-            world_size=args.world_size,
-        )
-        result = build_graph_pyramid_bunches(
-            Xt,
-            metric,
-            transport=transport,
-            transport_kind=args.bunch_partition,
-            stages_dir=args.stages or cfg.graph_stages_dir,
-            **build_kw,
-        )
-        if result is None:
-            # Non-root worker: freeze is root-only.
-            return 0
-        graphs, M, a1, ac = result
+                transport = make_transport(
+                    args.bunch_partition,
+                    stages_dir=args.stages or cfg.graph_stages_dir,
+                    rank=args.rank,
+                    world_size=args.world_size,
+                )
+                # stages_dir already in build_kw when --stages was set; don't pass twice
+                result = build_graph_pyramid_bunches(
+                    Xt,
+                    metric,
+                    transport=transport,
+                    transport_kind=args.bunch_partition,
+                    **build_kw,
+                )
+                if result is None:
+                    # Non-root worker: freeze is root-only.
+                    return 0
+                graphs, M, a1, ac = result
+    finally:
+        BUILD_PROGRESS.clear()
+    log.info("graph-build compute done; writing store")
     out = Path(args.out)
     n = int(Xt.shape[0])
     train_idx = torch.arange(n, dtype=torch.long)
@@ -470,7 +490,8 @@ def main_graph_build(argv: list[str] | None = None) -> int:
     eps_val = float(graphs[0].stats.epsilon) if graphs[0].stats.epsilon else 0.0
     backend = select_backend(out, n_reps=int(graphs[0].reps.rep_idx.shape[0]))
     if str(backend) == "dirstore" or out.suffix != ".pt":
-        store = open_graph_store(out)
+        n_reps = int(graphs[0].reps.rep_idx.shape[0])
+        store = open_graph_store(out, n_reps=n_reps)
         state = {
             "version": 1,
             "graphs": graphs,
@@ -480,7 +501,8 @@ def main_graph_build(argv: list[str] | None = None) -> int:
             "fingerprint": fp,
             "seed": args.seed,
             "epsilon": eps_val,
-            "delta": getattr(cfg, "delta", None),
+            # Persist the resolved radius, not the config token ("auto"/"eps").
+            "delta": float(getattr(graphs[0].stats, "delta", eps_val) or eps_val),
             "n_neighbors": cfg.n_neighbors,
             "n_landmarks": int(M.shape[0]),
             "metric_name": "l2",
@@ -490,7 +512,10 @@ def main_graph_build(argv: list[str] | None = None) -> int:
             "dedup": cfg.dedup,
         }
         if hasattr(store, "save_from_state"):
-            store.save_from_state(state, X=Xt)  # type: ignore[call-arg]
+            try:
+                store.save_from_state(state, X=Xt)  # type: ignore[call-arg]
+            except TypeError:
+                store.save_from_state(state)  # type: ignore[call-arg]
         elif hasattr(store, "save"):
             store.save(  # type: ignore[call-arg]
                 graphs=graphs,
@@ -534,7 +559,23 @@ def main_train(argv: list[str] | None = None) -> int:
     ap.add_argument("--X", required=True)
     ap.add_argument("--graph-path", required=True)
     ap.add_argument("--epochs", type=int, default=None)
-    ap.add_argument("--lambda-path", type=float, default=None)
+    ap.add_argument(
+        "--lambda-path",
+        type=float,
+        default=None,
+        help="bi-Lipschitz path-constraint weight (requires --path-npz)",
+    )
+    ap.add_argument(
+        "--path-ramp",
+        default=None,
+        help="comma pair t0,t1 for path schedule (default: config.path_ramp)",
+    )
+    ap.add_argument(
+        "--path-npz",
+        default=None,
+        help="spatial path triplets .npz (keys: horizontal_triplets/horizontal_dt "
+        "and/or vertical_triplets/vertical_dt)",
+    )
     ap.add_argument(
         "--epoch-unit",
         choices=("edges", "landmarks"),
@@ -554,15 +595,103 @@ def main_train(argv: list[str] | None = None) -> int:
         help="0..1 blend toward equal landmark-basin edge sampling",
     )
     ap.add_argument(
+        "--batch-edges",
+        type=int,
+        default=None,
+        help="edge draws per optimizer step (default: config.batch_edges)",
+    )
+    ap.add_argument(
         "--exemplar-policy",
         choices=("uniform", "sufficient_v1"),
         default="uniform",
     )
     ap.add_argument("--out", default="plane.pt")
+    ap.add_argument(
+        "--run-dir",
+        default=None,
+        help="directory for live.png, frames/, checkpoints/, progress.csv "
+        "(default: <out> without suffix)",
+    )
+    ap.add_argument(
+        "--plot-every",
+        type=int,
+        default=10,
+        help="write latent scatter every N optimizer steps (0 disables step plots)",
+    )
+    ap.add_argument(
+        "--ckpt-every",
+        type=int,
+        default=1,
+        help="write a checkpoint every N epochs (0 disables epoch checkpoints)",
+    )
+    ap.add_argument(
+        "--max-plot-n",
+        type=int,
+        default=5000,
+        help="subsample size for latent plots",
+    )
+    ap.add_argument(
+        "--color-meta",
+        default=None,
+        help="optional meta.npz; use --color-key for scatter colors",
+    )
+    ap.add_argument(
+        "--color-key",
+        default="image_id",
+        help="key inside --color-meta used as scatter color (default: image_id)",
+    )
+    ap.add_argument(
+        "--d-out",
+        type=int,
+        default=None,
+        help="embedding dimension (default: config.d_out, usually 2)",
+    )
+    ap.add_argument(
+        "--lambda-anchor",
+        type=float,
+        default=None,
+        help="Procrustes gauge weight inside lambda_geo (0 = stress only)",
+    )
+    ap.add_argument(
+        "--lambda-frame",
+        type=float,
+        default=None,
+        help="local rigidity (as-rigid-as-possible) weight",
+    )
+    ap.add_argument(
+        "--frame-ramp",
+        default=None,
+        help="comma pair t0,t1 for frame schedule (e.g. 0,0.05 = fast on-ramp)",
+    )
+    ap.add_argument(
+        "--lambda-geo",
+        type=float,
+        default=None,
+        help="coarse geodesic backbone weight",
+    )
+    ap.add_argument(
+        "--lambda-density",
+        type=float,
+        default=None,
+        help="density-budget weight (0 skips the pre-train density pass)",
+    )
+    ap.add_argument(
+        "--warm-start-steps",
+        type=int,
+        default=None,
+        help="encoder warm-start regression steps (0 disables)",
+    )
+    ap.add_argument(
+        "--init-ckpt",
+        default=None,
+        help="warm-start from a TrainMonitor / plane .pt (loads state_dict)",
+    )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default=None)
     args = ap.parse_args(argv)
     from leanmap import PLANEConfig, fit
+    from leanmap.graph import load_graph_pyramid
+    from leanmap.train.monitor import TrainMonitor
 
     X = _load_array(args.X)
     cfg = PLANEConfig.for_scale(len(X))
@@ -573,15 +702,142 @@ def main_train(argv: list[str] | None = None) -> int:
         cfg.epochs = args.epochs
     if args.lambda_path is not None:
         cfg.lambda_path = args.lambda_path
+    if args.path_ramp is not None:
+        parts = [p.strip() for p in str(args.path_ramp).split(",") if p.strip()]
+        if len(parts) != 2:
+            raise SystemExit("--path-ramp needs two comma-separated floats, e.g. 0,0.1")
+        cfg.path_ramp = (float(parts[0]), float(parts[1]))
     if args.epoch_unit is not None:
         cfg.epoch_unit = args.epoch_unit
     if args.landmark_epoch_samples is not None:
         cfg.landmark_epoch_samples = float(args.landmark_epoch_samples)
     if args.landmark_sample_mix is not None:
         cfg.landmark_sample_mix = float(args.landmark_sample_mix)
-    result = fit(X, config=cfg, graph_path=args.graph_path)
-    result.save(args.out)
-    print(f"wrote {args.out}")
+    if args.batch_edges is not None:
+        if int(args.batch_edges) < 1:
+            raise SystemExit("--batch-edges must be >= 1")
+        cfg.batch_edges = int(args.batch_edges)
+    if args.d_out is not None:
+        if int(args.d_out) < 1:
+            raise SystemExit("--d-out must be >= 1")
+        cfg.d_out = int(args.d_out)
+    if args.lambda_anchor is not None:
+        cfg.lambda_anchor = float(args.lambda_anchor)
+    if args.lambda_frame is not None:
+        cfg.lambda_frame = float(args.lambda_frame)
+    if args.lambda_geo is not None:
+        cfg.lambda_geo = float(args.lambda_geo)
+    if args.lambda_density is not None:
+        cfg.lambda_density = float(args.lambda_density)
+    if args.warm_start_steps is not None:
+        if int(args.warm_start_steps) < 0:
+            raise SystemExit("--warm-start-steps must be >= 0")
+        cfg.warm_start_steps = int(args.warm_start_steps)
+    if args.frame_ramp is not None:
+        parts = [p.strip() for p in str(args.frame_ramp).split(",") if p.strip()]
+        if len(parts) != 2:
+            raise SystemExit("--frame-ramp needs two comma-separated floats, e.g. 0,0.05")
+        cfg.frame_ramp = (float(parts[0]), float(parts[1]))
+    # Frozen graph is authoritative for landmark/neighbor counts (δ may
+    # reconcile L below the scale preset used at build time).
+    cached = load_graph_pyramid(args.graph_path)
+    cfg.n_landmarks = int(cached["n_landmarks"])
+    if cached.get("n_neighbors") is not None:
+        cfg.n_neighbors = int(cached["n_neighbors"])
+
+    out = Path(args.out)
+    run_dir = Path(args.run_dir) if args.run_dir else out.with_suffix("")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    color = None
+    color_label = ""
+    if args.color_meta:
+        meta = np.load(args.color_meta)
+        key = str(args.color_key)
+        if key not in meta.files:
+            raise SystemExit(
+                f"--color-key {key!r} not in {args.color_meta}; have {list(meta.files)}"
+            )
+        color = np.asarray(meta[key]).reshape(-1)
+        if color.shape[0] != len(X):
+            raise SystemExit(
+                f"color length {color.shape[0]} != X rows {len(X)} "
+                f"(meta={args.color_meta})"
+            )
+        color_label = key
+
+    callbacks = None
+    if int(args.plot_every) > 0 or int(args.ckpt_every) > 0:
+        callbacks = [
+            TrainMonitor(
+                X,
+                out_dir=run_dir,
+                plot_every=int(args.plot_every),
+                ckpt_every=int(args.ckpt_every),
+                max_plot_n=int(args.max_plot_n),
+                color=color,
+                colorbar_label=color_label,
+                seed=int(args.seed),
+                config=cfg,
+            )
+        ]
+
+    init_state_dict = None
+    if args.init_ckpt:
+        import torch
+
+        warm = torch.load(str(args.init_ckpt), map_location="cpu", weights_only=False)
+        if isinstance(warm, dict) and "state_dict" in warm:
+            init_state_dict = warm["state_dict"]
+        elif isinstance(warm, dict):
+            # bare state_dict or PLANEResult-like payload
+            init_state_dict = warm.get("state_dict", warm)
+        else:
+            raise SystemExit(f"--init-ckpt {args.init_ckpt!r}: expected a .pt dict")
+        print(f"warm-start from {args.init_ckpt}")
+
+    path_constraints = None
+    if args.path_npz:
+        from leanmap.path import PathConstraint
+
+        pdata = np.load(args.path_npz)
+        path_constraints = []
+        for name in ("horizontal", "vertical"):
+            tkey, dkey = f"{name}_triplets", f"{name}_dt"
+            if tkey not in pdata.files:
+                continue
+            tri = np.asarray(pdata[tkey], dtype=np.int64)
+            dt = np.asarray(pdata[dkey], dtype=np.float32)
+            if tri.shape[0] == 0:
+                continue
+            if int(tri.max()) >= len(X):
+                raise SystemExit(
+                    f"--path-npz {name}: max index {int(tri.max())} >= len(X)={len(X)}"
+                )
+            path_constraints.append(PathConstraint(name=name, triplets=tri, triplet_dt=dt))
+            print(f"path {name}: {tri.shape[0]} triplets")
+        if not path_constraints:
+            raise SystemExit(f"--path-npz {args.path_npz!r}: no usable triplets")
+        if cfg.lambda_path <= 0:
+            print(
+                f"warning: loaded {len(path_constraints)} path constraint(s) but "
+                f"lambda_path={cfg.lambda_path}; set --lambda-path > 0 to enable"
+            )
+
+    result = fit(
+        X,
+        config=cfg,
+        graph_path=args.graph_path,
+        callbacks=callbacks,
+        init_state_dict=init_state_dict,
+        path_constraints=path_constraints,
+    )
+    result.save(out)
+    # also drop a final checkpoint + plot under run_dir
+    if run_dir:
+        result.save(run_dir / "plane_final.pt")
+    print(f"wrote {out}")
+    print(f"run_dir {run_dir}")
     return 0
 
 

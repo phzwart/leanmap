@@ -501,6 +501,9 @@ class PLANEConfig:
             epoch_unit="landmarks",
             landmark_epoch_samples=128.0,
             landmark_sample_mix=0.75,
+            # Prefer δ calibration at large N. When R@ε is already in-band this
+            # is a no-op; when R would explode it coarsens the net before halo.
+            delta="auto",
         )
 
 

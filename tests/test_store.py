@@ -186,6 +186,32 @@ def test_needs_rebuild_invalidation_matrix(mismatch: str):
         assert needs_rebuild(meta, X, {"dedup": False}) is True
 
 
+def test_dirstore_save_accepts_delta_auto_token(tmp_path: Path):
+    """CLI may pass config delta='auto'; store must persist the resolved radius."""
+    X, graphs, M, top1, topc, train_idx, calib_idx = _tiny_pyramid(seed=2)
+    graphs[0].stats.delta = 0.42
+    store = DirStore(tmp_path / "store")
+    store.save(
+        graphs=graphs,
+        M=M,
+        assign_top1=top1,
+        assign_topc=topc,
+        train_idx=train_idx,
+        calib_idx=calib_idx,
+        fingerprint={"shape": list(X.shape)},
+        metric_name="l2",
+        n_all=int(X.shape[0]),
+        n_neighbors=8,
+        epsilon=0.1,
+        seed=0,
+        dedup=True,
+        delta="auto",
+    )
+    meta = store.meta()
+    assert meta["delta"] == pytest.approx(0.42)
+    assert meta["diagnostics"]["delta"] == pytest.approx(0.42)
+
+
 def test_fingerprint_sampled_vs_full():
     rng = np.random.default_rng(0)
     X = rng.standard_normal((1000, 8)).astype(np.float32)

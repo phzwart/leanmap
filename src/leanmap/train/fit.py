@@ -677,7 +677,16 @@ def fit(
                 f"cached graph n_neighbors={cached_k} != {config.n_neighbors}; "
                 "pass rebuild_graph=True"
             )
-        check_tensor_fingerprint(X_train, loaded_pyramid["fingerprint"])
+        from leanmap.store.fingerprint import verify_fingerprint
+
+        fp = loaded_pyramid.get("fingerprint") or {}
+        if "digest" in fp:
+            if not verify_fingerprint(X_train, {"fingerprint": fp}, full=True):
+                raise ValueError(
+                    "X_train fingerprint digest does not match the cached graph; rebuild"
+                )
+        else:
+            check_tensor_fingerprint(X_train, fp)
         graphs = loaded_pyramid["graphs"]
         M = loaded_pyramid["M"]
         assign_top1 = loaded_pyramid["assign_top1"]
@@ -775,6 +784,13 @@ def fit(
         )
     elif calib_idx is not None:
         assert X_cal.shape[0] > 0
+
+    # Epoch monitors can persist conformal scores into checkpoints.
+    if callbacks:
+        for cb in callbacks:
+            set_calib = getattr(cb, "set_calib", None)
+            if set_calib is not None and int(X_cal.shape[0]) > 0:
+                set_calib(X_cal)
 
     # 9. FactorStack
     D = int(X_enc_train.shape[1])

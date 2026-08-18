@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import Iterator, Optional, Sequence, TypeVar
+from typing import Callable, Iterator, Optional, Sequence, TypeVar
 
 import numpy as np
 import torch
@@ -41,6 +41,102 @@ def rss_mb() -> float:
         return float(usage) / 1024.0
     except Exception:  # noqa: BLE001
         return -1.0
+
+
+class BuildProgress:
+    """Thread-safe phase string for :class:`Heartbeat` detail callbacks.
+
+    Long graph-build stages update ``phase`` / ``detail`` so periodic heartbeats
+    report *where* work is, not only that the process is alive.
+    """
+
+    def __init__(self) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        self._phase = ""
+        self._detail = ""
+
+    def set(self, phase: str, detail: str = "") -> None:
+        with self._lock:
+            self._phase = str(phase or "")
+            self._detail = str(detail or "")
+
+    def clear(self) -> None:
+        with self._lock:
+            self._phase = ""
+            self._detail = ""
+
+    def format(self) -> str:
+        with self._lock:
+            if not self._phase:
+                return self._detail
+            if not self._detail:
+                return f"[{self._phase}]"
+            return f"[{self._phase}] {self._detail}"
+
+
+#: Process-wide progress shared by graph-build stages and CLI heartbeats.
+BUILD_PROGRESS = BuildProgress()
+
+
+class Heartbeat:
+    """Background ``I'm still running`` logger for long graph-build phases.
+
+    Starts a daemon thread that emits an INFO line every ``interval`` seconds
+    with elapsed wall time and RSS. Optional ``detail`` callable may return an
+    extra suffix (e.g. ``\"knn 12000/507390\"``).
+    """
+
+    def __init__(
+        self,
+        label: str,
+        *,
+        interval: float = 10.0,
+        detail: Optional[Callable[[], str]] = None,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        import threading
+        import time
+
+        self.label = label
+        self.interval = float(interval)
+        self.detail = detail
+        self.log = logger or get_logger()
+        self._stop = threading.Event()
+        self._t0 = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._run, name=f"leanmap-heartbeat-{label}", daemon=True
+        )
+
+    def _run(self) -> None:
+        import time
+
+        while not self._stop.wait(self.interval):
+            elapsed = time.monotonic() - self._t0
+            extra = ""
+            if self.detail is not None:
+                try:
+                    msg = self.detail()
+                    if msg:
+                        extra = f" {msg}"
+                except Exception:  # noqa: BLE001
+                    extra = " (detail error)"
+            self.log.info(
+                "heartbeat: %s still running  elapsed=%.0fs  RSS≈%.0f MiB%s",
+                self.label,
+                elapsed,
+                rss_mb(),
+                extra,
+            )
+
+    def __enter__(self) -> "Heartbeat":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(1.0, self.interval))
 
 
 def seed_everything(seed: int = 0) -> None:

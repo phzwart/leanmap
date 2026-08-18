@@ -200,6 +200,46 @@ def test_halo_merge_is_order_independent():
     assert torch.equal(a.member_of, b.member_of)
 
 
+def test_halo_merge_chunk_invariant():
+    """Blocked tiles agree with a tiny chunk size (same union-find result)."""
+    from leanmap.graph import _halo_merge, build_representatives
+
+    torch.manual_seed(3)
+    X = torch.randn(80, 3)
+    metric = wrap_metric("l2", X=X, n_neighbors=5, seed=0)
+    M = fps_init(X, metric, 5, seed=0)
+    top1, topc = assign_buckets(X, M, metric, c=3)
+    eps = 0.4
+    reps = build_representatives(X, top1, metric, epsilon=eps, L=5, seed=0)
+    a, ia = _halo_merge(X, reps, topc, metric, eps, chunk=2048)
+    b, ib = _halo_merge(X, reps, topc, metric, eps, chunk=7)
+    assert torch.equal(a.rep_idx, b.rep_idx)
+    assert torch.equal(a.member_of, b.member_of)
+    assert ia["halo_merged"] == ib["halo_merged"]
+
+
+def test_halo_merge_skips_large_uncompressed():
+    """Low-compression nets at large R skip halo (OOM guard)."""
+    from leanmap.build.pipeline import Representatives, _halo_merge
+    from leanmap.metrics import wrap_metric
+
+    n = 120_000
+    # Identity net: every point is its own rep (compression = 1).
+    X = torch.randn(n, 2)
+    metric = wrap_metric("l2", X=X[:1000], n_neighbors=5, seed=0)
+    reps = Representatives(
+        rep_idx=torch.arange(n, dtype=torch.int64),
+        member_of=torch.arange(n, dtype=torch.int64),
+        weight=torch.ones(n),
+        offsets=torch.arange(n + 1, dtype=torch.int64),
+        values=torch.arange(n, dtype=torch.int64),
+    )
+    topc = torch.zeros(n, 2, dtype=torch.int64)
+    out, info = _halo_merge(X, reps, topc, metric, epsilon=0.1)
+    assert info.get("halo_skipped") == "low_compression"
+    assert int(out.rep_idx.shape[0]) == n
+
+
 def test_epsilon_zero_no_dedup():
     torch.manual_seed(1)
     X = torch.randn(200, 6)

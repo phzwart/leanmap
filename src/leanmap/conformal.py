@@ -390,6 +390,11 @@ class ConformalCalibrator:
         log = get_logger()
         model.eval()
         device = next(model.parameters()).device
+        if int(X_calib.shape[0]) == 0:
+            log.warning("ConformalCalibrator.fit: empty calib; leaving scores unset")
+            self.tau_embed = 1.0
+            self.s_calib = None
+            return
         z_M = model._primary_anchor_embeddings(device)
         # tau_embed = median ||z - z_M|| over calib (for consistency diagnostic)
         dists = []
