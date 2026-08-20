@@ -649,6 +649,25 @@ def main_train(argv: list[str] | None = None) -> int:
         help="0..1 blend toward equal landmark-basin edge sampling",
     )
     ap.add_argument(
+        "--epoch-active-rows",
+        type=int,
+        default=None,
+        help="raw rows in each epoch active set (None=full graph; "
+        "for_scale N>200k defaults to 50000)",
+    )
+    ap.add_argument(
+        "--epoch-overlap",
+        type=float,
+        default=None,
+        help="fraction of active set kept from previous epoch (default 0.2)",
+    )
+    ap.add_argument(
+        "--epoch-cover-visits",
+        type=int,
+        default=None,
+        help="target visits/point for cover-pass estimate logged at fit start",
+    )
+    ap.add_argument(
         "--batch-edges",
         type=int,
         default=None,
@@ -767,6 +786,12 @@ def main_train(argv: list[str] | None = None) -> int:
         cfg.landmark_epoch_samples = float(args.landmark_epoch_samples)
     if args.landmark_sample_mix is not None:
         cfg.landmark_sample_mix = float(args.landmark_sample_mix)
+    if getattr(args, "epoch_active_rows", None) is not None:
+        cfg.epoch_active_rows = int(args.epoch_active_rows)
+    if getattr(args, "epoch_overlap", None) is not None:
+        cfg.epoch_overlap = float(args.epoch_overlap)
+    if getattr(args, "epoch_cover_visits", None) is not None:
+        cfg.epoch_cover_visits = int(args.epoch_cover_visits)
     if args.batch_edges is not None:
         if int(args.batch_edges) < 1:
             raise SystemExit("--batch-edges must be >= 1")

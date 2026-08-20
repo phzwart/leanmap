@@ -294,6 +294,9 @@ manifolds and flatten the weights at the same time.
 | `epoch_unit` | `edges` (small/mid); **`landmarks`** for `N>200k` | `edges` / `landmarks` | `landmarks`: steps ≈ `L × landmark_epoch_samples / batch_edges` (δ-independent). |
 | `landmark_epoch_samples` | 128 | 32–512 | Edge draws per landmark per epoch when `epoch_unit=landmarks`. |
 | `landmark_sample_mix` | 0 (small); **0.75** large | 0–1 | Blend toward equal landmark-basin edge coverage. |
+| `epoch_active_rows` | `None` (small); **50000** for `N>200k` | int or None | Raw rows in each epoch’s active set. `None` = sample the full frozen graph. |
+| `epoch_overlap` | **0.2** | 0–1 | Fraction of the active set kept from the previous epoch; refill from outside. |
+| `epoch_cover_visits` | 1 | ≥1 | Target visits/point for the cover estimate logged at fit start: `epochs ≈ n_visits·N / ((1-overlap)·B)`. |
 | `lr` | 1e-3 base; **2e-2** in `for_scale` small | 1e-3–2e-2 | Paired with `pca_skip`. |
 | `lr_after` / `lr_switch_epochs` | None / 0 | optional two-phase | Disables warmup+cosine when set. |
 | `batch_edges` | 4096 | 512–4096 | Lower on tiny N. |

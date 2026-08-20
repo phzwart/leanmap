@@ -36,10 +36,32 @@ flowchart LR
 | **1. Build** | `leanmap-graph-build --ingest streaming …` (or `build_graph_pyramid_streaming`) | Growing cover over all of \(N\) in batches; final fuzzy pyramid |
 | **2. Freeze** | Same CLI writes the store | `graphs[]`, `M`, `assign_top1/c`, fingerprint, ε/δ, \(k\), \(L\) — same schema as `--ingest local` |
 | **3. Train** | `leanmap-train --graph-path …` or `fit(..., graph_path=..., rebuild_graph=False)` | Loads the store; **does not** call streaming again |
-| **4. Each epoch** | Existing samplers | Alias-sample edges → expand cells → fuzzy CE; ordinals/geo/density on the **same** frozen cover |
+| **4. Each epoch** | Existing samplers (+ optional active set) | Alias-sample edges → expand cells → fuzzy CE; ordinals/geo/density on the **same** frozen cover. With `epoch_active_rows` set (large-N default 50k), each epoch restricts sampling to an overlapping raw-row pass (`epoch_overlap=0.2` by default); see below. |
 | **5. After fit** | Usual artefact | Encoder (+ landmarks for inference); neighbour graph can be discarded |
 
 **Important:** exemplar policy / `epoch_unit=landmarks` only reweights **which raw rows** appear in SGD batches. They do **not** rebuild topology. Every row that was ingested at build time already has a cell; if it is never drawn this epoch, its edges simply are not sampled.
+
+### Overlapping epoch active sets (train regularization)
+
+When `epoch_active_rows=B` is set, epoch \(t\) uses an active index set \(A_t\) of size \(B\):
+
+- Keep \(\approx\) `epoch_overlap` · \(B\) rows from \(A_{t-1}\) (default **20%**).
+- Fill the rest uniformly from rows **outside** the kept set.
+- Mask fuzzy edge mass to cells that intersect \(A_t\); expand members from \(A_t\) only.
+
+Cover planner (`leanmap.sampling.estimate_cover_passes`):
+
+```text
+fresh/epoch ≈ (1 - overlap) * B
+epochs ≈ ceil(n_visits * N / fresh)
+```
+
+Example: \(N=10^7\), \(B=5\cdot10^4\), overlap \(0.2\) → fresh \(4\cdot10^4\) → **~250 epochs** for one visit of every point; **~750** for three visits. Fit logs this estimate and warns if `epochs` is lower.
+
+```bash
+leanmap-train --X X.npy --graph-path graph_store/ \
+  --epoch-active-rows 50000 --epoch-overlap 0.2 --epoch-cover-visits 1
+```
 
 ### Concrete commands
 

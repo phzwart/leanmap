@@ -941,6 +941,10 @@ def fit(
             mix,
             getattr(config, "epoch_unit", "edges"),
         )
+    # Per-level base weights (before epoch active-set masking).
+    edge_base_weights = [
+        np.asarray(s._base_weights, dtype=np.float64).copy() for s in edge_samps
+    ]
     n_levels = len(graphs)
     if config.pyramid_level_weights is not None:
         lvl_w = [float(x) for x in config.pyramid_level_weights]
@@ -1384,8 +1388,79 @@ def fit(
     ckpt_every = max(1, config.epochs // 10)
     global_step = 0
 
+    # Overlapping epoch active-set passes (optional; large-N default via for_scale).
+    from leanmap.sampling.epoch_pass import (
+        active_member_csr,
+        cell_intersects_active,
+        edge_weights_for_active_cells,
+        estimate_cover_passes,
+        format_cover_passes,
+        next_epoch_active_set,
+    )
+
+    epoch_active_rows = getattr(config, "epoch_active_rows", None)
+    epoch_overlap = float(getattr(config, "epoch_overlap", 0.2) or 0.0)
+    epoch_cover_visits = int(getattr(config, "epoch_cover_visits", 1) or 1)
+    use_epoch_pass = epoch_active_rows is not None and int(epoch_active_rows) > 0
+    prev_active = None
+    pass_rng = np.random.default_rng(int(config.seed) + 17)
+    if use_epoch_pass:
+        B_active = min(int(epoch_active_rows), int(X_train.shape[0]))
+        cover_rep = estimate_cover_passes(
+            int(X_train.shape[0]),
+            B_active,
+            epoch_overlap,
+            n_visits=epoch_cover_visits,
+        )
+        log.info(
+            "epoch active-set: B=%d overlap=%.2f — %s",
+            B_active,
+            epoch_overlap,
+            format_cover_passes(cover_rep),
+        )
+        if int(config.epochs) < int(cover_rep["epochs"]):
+            log.warning(
+                "epochs=%d < cover estimate %d for %d× visits; "
+                "raise epochs or epoch_active_rows / lower epoch_overlap",
+                int(config.epochs),
+                int(cover_rep["epochs"]),
+                epoch_cover_visits,
+            )
+
     for epoch in range(config.epochs):
         model.train()
+        if use_epoch_pass:
+            B_active = min(int(epoch_active_rows), int(X_train.shape[0]))
+            active = next_epoch_active_set(
+                int(X_train.shape[0]),
+                B_active,
+                prev_active,
+                epoch_overlap,
+                pass_rng,
+            )
+            if prev_active is not None and active.size and prev_active.size:
+                inter = float(np.intersect1d(active, prev_active).size)
+                ov = inter / float(active.size)
+            else:
+                ov = 0.0
+            log.info(
+                "epoch %d active-set: |A|=%d overlap_with_prev=%.3f (target=%.2f)",
+                epoch + 1,
+                int(active.size),
+                ov,
+                epoch_overlap,
+            )
+            for li, (samp, g) in enumerate(zip(edge_samps, graphs)):
+                cell_hit = cell_intersects_active(g.reps, active)
+                w_mask = edge_weights_for_active_cells(
+                    samp.edges, edge_base_weights[li], cell_hit, require_both=True
+                )
+                samp.set_weights(w_mask)
+                off_a, val_a = active_member_csr(g.reps, active)
+                samp.set_member_csr(off_a, val_a)
+            cell_hit0 = cell_intersects_active(graphs[0].reps, active)
+            neg_samp.set_active_cells(cell_hit0)
+            prev_active = active
         totals = {
             "geom": 0.0,
             "ord": 0.0,

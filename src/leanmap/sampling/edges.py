@@ -179,12 +179,47 @@ class EdgeSampler:
             self._member_offsets = None
             self._member_values = None
             self._use_csr_members = False
+        # Base weights before per-epoch active-set masking (for restore / rebuild).
+        self._base_weights = np.asarray(self._weights, dtype=np.float64).copy()
+
+    def set_weights(self, weights: ArrayLike) -> None:
+        """Replace alias mass (e.g. after epoch active-set masking)."""
+        self._weights = np.maximum(np.asarray(weights, dtype=np.float64).reshape(-1), 1e-12)
+        if int(self._weights.shape[0]) != int(np.asarray(self.edges).shape[0]):
+            raise ValueError(
+                f"weights length {self._weights.shape[0]} != E={np.asarray(self.edges).shape[0]}"
+            )
+        self.prob, self.alias = _alias_setup(self._weights)
+
+    def set_member_csr(
+        self,
+        offsets: Optional[ArrayLike],
+        values: Optional[ArrayLike],
+    ) -> None:
+        """Restrict cell expansion to a CSR view (e.g. active members only).
+
+        Pass ``offsets=None`` to restore the graph's full cell membership.
+        """
+        if offsets is None or values is None:
+            self._use_csr_members = False
+            self._member_offsets = None
+            self._member_values = None
+            return
+        self._member_offsets = offsets
+        self._member_values = values
+        self._use_csr_members = True
 
     def _expand_cell(self, cell: int) -> int:
         if self._use_csr_members:
-            return _cell_member_csr(
+            idx = _cell_member_csr(
                 self._member_offsets, self._member_values, cell, self.rng
             )
+            if idx < 0:
+                # Empty active cell — fall back to full membership if available.
+                if self.reps is not None:
+                    return _cell_member(self.reps, cell, self.rng)
+                raise RuntimeError(f"active cell {cell} has no members")
+            return idx
         return _cell_member(self.reps, cell, self.rng)
 
     def sample(
@@ -213,10 +248,23 @@ class NegativeSampler:
         self.reps = reps
         self.R = int(reps.rep_idx.shape[0])
         self.rng = np.random.default_rng(seed + 1)
+        self._active_cells: Optional[np.ndarray] = None
+
+    def set_active_cells(self, cell_active: Optional[np.ndarray]) -> None:
+        """If set, draw negatives only from cells that intersect the active set."""
+        if cell_active is None:
+            self._active_cells = None
+            return
+        ca = np.asarray(cell_active, dtype=bool).reshape(-1)
+        idx = np.flatnonzero(ca)
+        self._active_cells = idx if idx.size else None
 
     def sample(self, B: int, n_neg: int = 5) -> torch.Tensor:
         """Returns ``x_neg: (B, n_neg, D)``."""
-        cells = self.rng.integers(0, self.R, size=(B, n_neg))
+        if self._active_cells is not None and self._active_cells.size > 0:
+            cells = self.rng.choice(self._active_cells, size=(B, n_neg), replace=True)
+        else:
+            cells = self.rng.integers(0, self.R, size=(B, n_neg))
         idx = [
             [_cell_member(self.reps, int(c), self.rng) for c in row] for row in cells
         ]

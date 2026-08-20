@@ -87,6 +87,9 @@ class TrainConfig:
     landmark_epoch_samples: float = 128.0
     # Blend edge-mass alias toward equal landmark-basin coverage (0=off, 1=full).
     landmark_sample_mix: float = 0.0
+    epoch_active_rows: Optional[int] = None
+    epoch_overlap: float = 0.2
+    epoch_cover_visits: int = 1
     pca_skip: bool = True
     warm_start_steps: int = 0
     warm_start_layout: str = "auto"
@@ -383,6 +386,15 @@ class PLANEConfig:
     landmark_epoch_samples: float = 128.0
     # Mix edge-mass alias toward equal landmark-basin coverage (0 = golden path).
     landmark_sample_mix: float = 0.0
+    # Epoch active-set pass: each epoch samples constraints from ~B raw rows.
+    # None disables (full frozen-graph alias; small-N / golden default).
+    # ``for_scale(N>200k)`` sets 50_000. Consecutive epochs keep
+    # ``epoch_overlap`` of the previous active set (default 0.2) and refill
+    # the rest from outside — see ``leanmap.sampling.epoch_pass``.
+    epoch_active_rows: Optional[int] = None
+    epoch_overlap: float = 0.2
+    # Planning target for :func:`estimate_cover_passes` (logged at fit start).
+    epoch_cover_visits: int = 1
     # Tuned for the ``pca_skip=True`` path, where the head only has to refine an
     # already-sensible PCA layout. With ``pca_skip=False`` the head must build the
     # layout from a near-zero init and needs 5e-3..2e-2; see ``pca_skip``.
@@ -504,6 +516,10 @@ class PLANEConfig:
             # Prefer δ calibration at large N. When R@ε is already in-band this
             # is a no-op; when R would explode it coarsens the net before halo.
             delta="auto",
+            # Overlapping epoch passes (~50k rows, 20% carry-over by default).
+            epoch_active_rows=50_000,
+            epoch_overlap=0.2,
+            epoch_cover_visits=1,
         )
 
 
