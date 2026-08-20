@@ -55,6 +55,9 @@ CLI (App. B):
 
 ```bash
 leanmap-graph-build --X X.npy --out graph.pt
+# Large-N streaming cover (seed + batch absorb/spawn):
+# leanmap-graph-build --X X.npy --out graph_store/ --ingest streaming \
+#   --ingest-batch 50000 --delta auto --knn-mode ann
 leanmap-train --X X.npy --graph-path graph.pt --exemplar-policy uniform
 
 # Multi-node FileStore bunches (shared stages; no mpi4py):
@@ -62,6 +65,12 @@ leanmap-train --X X.npy --graph-path graph.pt --exemplar-policy uniform
 #   --stages /shared/stages --bunch-partition fs
 # Optional: --bunch-partition ddp (torchrun) or mpi (leanmap[hpc])
 ```
+
+| CLI flag | Role |
+|----------|------|
+| `--ingest {local,streaming}` | Single-pass (default) vs streaming cover |
+| `--ingest-batch` | Uncovered rows per streaming round (default 50000) |
+| `--ingest-seed-size` | Streaming seed subsample (default = ingest-batch) |
 
 ---
 

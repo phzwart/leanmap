@@ -401,6 +401,28 @@ def main_graph_build(argv: list[str] | None = None) -> int:
         default=None,
         help="worker world size (default: env WORLD_SIZE or 1); used with fs",
     )
+    ap.add_argument(
+        "--ingest",
+        choices=("local", "streaming"),
+        default="local",
+        help=(
+            "local: single-pass build_graph_pyramid (default); "
+            "streaming: seed + batch absorb/spawn cover "
+            "(see docs/design/streaming_graph_build.md)"
+        ),
+    )
+    ap.add_argument(
+        "--ingest-batch",
+        type=int,
+        default=50_000,
+        help="streaming ingest batch size (uncovered rows per round)",
+    )
+    ap.add_argument(
+        "--ingest-seed-size",
+        type=int,
+        default=None,
+        help="streaming seed subsample size (default: --ingest-batch)",
+    )
     args = ap.parse_args(argv)
     from leanmap import PLANEConfig
     from leanmap.graph import (
@@ -440,13 +462,15 @@ def main_graph_build(argv: list[str] | None = None) -> int:
         stages_dir=cfg.graph_stages_dir,
     )
     log.info(
-        "graph-build start: N=%d d=%d knn_mode=%s pyramid_scales=%d L=%d k=%d",
+        "graph-build start: N=%d d=%d knn_mode=%s pyramid_scales=%d L=%d k=%d "
+        "ingest=%s",
         Xt.shape[0],
         Xt.shape[1],
         cfg.knn_mode,
         cfg.pyramid_scales,
         cfg.n_landmarks,
         cfg.n_neighbors,
+        args.ingest,
     )
     BUILD_PROGRESS.set("graph-build", "starting")
     try:
@@ -455,7 +479,37 @@ def main_graph_build(argv: list[str] | None = None) -> int:
             interval=10.0,
             detail=BUILD_PROGRESS.format,
         ):
-            if args.bunch_partition == "local":
+            if args.ingest == "streaming":
+                if args.bunch_partition != "local":
+                    raise SystemExit(
+                        "--ingest streaming is single-process only; "
+                        "use --bunch-partition local"
+                    )
+                from leanmap.build.streaming import build_graph_pyramid_streaming
+
+                stream_kw = {
+                    k: v
+                    for k, v in build_kw.items()
+                    if k != "stages_dir"
+                }
+                stream_kw["ingest_batch"] = int(args.ingest_batch)
+                if args.ingest_seed_size is not None:
+                    stream_kw["seed_size"] = int(args.ingest_seed_size)
+                stream_kw["compute_knn_overlap"] = int(Xt.shape[0]) <= 20_000
+                graphs, M, a1, ac, stream_report = build_graph_pyramid_streaming(
+                    Xt, metric, **stream_kw
+                )
+                log.info(
+                    "streaming report: R=%d absorbed=%d spawned=%d novelty=%d "
+                    "rounds=%d knn_overlap=%s",
+                    stream_report.n_reps,
+                    stream_report.n_absorbed,
+                    stream_report.n_spawned,
+                    stream_report.n_novelty_landmarks,
+                    stream_report.n_rounds,
+                    stream_report.knn_overlap,
+                )
+            elif args.bunch_partition == "local":
                 graphs, M, a1, ac = build_graph_pyramid(Xt, metric, **build_kw)
             else:
                 from leanmap.build.bunches import build_graph_pyramid_bunches

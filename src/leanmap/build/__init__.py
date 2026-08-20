@@ -35,15 +35,24 @@ from .pipeline import (
     validate_precomputed_knn,
 )
 from .resolution import crawl_epsilon, format_epsilon_crawl, solve_delta
+from .streaming import (
+    StreamingBuildReport,
+    build_graph_pyramid_streaming,
+    build_graph_streaming,
+    knn_overlap_jaccard,
+)
 
 __all__ = [
     "GRAPH_PYRAMID_VERSION",
     "Graph",
     "GraphStats",
     "Representatives",
+    "StreamingBuildReport",
     "assemble_graph_from_knn",
     "build_graph",
     "build_graph_pyramid",
+    "build_graph_pyramid_streaming",
+    "build_graph_streaming",
     "build_representatives",
     "check_tensor_fingerprint",
     "crawl_epsilon",
@@ -51,6 +60,7 @@ __all__ = [
     "format_epsilon_crawl",
     "graph_from_state",
     "graph_to_state",
+    "knn_overlap_jaccard",
     "knn_representatives",
     "landmark_backbone",
     "load_graph_pyramid",
